@@ -1,0 +1,54 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: superKnowledgeBase
+  threads:
+    virtual:
+      enabled: true
+  datasource:
+    url: jdbc:postgresql://localhost:5433/skb
+    username: skb
+    password: skb
+  servlet:
+    multipart:
+      max-file-size: 200MB
+      max-request-size: 1GB
+  mvc:
+    async:
+      # 流式回答可能较长
+      request-timeout: 5m
+  ai:
+    model:
+      chat: deepseek
+      embedding: ollama
+    deepseek:
+      api-key: ${DEEPSEEK_API_KEY:not-configured}
+      chat:
+        options:
+          model: deepseek-chat
+          temperature: 0.3
+    ollama:
+      base-url: http://localhost:11434
+      embedding:
+        options:
+          model: bge-m3
+
+skb:
+  storage-dir: ./data/files
+  ingestion:
+    # 同时处理的文档数，避免压垮本地 embedding 服务
+    concurrency: 2
+    embedding-batch-size: 16
+  chunk:
+    target-chars: 600
+    max-chars: 1000
+    overlap-chars: 100
+  retrieval:
+    top-k: 6
+    # 余弦相似度低于此值的片段视为不相关（bge-m3 经验值，可按评估结果调整）
+    min-score: 0.45
+  chat:
+    history-messages: 6
+    max-context-chars: 12000

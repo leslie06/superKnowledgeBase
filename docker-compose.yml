@@ -1,0 +1,17 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: skb-postgres
+    environment:
+      POSTGRES_DB: skb
+      POSTGRES_USER: skb
+      POSTGRES_PASSWORD: skb
+    ports:
+      # 本机 5432 已被占用，映射到 5433
+      - "5433:5432"
+    volumes:
+      - skb-pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  skb-pgdata:
