@@ -51,6 +51,8 @@ JAVA_HOME=$(/usr/libexec/java_home -v 21) ./mvnw spring-boot:run
 
 参数（切块大小、召回数量、相似度阈值等）都在 `src/main/resources/application.yaml` 的 `skb.*` 下。
 
+结合代码的详细说明见 [docs/rag-pipeline.md](docs/rag-pipeline.md)（[在线版](https://claude.ai/code/artifact/65ce178b-e780-41b2-9bfe-34d933a50508)）。
+
 ## 主要接口
 
 | 方法 | 路径 | 说明 |
