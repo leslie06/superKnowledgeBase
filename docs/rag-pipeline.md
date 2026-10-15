@@ -279,6 +279,42 @@ public List<RetrievedChunk> retrieve(long kbId, String query) {
 
 **调试接口**：`POST /api/knowledge-bases/{kbId}/search`，请求体 `{"query": "...", "topK": 10}`（topK 限制在 1～50）。它直接调用 `search()`，不做阈值过滤，也不调用 LLM，用来观察分数分布、调整 `min-score` 和切分参数。
 
+**直接用 SQL 验证**：检索本身就是上面那条 SQL，可以在 psql 里手动执行，观察召回结果和分数。SQL 没法把文字转成向量，所以「问题」有两种来源。
+
+方法一，拿库里已有片段的向量当问题，查和片段 1 最相似的 6 个片段。这是纯 SQL，先执行 `docker exec -it skb-postgres psql -U skb -d skb` 进入 psql：
+
+```sql
+WITH q AS (SELECT kb_id, embedding FROM chunk WHERE id = 1)
+SELECT c.id, d.filename, c.heading_path, c.location,
+       round((1 - (c.embedding <=> q.embedding))::numeric, 4) AS score,
+       left(c.content, 40) AS preview
+FROM chunk c JOIN document d ON d.id = c.document_id, q
+WHERE c.kb_id = q.kb_id
+ORDER BY c.embedding <=> q.embedding
+LIMIT 6;
+```
+
+第一行是片段 1 自己，score 为 1。
+
+方法二，用真实问题查，和应用的检索一致：先调 Ollama 的 bge-m3 把问题转成 1024 维向量，再用 psql 变量传给 SQL。
+
+```bash
+Q='年假有几天'
+VEC=$(curl -s localhost:11434/api/embed -d "{\"model\":\"bge-m3\",\"input\":\"$Q\"}" \
+  | python3 -c 'import sys,json;print(json.dumps(json.load(sys.stdin)["embeddings"][0],separators=(",",":")))')
+
+docker exec -i skb-postgres psql -U skb -d skb -v vec="$VEC" <<'SQL'
+SELECT c.id, d.filename, c.heading_path, c.location,
+       round((1 - (c.embedding <=> :'vec'::vector))::numeric, 4) AS score,
+       left(c.content, 40) AS preview
+FROM chunk c JOIN document d ON d.id = c.document_id
+ORDER BY c.embedding <=> :'vec'::vector
+LIMIT 6;
+SQL
+```
+
+这条 SQL 查的是所有知识库。要和应用完全一致，需要在 `ORDER BY` 前加 `WHERE c.kb_id = <知识库 id>`，并忽略 score 低于 0.45 的行。在 `SELECT` 前加 `EXPLAIN` 可以查看执行计划，出现 `Index Scan using ... hnsw` 说明走了 HNSW 索引；数据量小时 PG 可能选择全表扫描。
+
 ## 检索问答三：拼接 Prompt 与流式生成
 
 召回的片段先按字数预算截取并编号，再拼成「系统提示 + 历史消息 + 参考资料和问题」交给 DeepSeek 流式生成。模型在句末标注的 `[n]` 和片段编号一一对应，前端据此把引用变成可点击的出处。
