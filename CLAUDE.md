@@ -15,6 +15,7 @@ export JAVA_HOME=$(/usr/libexec/java_home -v 21)
 ./mvnw test                                                       # 全部测试
 ./mvnw test -Dtest=ChunkerTests                                   # 单个测试类
 ./mvnw test -Dtest=ChunkerTests#splitsOnHeadingChange             # 单个测试方法
+python3 scripts/eval_retrieval.py --kb-id 5 --csv scripts/eval/laws.csv   # 检索评测（需后端运行），题集格式见脚本头注释
 
 cd frontend && npm install
 npm run dev          # http://localhost:5173，/api 代理到 8080
