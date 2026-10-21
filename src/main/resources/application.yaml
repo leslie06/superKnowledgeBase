@@ -48,7 +48,7 @@ skb:
   retrieval:
     top-k: 6
     # 余弦相似度低于此值的片段视为不相关（bge-m3 经验值，可按评估结果调整）
-    min-score: 0.45
+    min-score: 0.5
   chat:
     history-messages: 6
     max-context-chars: 12000

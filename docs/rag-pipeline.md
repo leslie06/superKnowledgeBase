@@ -240,7 +240,7 @@ private static final String REWRITE_SYSTEM_PROMPT = """
 
 ## 检索问答二：向量检索与召回过滤
 
-检索是一条 SQL：在当前知识库的片段里，用 HNSW 索引找出与问题向量余弦距离最近的 `top-k`（6）个，再丢掉相似度低于 `min-score`（0.45）的。当前只有向量召回一路，没有关键词检索和重排。
+检索是一条 SQL：在当前知识库的片段里，用 HNSW 索引找出与问题向量余弦距离最近的 `top-k`（6）个，再丢掉相似度低于 `min-score`（0.5）的。当前只有向量召回一路，没有关键词检索和重排。
 
 ```java
 // Retriever.search（略去参数绑定）
@@ -269,7 +269,7 @@ return result.stream().sorted(Comparator.comparingDouble(RetrievedChunk::score).
 - **`iterative_scan`**：HNSW 先在所有知识库的向量里取出一批候选（默认 `ef_search = 40` 个），再按 `kb_id` 过滤。如果候选大多属于别的知识库，过滤后可能凑不够 6 个。pgvector 0.8 的 `iterative_scan` 在数量不够时会继续沿图向外搜。`relaxed_order` 模式为了速度允许结果顺序有轻微偏差，所以代码最后在 Java 里按 score 重新排序。
 - **只读事务**：`SET LOCAL` 只在当前事务内有效，必须和查询在同一个事务里，所以用了一个只读的 `TransactionTemplate`。设置不会泄漏到连接池里的其他请求。
 
-**召回过滤**：`retrieve()` 在 `search()` 的结果上再过滤一遍，只保留 `score >= skb.retrieval.min-score` 的片段。向量检索永远会返回「最近的 k 个」，哪怕它们和问题毫不相关。阈值让「知识库里没有的内容」可以得到明确的「没找到」，而不是拿无关片段勉强作答。0.45 是 bge-m3 的经验值，还没有经过评测集校准。
+**召回过滤**：`retrieve()` 在 `search()` 的结果上再过滤一遍，只保留 `score >= skb.retrieval.min-score` 的片段。向量检索永远会返回「最近的 k 个」，哪怕它们和问题毫不相关。阈值让「知识库里没有的内容」可以得到明确的「没找到」，而不是拿无关片段勉强作答。阈值最初取 bge-m3 的经验值 0.45，用 `scripts/eval/laws.csv` 评测后调整为 0.5：正确片段最低分 0.557，无答案题最高分 0.455（0.45 时会被放行）。
 
 ```java
 public List<RetrievedChunk> retrieve(long kbId, String query) {
@@ -313,7 +313,7 @@ LIMIT 6;
 SQL
 ```
 
-这条 SQL 查的是所有知识库。要和应用完全一致，需要在 `ORDER BY` 前加 `WHERE c.kb_id = <知识库 id>`，并忽略 score 低于 0.45 的行。在 `SELECT` 前加 `EXPLAIN` 可以查看执行计划，出现 `Index Scan using ... hnsw` 说明走了 HNSW 索引；数据量小时 PG 可能选择全表扫描。
+这条 SQL 查的是所有知识库。要和应用完全一致，需要在 `ORDER BY` 前加 `WHERE c.kb_id = <知识库 id>`，并忽略 score 低于 0.5 的行。在 `SELECT` 前加 `EXPLAIN` 可以查看执行计划，出现 `Index Scan using ... hnsw` 说明走了 HNSW 索引；数据量小时 PG 可能选择全表扫描。
 
 ## 检索问答三：拼接 Prompt 与流式生成
 
@@ -386,7 +386,7 @@ private static final String ANSWER_SYSTEM_PROMPT = """
 | `chunk.max-chars` | 1000 | 切分 | 片段字数上限；超过它的段落按句拆分 |
 | `chunk.overlap-chars` | 100 | 切分 | 因长度切分时的句子级重叠 |
 | `retrieval.top-k` | 6 | 检索 | 问答时召回的片段数 |
-| `retrieval.min-score` | 0.45 | 召回过滤 | 余弦相似度阈值 |
+| `retrieval.min-score` | 0.5 | 召回过滤 | 余弦相似度阈值 |
 | `chat.history-messages` | 6 | 改写、生成 | 携带的历史消息条数 |
 | `chat.max-context-chars` | 12000 | 拼接 Prompt | 参考资料的字数预算 |
 
