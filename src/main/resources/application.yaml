@@ -47,8 +47,14 @@ skb:
     overlap-chars: 100
   retrieval:
     top-k: 6
-    # 余弦相似度低于此值的片段视为不相关（bge-m3 经验值，可按评估结果调整）
+    # 余弦相似度低于此值、且没有精确命中问题中编号的片段视为不相关（按 scripts/eval 评测结果调整）
     min-score: 0.5
+    # 向量、关键词（BM25）两路各召回的候选数，RRF 融合排序后再取 top-k
+    candidates: 30
+    # RRF 融合：片段得分 = 1 / (rrf-k + 向量排名) + keyword-weight / (rrf-k + 关键词排名)；
+    # 精确命中问题中编号的片段始终排在最前。两个值由 scripts/eval 四份题集网格搜索得出
+    rrf-k: 10
+    keyword-weight: 0.25
   chat:
     history-messages: 6
     max-context-chars: 12000

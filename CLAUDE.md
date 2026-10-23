@@ -15,7 +15,7 @@ export JAVA_HOME=$(/usr/libexec/java_home -v 21)
 ./mvnw test                                                       # 全部测试
 ./mvnw test -Dtest=ChunkerTests                                   # 单个测试类
 ./mvnw test -Dtest=ChunkerTests#splitsOnHeadingChange             # 单个测试方法
-python3 scripts/eval_retrieval.py --kb-id 5 --csv scripts/eval/laws.csv   # 检索评测（需后端运行），题集格式见脚本头注释
+python3 scripts/eval_retrieval.py --kb-id 5 --csv scripts/eval/laws.csv   # 检索评测（需后端运行），题集格式见脚本头注释；基线在 scripts/eval/baseline/
 
 cd frontend && npm install
 npm run dev          # http://localhost:5173，/api 代理到 8080
@@ -51,7 +51,7 @@ npm run typecheck    # vue-tsc 类型检查
 
 ### 检索与问答
 
-- `retrieval/Retriever`：pgvector HNSW 余弦检索，按 `kb_id` 过滤；查询前 `SET LOCAL hnsw.iterative_scan = relaxed_order` 防止过滤后召回不足，因此结果需要在 Java 中重新排序。`retrieve()` 按 `skb.retrieval.min-score` 过滤，`search()` 不过滤，供 `/search` 调试接口使用。后续计划在这里加入 BM25 混合检索 / RRF / Rerank。
+- `retrieval/Retriever`：混合检索。向量召回是 pgvector HNSW 余弦检索，按 `kb_id` 过滤，查询前 `SET LOCAL hnsw.iterative_scan = relaxed_order` 防止过滤后召回不足，因此结果需要在 Java 中重新排序。关键词召回是 BM25：`KeywordAnalyzer` 在 Java 里切词（中文二字组、英文数字整词、条款号规范成"第N条"），写入 `chunk.keyword_tsv`，PG 只做 GIN 索引和打分，不依赖中文分词扩展。融合时，精确命中问题中编号的片段排在最前，其余按加权 RRF 排序。`score` 始终是余弦相似度。`retrieve()` 只保留 `score >= min-score` 或 `exactMatch` 的片段；`search()` 不过滤，供 `/search` 调试接口使用（支持 `mode=hybrid|vector|keyword`）。修改分词规则后，要把 `keyword_tsv` 置空并重启，由 `KeywordIndexBackfill` 重建。后续计划在这里加入 Rerank。
 - `chat/ChatService`：多轮对话时先用 LLM 把问题改写成独立查询 → 检索 → 按 `skb.chat.max-context-chars` 预算组装带编号的参考资料 → `ChatClient` 流式生成。返回 SSE 事件 `citations` → `delta`* → `done`（出错时为 `error`），前端 `ChatView.vue` 依赖这个顺序。无命中时不调用 LLM，直接返回固定回答。改写后的查询和命中分数作为 `retrieval_trace` 存入 `message` 表，便于排查 bad case。
 - 未配置 DeepSeek Key 时应用依然可以启动（占位值 `not-configured`），只有问答接口会返回 error 事件。
 

@@ -44,7 +44,14 @@ export interface RetrievedChunk {
   headingPath: string | null
   location: string | null
   content: string
+  /** 与问题的余弦相似度 */
   score: number
+  /** BM25 得分，未被关键词召回时为 null */
+  keywordScore: number | null
+  vectorRank: number | null
+  keywordRank: number | null
+  /** 是否精确命中问题中的编号（条款号、型号等） */
+  exactMatch: boolean
 }
 
 export interface Citation {

@@ -236,7 +236,7 @@ function extension(filename: string) {
     <section class="panel">
       <div class="panel-header">
         <h3>检索测试</h3>
-        <span class="panel-hint">只看召回了哪些片段和相似度，不调用大模型，用来判断"答不好"是检索问题还是生成问题</span>
+        <span class="panel-hint">只看召回了哪些片段和相似度（向量 + 关键词融合排序），不调用大模型，用来判断"答不好"是检索问题还是生成问题</span>
       </div>
       <div class="search-row">
         <el-input v-model="searchQuery" placeholder="输入一个问题，例如：年假有几天？" @keyup.enter="runSearch" />
@@ -249,6 +249,9 @@ function extension(filename: string) {
             <el-tag size="small" :type="r.score >= 0.6 ? 'success' : r.score >= 0.45 ? 'warning' : 'info'">
               {{ r.score.toFixed(3) }}
             </el-tag>
+            <span v-if="r.vectorRank" class="muted">向量 #{{ r.vectorRank }}</span>
+            <span v-if="r.keywordRank" class="muted">关键词 #{{ r.keywordRank }}</span>
+            <el-tag v-if="r.exactMatch" size="small" type="success" effect="plain">精确命中</el-tag>
             <a :href="fileUrl(r.documentId, r.filename, r.location)" target="_blank">{{ r.filename }}</a>
             <span v-if="r.headingPath" class="muted">{{ r.headingPath }}</span>
             <span v-if="r.location" class="muted">{{ r.location }}</span>

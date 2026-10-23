@@ -244,50 +244,112 @@ private static final String REWRITE_SYSTEM_PROMPT = """
 - **降级**：改写调用抛异常或返回空内容时，退回用原问题检索，只记一条 warn 日志，不影响后续回答。
 - 改写后的问题会作为 `searchQuery` 存进答案消息的 `retrieval_trace`，排查「为什么没检索到」时可以直接看到实际用于检索的是什么。
 
-**问题向量化**在 `Retriever.search` 里完成：`embeddingModel.embed(query)` 用和摄入时同一个 bge-m3 模型，把问题转成 1024 维向量。问题和片段必须用同一个模型，否则两边的向量不在同一个空间里，距离没有意义。问题不加任何前缀；片段向量化时加的「文件 / 章节 / 位置」头部，是为了让问题里提到的文件名、章节名也能匹配上。
+**问题向量化**在 `Retriever.rank` 里完成：`embeddingModel.embed(query)` 用和摄入时同一个 bge-m3 模型，把问题转成 1024 维向量。问题和片段必须用同一个模型，否则两边的向量不在同一个空间里，距离没有意义。问题不加任何前缀；片段向量化时加的「文件 / 章节 / 位置」头部，是为了让问题里提到的文件名、章节名也能匹配上。
 
-## 检索问答二：向量检索与召回过滤
+## 检索问答二：混合检索与召回过滤
 
-检索是一条 SQL：在当前知识库的片段里，用 HNSW 索引找出与问题向量余弦距离最近的 `top-k`（6）个，再丢掉相似度低于 `min-score`（0.5）的。当前只有向量召回一路，没有关键词检索和重排。
+检索分两路召回再融合，入口是 `Retriever.rank`：
+
+1. **向量召回**：HNSW 余弦检索，取最相近的 `candidates`（30）个，擅长换了说法的问题；
+2. **关键词召回**：BM25，同样取 30 个，擅长条款号、编号、型号这类向量不敏感的字面信息；
+3. **融合排序**：精确命中问题中编号的片段排最前，其余按加权 RRF 排序；
+4. **召回过滤**（仅问答）：丢掉余弦相似度低于 `min-score`（0.5）且没有精确命中的片段，取前 `top-k`（6）个。
+
+为什么要加关键词一路：只有向量召回时，「劳动合同法第三十九条」「民法典第1079条」这类按条款号提问的题，14 道里只有 1 道排第一（`scripts/eval/laws_article.csv`）。bge-m3 把「第三十九条」和「第二十九条」看成几乎一样的东西，而且错误结果的相似度都在 0.5 以上，阈值也拦不住。
+
+### 向量召回
 
 ```java
-// Retriever.search（略去参数绑定）
-String vector = PgVectors.toLiteral(embeddingModel.embed(query));
-List<RetrievedChunk> result = readOnlyTx.execute(status -> {
-    // 带 kb_id 过滤时让 HNSW 继续扫描，避免存在多个知识库时召回数量不足
-    jdbc.sql("SET LOCAL hnsw.iterative_scan = relaxed_order").update();
-    return jdbc.sql("""
-            SELECT c.id AS chunk_id, c.document_id, d.filename, c.heading_path, c.location, c.content,
-                   1 - (c.embedding <=> CAST(:vector AS vector)) AS score
-            FROM chunk c JOIN document d ON d.id = c.document_id
-            WHERE c.kb_id = :kbId
-            ORDER BY c.embedding <=> CAST(:vector AS vector)
-            LIMIT :topK
-            """)...;
-});
+// Retriever.vectorSearch（略去参数绑定）
+// 带 kb_id 过滤时让 HNSW 继续扫描，避免存在多个知识库时召回数量不足
+jdbc.sql("SET LOCAL hnsw.iterative_scan = relaxed_order").update();
+List<Hit> hits = jdbc.sql("""
+        SELECT c.id AS chunk_id, 1 - (c.embedding <=> CAST(:vector AS vector)) AS score
+        FROM chunk c
+        WHERE c.kb_id = :kbId
+        ORDER BY c.embedding <=> CAST(:vector AS vector)
+        LIMIT :limit
+        """)...;
 // relaxed_order 下结果可能略微乱序
-return result.stream().sorted(Comparator.comparingDouble(RetrievedChunk::score).reversed()).toList();
+return hits.stream().sorted(Comparator.comparingDouble(Hit::score).reversed()).toList();
 ```
 
 逐项说明：
 
 - **`<=>` 与 score**：`<=>` 是 pgvector 的余弦距离运算符，取值 0～2，越小越相似。`1 - 距离` 就是余弦相似度，作为 `score` 返回，越大越相关。
 - **走索引**：`ORDER BY 距离 LIMIT k` 正好是 HNSW 索引能加速的查询形式，不会对全表做距离计算。
-- **按知识库过滤**：`chunk.kb_id` 是冗余列，过滤时不用先关联 `document`。`JOIN document` 只是为了取文件名。
-- **`iterative_scan`**：HNSW 先在所有知识库的向量里取出一批候选（默认 `ef_search = 40` 个），再按 `kb_id` 过滤。如果候选大多属于别的知识库，过滤后可能凑不够 6 个。pgvector 0.8 的 `iterative_scan` 在数量不够时会继续沿图向外搜。`relaxed_order` 模式为了速度允许结果顺序有轻微偏差，所以代码最后在 Java 里按 score 重新排序。
-- **只读事务**：`SET LOCAL` 只在当前事务内有效，必须和查询在同一个事务里，所以用了一个只读的 `TransactionTemplate`。设置不会泄漏到连接池里的其他请求。
+- **按知识库过滤**：`chunk.kb_id` 是冗余列，过滤时不用先关联 `document`。
+- **`iterative_scan`**：HNSW 先在所有知识库的向量里取出一批候选（默认 `ef_search = 40` 个），再按 `kb_id` 过滤。如果候选大多属于别的知识库，过滤后可能凑不够数。pgvector 0.8 的 `iterative_scan` 在数量不够时会继续沿图向外搜。`relaxed_order` 模式为了速度允许结果顺序有轻微偏差，所以代码最后在 Java 里按 score 重新排序。
+- **只读事务**：`SET LOCAL` 只在当前事务内有效，必须和查询在同一个事务里，所以两路召回和取详情都放在一个只读的 `TransactionTemplate` 里。设置不会泄漏到连接池里的其他请求。
 
-**召回过滤**：`retrieve()` 在 `search()` 的结果上再过滤一遍，只保留 `score >= skb.retrieval.min-score` 的片段。向量检索永远会返回「最近的 k 个」，哪怕它们和问题毫不相关。阈值让「知识库里没有的内容」可以得到明确的「没找到」，而不是拿无关片段勉强作答。阈值最初取 bge-m3 的经验值 0.45，用 `scripts/eval/laws.csv` 评测后调整为 0.5：正确片段最低分 0.557，无答案题最高分 0.455（0.45 时会被放行）。
+### 关键词召回（BM25）
+
+PostgreSQL 自带的全文检索不会切中文，装 zhparser / pg_jieba 又要自己构建数据库镜像。所以分词在 Java 里完成（`KeywordAnalyzer`），切好的词项直接写成 `tsvector` 存进 `chunk.keyword_tsv`，PG 只负责 GIN 索引和打分，不再分词。建索引和查询用同一套规则：
+
+| 规则 | 示例 |
+| --- | --- |
+| 中文按二字组切分，单字连续段保留单字 | 年假天数 → 年假 / 假天 / 天数 |
+| 英文、数字按整词保留并转小写；带下划线的再拆出各段 | Q5 → q5；RW_202607050001 → rw_202607050001 / rw / 202607050001 |
+| 条款编号统一成阿拉伯数字，编号本身不再切二字组 | 第一千零七十九条、第1079条、1079条 → 第1079条 |
+| 全角字符先转半角（NFKC） | 第８２条 → 第82条 |
+| 仅查询：先去掉疑问词 | 「是什么」「怎么」「哪些」「多少」「吗」等 |
+
+条款号不切二字组，是因为「三十」「九条」会命中所有「第三十X条」，反而把要找的那条挤下去。疑问词要去掉，是因为它们在制度、法规正文里很少出现，IDF 反而很高。
+
+**索引**：V4 迁移给 `chunk` 加了 `keyword_tsv`（GIN 索引）和 `keyword_token_count`（词项总数，即 BM25 的文档长度）两列。词项来自「章节路径 + 正文」，章节名里的「证件办理」「车辆管理」往往就是用户的检索词。新片段在 `ChunkRepository.insertAll` 写入时生成；V4 之前入库的片段由 `KeywordIndexBackfill` 在应用启动后于后台补齐，只需分词，不用重新向量化。
+
+**打分**：标准 BM25，`k1 = 1.2`、`b = 0.75`。文档数 N、每个词的文档频率 df、平均文档长度都按当前知识库实时统计；词频 tf 取 `tsvector` 中该词项的位置个数：
+
+```text
+idf(t)  = ln(1 + (N - df + 0.5) / (df + 0.5))
+score   = Σ idf(t) · tf · (k1 + 1) / (tf + k1 · (1 - b + b · 文档长度 / 平均文档长度))
+```
+
+SQL 先用 `keyword_tsv @@ 'q5' | '系统' | ...`（任一词项命中，走 GIN 索引）筛出候选，再 `unnest(keyword_tsv)` 取出命中词项的 tf 求和。在当前几百个片段的库上单次查询 15～100 ms。它要对每个候选展开全部词项，片段数到几万时需要关注耗时。
+
+### 融合排序
+
+```java
+// 问题里写明了"第39条""Q5"这类编号时，包含它的片段几乎一定是用户要找的，直接排到最前
+rows.sorted(comparing(exactMatch).reversed()
+        .thenComparing(fused 得分降序)
+        .thenComparing(余弦相似度降序))
+```
+
+- **精确命中优先**：问题中的「精确词项」指条款编号、字母数字混合的编号（q5、rw_202607050001）和 5 位以上的数字（商品编码等）。片段包含其中任意一个时 `exactMatch = true`，排在所有片段前面。
+- **加权 RRF**：其余片段的得分为 `1 / (rrf-k + 向量排名) + keyword-weight / (rrf-k + 关键词排名)`，只出现在一路时只算该路。RRF 只看排名、不看分数，余弦相似度和 BM25 分数的量纲不同也能直接融合。
+- **参数**：`rrf-k = 10`、`keyword-weight = 0.25`，是在四份题集上网格搜索得到的。常见的 `k = 60` 等权融合会让 laws 题集的 Hit@1 从 100% 掉到 56%。k 越大，各名次之间的分差越小：k = 60 时向量第 1 名和第 9 名只差 0.002，关键词这一路随便贡献一点就能把顺序翻过来。而二字组 BM25 对改写、口语化的问题噪声很大，例如「租房合同最长能签多少年」会命中一堆含「合同」的劳动合同法条文。
+- **结果中的分数**：`score` 始终是与问题的余弦相似度。只从关键词召回的片段会补算余弦相似度，过滤和前端展示仍然统一用它。另有 `keywordScore`（BM25）、`vectorRank`、`keywordRank`、`exactMatch` 字段，用于排查。
+
+不同方式在四份题集上的 Hit@1 / 问答可用率（`python3 scripts/eval_retrieval.py --mode vector|hybrid ...`）：
+
+| 题集 | 内容 | 纯向量 | 混合检索 |
+| --- | --- | --- | --- |
+| `laws.csv` | 法律法规，改写 / 口语化问法 | 100% / 100% | 100% / 100% |
+| `laws_article.csv` | 按条款号提问 | 7.1% / 35.7% | 92.9% / 100% |
+| `handbook.csv` | 员工手册（双栏 PDF） | 78.9% / 94.7% | 89.5% / 100% |
+| `requirements.csv` | 需求文档中的编码、ID、字段规则 | 80.0% / 85.0% | 95.0% / 100% |
+
+无答案题的拒答率不变（laws 100%，handbook 0%，requirements 33.3%）。混合检索解决的是「找得到、排得准」，判断「库里到底有没有答案」要靠后续的 Reranker。
+
+### 召回过滤
+
+`retrieve()` 在融合后的候选上过滤，只保留 `score >= skb.retrieval.min-score` **或** `exactMatch` 的片段，再取前 `top-k` 个。向量检索永远会返回「最近的 k 个」，哪怕它们和问题毫不相关。阈值让「知识库里没有的内容」可以得到明确的「没找到」，而不是拿无关片段勉强作答。阈值最初取 bge-m3 的经验值 0.45，用 `scripts/eval/laws.csv` 评测后调整为 0.5：正确片段最低分 0.557，无答案题最高分 0.455（0.45 时会被放行）。
+
+精确命中不受阈值限制，是因为编号类问题的余弦相似度往往偏低。例如「Q5 系统是用来做什么的」，正确片段只有 0.426，「商品编码 2025999500042779 对应哪个产品」只有 0.462。
 
 ```java
 public List<RetrievedChunk> retrieve(long kbId, String query) {
-    return search(kbId, query, defaultTopK).stream().filter(c -> c.score() >= minScore).toList();
+    return rank(kbId, query, Mode.HYBRID, candidates).stream()
+            .filter(c -> c.score() >= minScore || c.exactMatch())
+            .limit(defaultTopK)
+            .toList();
 }
 ```
 
-**调试接口**：`POST /api/knowledge-bases/{kbId}/search`，请求体 `{"query": "...", "topK": 10}`（topK 限制在 1～50）。它直接调用 `search()`，不做阈值过滤，也不调用 LLM，用来观察分数分布、调整 `min-score` 和切分参数。
+**调试接口**：`POST /api/knowledge-bases/{kbId}/search`，请求体 `{"query": "...", "topK": 10, "mode": "hybrid"}`。topK 限制在 1～50；`mode` 可选 `hybrid`（默认）、`vector`、`keyword`，用来对比单路效果。它直接调用 `search()`，不做相关性过滤，也不调用 LLM，用来观察排名和分数分布、调整参数。前端「检索测试」会显示每条结果的向量 / 关键词排名和「精确命中」标记。
 
-**直接用 SQL 验证**：检索本身就是上面那条 SQL，可以在 psql 里手动执行，观察召回结果和分数。SQL 没法把文字转成向量，所以「问题」有两种来源。
+**直接用 SQL 验证向量召回**：向量召回本身就是上面那条 SQL，可以在 psql 里手动执行，观察召回结果和分数。SQL 没法把文字转成向量，所以「问题」有两种来源。
 
 方法一，拿库里已有片段的向量当问题，查和片段 1 最相似的 6 个片段。这是纯 SQL，先执行 `docker exec -it skb-postgres psql -U skb -d skb` 进入 psql：
 
@@ -394,14 +456,18 @@ private static final String ANSWER_SYSTEM_PROMPT = """
 | `chunk.max-chars` | 1000 | 切分 | 片段字数上限；超过它的段落按句拆分 |
 | `chunk.overlap-chars` | 100 | 切分 | 因长度切分时的句子级重叠 |
 | `retrieval.top-k` | 6 | 检索 | 问答时召回的片段数 |
-| `retrieval.min-score` | 0.5 | 召回过滤 | 余弦相似度阈值 |
+| `retrieval.min-score` | 0.5 | 召回过滤 | 余弦相似度阈值；精确命中编号的片段不受限制 |
+| `retrieval.candidates` | 30 | 混合检索 | 向量、关键词两路各召回的候选数 |
+| `retrieval.rrf-k` | 10 | 融合排序 | RRF 常数，越小名次之间的分差越大 |
+| `retrieval.keyword-weight` | 0.25 | 融合排序 | 关键词一路在 RRF 中的权重（向量为 1） |
 | `chat.history-messages` | 6 | 改写、生成 | 携带的历史消息条数 |
 | `chat.max-context-chars` | 12000 | 拼接 Prompt | 参考资料的字数预算 |
 
 **已知限制**：
 
 - **不支持扫描件**：PDF 解析关闭了 OCR，扫描版 PDF 和纯图片内容会以 `FAILED` 结束。图表里的信息也不会被提取。
-- **只有向量召回**：对精确的编号、型号、人名等关键词不敏感；召回结果也没有重排，排序完全取决于向量相似度。
+- **没有重排**：混合检索只按排名融合，没有用 Reranker 判断片段是否真的回答了问题。员工手册、需求文档这类库里，无答案题的最高相似度（0.55～0.58）高于部分正确片段，单靠余弦阈值无法完全区分，「公司班车几点发车」这类问题仍会拿相近章节作答。
+- **二字组分词较粗**：关键词召回没有词典，「合同」会命中「劳动合同」「租赁合同」，所以融合时给它的权重较低；按人名、型号精确检索主要靠「精确命中优先」。
 - **阈值未校准**：`min-score` 是经验值，还没有评测集。设高了会漏答，设低了会把无关片段交给模型。
 - **向量维度写死**：`vector(1024)` 和 bge-m3 绑定，更换 embedding 模型要改表结构并重新处理全部文档。
 - **引用由模型自觉标注**：`[n]` 是否准确依赖提示词约束，系统没有校验模型引用的编号是否真的支持对应的句子。

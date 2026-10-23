@@ -9,7 +9,7 @@
    │ REST / SSE
 Spring Boot 4 + Spring AI 2
    ├─ 摄入：Tika 解析 → 结构感知切块 → bge-m3 向量化（Ollama 本地） → PostgreSQL + pgvector
-   ├─ 检索：问题改写（多轮） → 向量召回 → 相似度阈值过滤
+   ├─ 检索：问题改写（多轮） → 向量召回 + BM25 关键词召回 → RRF 融合 → 相关性过滤
    └─ 生成：带编号参考资料的 Prompt → DeepSeek 流式输出 → [n] 引用
 ```
 
@@ -46,6 +46,8 @@ JAVA_HOME=$(/usr/libexec/java_home -v 21) ./mvnw spring-boot:run
 - **解析**（`ingestion/DocumentParser`）：Word 按标题样式建立章节路径，没有样式时按"第X章 / 一、/ 2.1"等编号识别；PDF 记录页码；PPT 按幻灯片切分，首行作为标题；Excel 每行转成"列名: 值"，保证切块后每行仍带表头语义。扫描版 PDF 暂不支持（需要 OCR）。
 - **切块**（`ingestion/Chunker`）：不跨章节、不跨幻灯片或工作表；目标 600 字、上限 1000 字；按长度切分时保留约 100 字的句子级重叠。
 - **向量文本**：把"文件名 + 章节路径 + 位置"拼在片段前面再做向量化，提升"XX 手册里的 YY"这类问题的命中率。
+- **混合检索**（`retrieval/Retriever`）：向量召回负责语义相近的问法，BM25 负责条款号、编号、型号这类字面信息（中文按二字组切词，不依赖数据库分词扩展）。精确命中问题中编号的片段排最前，其余按加权 RRF 融合。
+- **检索评测**：`scripts/eval_retrieval.py` 按题集统计 Hit@k、MRR、问答可用率和无答案题拒答率，题集与基线在 `scripts/eval/`。
 - **去重**：同一知识库内按 SHA-256 去重。
 - **恢复**：服务重启后自动继续处理未完成的文档。
 
@@ -66,6 +68,6 @@ JAVA_HOME=$(/usr/libexec/java_home -v 21) ./mvnw spring-boot:run
 
 ## 后续路线
 
-- **P2 效果**：BM25 关键词检索 + 向量的混合召回（RRF 融合）、Reranker 精排、父子块、评估测试集。
+- **P2 效果**：~~BM25 关键词检索 + 向量的混合召回（RRF 融合）~~、~~评估测试集~~（已完成）、Reranker 精排、父子块。
 - **P3 规模**：MinerU / Docling 处理复杂 PDF 与扫描件 OCR、目录监听自动同步、标签过滤。
 - **P4 进阶**：Agentic RAG、跨文档关系问答、图表理解。
