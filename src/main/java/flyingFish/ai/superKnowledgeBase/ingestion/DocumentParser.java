@@ -35,7 +35,8 @@ public class DocumentParser {
     private static final Pattern SECTION_HEADING = Pattern.compile("^第[一二三四五六七八九十百零〇\\d]+节\\s*.*");
     private static final Pattern CN_NUMBER_HEADING = Pattern.compile("^[一二三四五六七八九十]+、.+");
     private static final Pattern CN_PAREN_HEADING = Pattern.compile("^[（(][一二三四五六七八九十]+[)）].+");
-    private static final Pattern DECIMAL_HEADING = Pattern.compile("^(\\d+(?:\\.\\d+){0,4})\\s+\\S.*");
+    /** 首段编号限两位数，避免把"300 高工、主管"这类表格残行、"2026 年计划"这类年份误认成标题 */
+    private static final Pattern DECIMAL_HEADING = Pattern.compile("^(\\d{1,2}(?:\\.\\d+){0,4})\\s+\\S.*");
     private static final Pattern SENTENCE_END = Pattern.compile(".*[。；;：:，,！!？?]$");
 
     private final AutoDetectParser parser = new AutoDetectParser();
@@ -50,7 +51,7 @@ public class DocumentParser {
         } catch (Exception e) {
             throw new IOException("文件解析失败：" + e.getMessage(), e);
         }
-        List<Block> blocks = handler.blocks();
+        List<Block> blocks = type == DocType.PDF ? PdfTextCleaner.clean(handler.blocks()) : handler.blocks();
         return switch (type) {
             case EXCEL -> excelUnits(blocks);
             case PPT -> pptUnits(blocks);
@@ -61,8 +62,9 @@ public class DocumentParser {
     private static ParseContext parseContext() {
         ParseContext context = new ParseContext();
         PDFParserConfig pdfConfig = new PDFParserConfig();
-        // 按阅读顺序抽取文本，减少双栏 PDF 的串行问题；扫描件 OCR 留到后续版本
-        pdfConfig.setSortByPosition(true);
+        // 不按坐标排序：按坐标排序会把双栏 PDF 同一高度的左右两栏拼成一行；
+        // 保持内容流顺序时，常见排版工具生成的双栏 PDF 能先读完左栏再读右栏。扫描件 OCR 留到后续版本
+        pdfConfig.setSortByPosition(false);
         pdfConfig.setOcrStrategy(PDFParserConfig.OCR_STRATEGY.NO_OCR);
         pdfConfig.setExtractInlineImages(false);
         context.set(PDFParserConfig.class, pdfConfig);

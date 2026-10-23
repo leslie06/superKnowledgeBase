@@ -45,7 +45,7 @@ npm run typecheck    # vue-tsc 类型检查
 
 上传（`DocumentService`）→ 按 SHA-256 在同一知识库内去重 → 文件存到 `skb.storage-dir/{kbId}/{sha256}.{ext}` → `IngestionService.submit` 异步处理。处理在固定大小的虚拟线程池中进行（`skb.ingestion.concurrency`，避免压垮本地 Ollama），文档状态依次为 `PENDING → PARSING → EMBEDDING → READY / FAILED`。旧 chunk 删除与新 chunk 写入在同一事务中完成，所以 reindex 是原子替换。应用启动时（`ApplicationReadyEvent`）会自动重新提交所有未完成状态的文档。
 
-- `DocumentParser` + `TikaBlockHandler`：Tika 输出 → `TextUnit`（文本 + 章节路径 + 位置）。Word 优先用标题样式，没有样式时用中文编号正则（"第X章"、"一、"、"2.1" 等）推断标题；PDF 记录页码；PPT 每张幻灯片首行作为标题；Excel 每行转成"列名: 值"。
+- `DocumentParser` + `TikaBlockHandler`：Tika 输出 → `TextUnit`（文本 + 章节路径 + 位置）。Word 优先用标题样式，没有样式时用中文编号正则（"第X章"、"一、"、"2.1" 等）推断标题；PDF 记录页码，并先经 `PdfTextCleaner` 去掉页眉页脚和目录、接回被换行截断的句子；PPT 每张幻灯片首行作为标题；Excel 每行转成"列名: 值"。
 - `Chunker`：不跨章节、不跨幻灯片/工作表（PDF 跨页允许合并，位置记为"第1-2页"）；按 `skb.chunk.*` 的目标/上限字数切分，句子级重叠。
 - 向量化时把"文件名 + 章节 + 位置"拼在片段前面（`IngestionService.embeddingText`），但数据库中 `chunk.content` 只存原文。
 
