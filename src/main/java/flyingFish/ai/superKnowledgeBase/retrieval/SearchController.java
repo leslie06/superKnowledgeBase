@@ -6,16 +6,17 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * 检索调试接口：只看召回结果、各路排名和分数，不做相关性过滤，也不调用 LLM。
+ * 检索调试接口：只看召回结果、各路排名和分数，不做相关性过滤（结果中的 relevant 标出问答时会不会用到），也不调用 LLM。
  */
 @RestController
 @RequestMapping("/api/knowledge-bases/{kbId}/search")
 public class SearchController {
 
     /**
-     * @param mode 召回方式：hybrid（默认，向量 + 关键词融合）、vector、keyword，用于对比各路效果
+     * @param mode   召回方式：hybrid（默认，向量 + 关键词融合）、vector、keyword，用于对比各路效果
+     * @param rerank 是否精排，不传时按配置；只在 hybrid 模式下生效
      */
-    public record SearchRequest(String query, Integer topK, String mode) {
+    public record SearchRequest(String query, Integer topK, String mode, Boolean rerank) {
     }
 
     private final Retriever retriever;
@@ -30,7 +31,7 @@ public class SearchController {
             throw new IllegalArgumentException("查询内容不能为空");
         }
         int topK = request.topK() == null ? 10 : Math.clamp(request.topK(), 1, 50);
-        return retriever.search(kbId, request.query(), topK, mode(request.mode()));
+        return retriever.search(kbId, request.query(), topK, mode(request.mode()), request.rerank());
     }
 
     private static Retriever.Mode mode(String mode) {

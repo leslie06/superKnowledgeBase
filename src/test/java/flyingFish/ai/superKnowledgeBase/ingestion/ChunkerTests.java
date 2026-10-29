@@ -12,7 +12,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 class ChunkerTests {
 
     private final Chunker chunker = new Chunker(new SkbProperties(null, null,
-            new SkbProperties.Chunk(100, 150, 30), null, null));
+            new SkbProperties.Chunk(100, 150, 30), null, null, null));
 
     @Test
     void splitsOnHeadingChange() {

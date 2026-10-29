@@ -16,6 +16,8 @@ export JAVA_HOME=$(/usr/libexec/java_home -v 21)
 ./mvnw test -Dtest=ChunkerTests                                   # 单个测试类
 ./mvnw test -Dtest=ChunkerTests#splitsOnHeadingChange             # 单个测试方法
 python3 scripts/eval_retrieval.py --kb-id 5 --csv scripts/eval/laws.csv   # 检索评测（需后端运行），题集格式见脚本头注释；基线在 scripts/eval/baseline/
+python3 scripts/eval_retrieval.py --kb-id 5 --csv scripts/eval/laws.csv --rerank off   # 对比不精排的效果
+python3 scripts/rerank_server.py                                  # Rerank 服务 http://localhost:8081（bge-reranker-v2-m3，需 sentence-transformers）
 
 cd frontend && npm install
 npm run dev          # http://localhost:5173，/api 代理到 8080
@@ -25,7 +27,7 @@ npm run typecheck    # vue-tsc 类型检查
 
 `SuperKnowledgeBaseApplicationTests`（`@SpringBootTest`）会连接数据库并执行 Flyway 迁移，需要先启动 docker 中的 PostgreSQL；`ChunkerTests` 是纯单元测试，不依赖外部服务。
 
-外部依赖：Ollama（`localhost:11434`，已拉取 `bge-m3`）只用于 embedding；LLM 只用 DeepSeek 云端 API，不要在本机跑本地 LLM（内存不足）。
+外部依赖：Ollama（`localhost:11434`，已拉取 `bge-m3`）只用于 embedding；Rerank 服务（`localhost:8081`，`scripts/rerank_server.py`）用于精排，没启动时检索自动降级；LLM 只用 DeepSeek 云端 API，不要在本机跑本地 LLM（内存不足）。
 
 ## 架构
 
@@ -51,7 +53,7 @@ npm run typecheck    # vue-tsc 类型检查
 
 ### 检索与问答
 
-- `retrieval/Retriever`：混合检索。向量召回是 pgvector HNSW 余弦检索，按 `kb_id` 过滤，查询前 `SET LOCAL hnsw.iterative_scan = relaxed_order` 防止过滤后召回不足，因此结果需要在 Java 中重新排序。关键词召回是 BM25：`KeywordAnalyzer` 在 Java 里切词（中文二字组、英文数字整词、条款号规范成"第N条"），写入 `chunk.keyword_tsv`，PG 只做 GIN 索引和打分，不依赖中文分词扩展。融合时，精确命中问题中编号的片段排在最前，其余按加权 RRF 排序。`score` 始终是余弦相似度。`retrieve()` 只保留 `score >= min-score` 或 `exactMatch` 的片段；`search()` 不过滤，供 `/search` 调试接口使用（支持 `mode=hybrid|vector|keyword`）。修改分词规则后，要把 `keyword_tsv` 置空并重启，由 `KeywordIndexBackfill` 重建。后续计划在这里加入 Rerank。
+- `retrieval/Retriever`：混合检索。向量召回是 pgvector HNSW 余弦检索，按 `kb_id` 过滤，查询前 `SET LOCAL hnsw.iterative_scan = relaxed_order` 防止过滤后召回不足，因此结果需要在 Java 中重新排序。关键词召回是 BM25：`KeywordAnalyzer` 在 Java 里切词（中文二字组、英文数字整词、条款号规范成"第N条"），写入 `chunk.keyword_tsv`，PG 只做 GIN 索引和打分，不依赖中文分词扩展。融合时，精确命中问题中编号的片段排在最前，其余按加权 RRF 排序。随后把 RRF 前 `skb.rerank.candidates` 个片段（章节路径 + 正文）交给 `RerankClient` 精排，仍然精确命中优先、其余按 `rerankScore` 排序；精排在数据库事务之外调用，服务不可用时记 WARN 并退回 RRF 排序。`score` 始终是余弦相似度，`rerankScore` 是精排分数（0~1，未精排为 null）。相关性由 `relevant` 字段表示：精排时为 `rerankScore >= rerank.min-score`，未精排时为 `score >= retrieval.min-score`，精确命中的片段始终相关。`retrieve()` 只保留 `relevant` 的片段；`search()` 不过滤，供 `/search` 调试接口使用（支持 `mode=hybrid|vector|keyword` 和 `rerank=true|false`，单路模式不精排），评测脚本直接读取 `relevant`。修改分词规则后，要把 `keyword_tsv` 置空并重启，由 `KeywordIndexBackfill` 重建。
 - `chat/ChatService`：多轮对话时先用 LLM 把问题改写成独立查询 → 检索 → 按 `skb.chat.max-context-chars` 预算组装带编号的参考资料 → `ChatClient` 流式生成。返回 SSE 事件 `citations` → `delta`* → `done`（出错时为 `error`），前端 `ChatView.vue` 依赖这个顺序。无命中时不调用 LLM，直接返回固定回答。改写后的查询和命中分数作为 `retrieval_trace` 存入 `message` 表，便于排查 bad case。
 - 未配置 DeepSeek Key 时应用依然可以启动（占位值 `not-configured`），只有问答接口会返回 error 事件。
 

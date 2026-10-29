@@ -9,7 +9,7 @@
    │ REST / SSE
 Spring Boot 4 + Spring AI 2
    ├─ 摄入：Tika 解析 → 结构感知切块 → bge-m3 向量化（Ollama 本地） → PostgreSQL + pgvector
-   ├─ 检索：问题改写（多轮） → 向量召回 + BM25 关键词召回 → RRF 融合 → 相关性过滤
+   ├─ 检索：问题改写（多轮） → 向量召回 + BM25 关键词召回 → RRF 融合 → bge-reranker 精排 → 相关性过滤
    └─ 生成：带编号参考资料的 Prompt → DeepSeek 流式输出 → [n] 引用
 ```
 
@@ -17,12 +17,13 @@ Spring Boot 4 + Spring AI 2
 |---|---|---|
 | PostgreSQL 17 + pgvector | 元数据、向量、对话记录 | docker，端口 5433 |
 | Ollama + bge-m3 | 文本向量化（本地，约 1.2GB 内存） | 端口 11434 |
+| Rerank 服务 + bge-reranker-v2-m3 | 检索结果精排（本地，`scripts/rerank_server.py`，约 2.2GB 模型） | 端口 8081 |
 | DeepSeek | 问答生成、问题改写 | 云端 API |
 | 原始文件 | 按内容哈希存储 | `./data/files` |
 
 ## 启动
 
-前置条件：JDK 21、Docker、Ollama（已拉取 `bge-m3`）、Node 22（仅开发前端时需要）。
+前置条件：JDK 21、Docker、Ollama（已拉取 `bge-m3`）、Python 3.10+ 与 `pip install sentence-transformers`（Rerank 服务）、Node 22（仅开发前端时需要）。
 
 ```bash
 # 1. 数据库
@@ -30,10 +31,14 @@ docker compose up -d
 
 # 2. DeepSeek Key：写在 config/application.yaml（已 gitignore），或设置环境变量 DEEPSEEK_API_KEY
 
-# 3. 构建前端（产物输出到 src/main/resources/static，随 jar 一起打包）
+# 3. Rerank 服务（首次运行会下载约 2.2GB 模型，慢时可设 HF_ENDPOINT=https://hf-mirror.com）
+#    不启动也能用，检索会退回 RRF 排序和余弦阈值；不想用时把 skb.rerank.enabled 设为 false
+python3 scripts/rerank_server.py
+
+# 4. 构建前端（产物输出到 src/main/resources/static，随 jar 一起打包）
 cd frontend && npm install && npm run build && cd ..
 
-# 4. 启动后端（需在项目根目录启动，才能读到 config/application.yaml）
+# 5. 启动后端（需在项目根目录启动，才能读到 config/application.yaml）
 JAVA_HOME=$(/usr/libexec/java_home -v 21) ./mvnw spring-boot:run
 ```
 
@@ -47,6 +52,7 @@ JAVA_HOME=$(/usr/libexec/java_home -v 21) ./mvnw spring-boot:run
 - **切块**（`ingestion/Chunker`）：不跨章节、不跨幻灯片或工作表；目标 600 字、上限 1000 字；按长度切分时保留约 100 字的句子级重叠。
 - **向量文本**：把"文件名 + 章节路径 + 位置"拼在片段前面再做向量化，提升"XX 手册里的 YY"这类问题的命中率。
 - **混合检索**（`retrieval/Retriever`）：向量召回负责语义相近的问法，BM25 负责条款号、编号、型号这类字面信息（中文按二字组切词，不依赖数据库分词扩展）。精确命中问题中编号的片段排最前，其余按加权 RRF 融合。
+- **精排**（`retrieval/RerankClient`）：RRF 前 20 个片段交给交叉编码器 bge-reranker-v2-m3 逐对打分并重排，相关性过滤改用精排分数。余弦相似度只反映话题像不像，分不清"有相关章节但没有答案"；精排后无答案题拒答 7/19 → 14/19，问答可用 114/118 → 117/118，单次检索总耗时约 2 秒（M2 Pro，MPS）。
 - **检索评测**：`scripts/eval_retrieval.py` 按题集统计 Hit@k、MRR、问答可用率和无答案题拒答率，题集与基线在 `scripts/eval/`。
 - **去重**：同一知识库内按 SHA-256 去重。
 - **恢复**：服务重启后自动继续处理未完成的文档。
@@ -68,6 +74,6 @@ JAVA_HOME=$(/usr/libexec/java_home -v 21) ./mvnw spring-boot:run
 
 ## 后续路线
 
-- **P2 效果**：~~BM25 关键词检索 + 向量的混合召回（RRF 融合）~~、~~评估测试集~~（已完成）、Reranker 精排、父子块。
+- **P2 效果**：~~BM25 关键词检索 + 向量的混合召回（RRF 融合）~~、~~评估测试集~~、~~Reranker 精排~~（已完成）、父子块（法条类片段一块含多个条文，精排分数被稀释）、口语化查询改写。
 - **P3 规模**：MinerU / Docling 处理复杂 PDF 与扫描件 OCR、目录监听自动同步、标签过滤。
 - **P4 进阶**：Agentic RAG、跨文档关系问答、图表理解。

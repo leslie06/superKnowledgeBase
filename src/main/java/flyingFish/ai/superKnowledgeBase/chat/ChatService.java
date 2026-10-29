@@ -21,6 +21,7 @@ import reactor.core.scheduler.Schedulers;
 import tools.jackson.databind.json.JsonMapper;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -57,8 +58,9 @@ public class ChatService {
             如果最新问题本身已经完整，原样输出。
             """;
 
+    /** @param hits 检索命中的片段及分数，写入 retrieval_trace 便于排查 bad case */
     private record PreparedChat(Conversation conversation, List<ChatMessage> history, String question,
-                                String searchQuery, List<Citation> citations) {
+                                String searchQuery, List<Citation> citations, List<Map<String, Object>> hits) {
     }
 
     private final ConversationRepository conversations;
@@ -146,7 +148,7 @@ public class ChatService {
         }
         String searchQuery = history.isEmpty() ? question : rewriteQuery(history, question);
         List<RetrievedChunk> chunks = retriever.retrieve(conversation.kbId(), searchQuery);
-        return new PreparedChat(conversation, history, question, searchQuery, toCitations(chunks));
+        return new PreparedChat(conversation, history, question, searchQuery, toCitations(chunks), trace(chunks));
     }
 
     private Flux<ServerSentEvent<String>> answer(PreparedChat chat) {
@@ -185,11 +187,7 @@ public class ChatService {
     }
 
     private long saveAssistantMessage(PreparedChat chat, String answer) {
-        Map<String, Object> trace = Map.of(
-                "searchQuery", chat.searchQuery(),
-                "hits", chat.citations().stream()
-                        .map(c -> Map.of("chunkId", c.chunkId(), "score", c.score()))
-                        .toList());
+        Map<String, Object> trace = Map.of("searchQuery", chat.searchQuery(), "hits", chat.hits());
         return conversations.insertMessage(chat.conversation().id(), ChatMessage.ASSISTANT, answer,
                 chat.citations(), trace);
     }
@@ -210,6 +208,18 @@ public class ChatService {
             log.warn("问题改写失败，使用原问题检索", e);
             return question;
         }
+    }
+
+    private static List<Map<String, Object>> trace(List<RetrievedChunk> chunks) {
+        return chunks.stream().map(c -> {
+            Map<String, Object> hit = new LinkedHashMap<>();
+            hit.put("chunkId", c.chunkId());
+            hit.put("score", c.score());
+            if (c.rerankScore() != null) {
+                hit.put("rerankScore", c.rerankScore());
+            }
+            return hit;
+        }).toList();
     }
 
     /** 按相关度从高到低放入上下文，超过字符预算即停止。 */

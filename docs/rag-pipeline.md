@@ -1,14 +1,14 @@
 # 超级知识库：文档摄入与检索问答实现说明
 
-2026-10-15 · [在线版](https://claude.ai/code/artifact/65ce178b-e780-41b2-9bfe-34d933a50508)
+2026-10-29 · [在线版](https://claude.ai/code/artifact/65ce178b-e780-41b2-9bfe-34d933a50508)
 
 ## 概述
 
-系统有两条核心链路：**摄入**把上传的 Word / Excel / PPT / PDF 变成带出处信息的向量片段，存进 PostgreSQL；**检索问答**把用户问题变成向量，在同一个库里召回最相关的片段，拼成带编号的参考资料交给 DeepSeek 流式回答，并要求标注 `[n]` 引用。
+系统有两条核心链路：**摄入**把上传的 Word / Excel / PPT / PDF 变成带出处信息的向量片段和关键词索引，存进 PostgreSQL；**检索问答**用向量和关键词两路在同一个库里召回片段，经交叉编码器精排、过滤掉不相关的片段后，拼成带编号的参考资料交给 DeepSeek 流式回答，并要求标注 `[n]` 引用。
 
 两条链路共用同一个 embedding 模型（Ollama 本地 bge-m3，1024 维）和同一张 `chunk` 表：摄入写、检索读。向量和业务数据都在 PostgreSQL（pgvector 扩展）里，没有独立的向量数据库。
 
-![两条核心链路 · 摄入 5 步、检索问答 6 步](images/rag-overview.png)
+![两条核心链路 · 摄入 5 步、检索问答 7 步](images/rag-overview.png)
 
 上排每篇文档执行一次，下排每次提问执行一次；两条链路通过 `chunk` 表和同一个 bge-m3 模型衔接。
 
@@ -19,7 +19,8 @@
 | 解析 | `ingestion/DocumentParser`、`TikaBlockHandler` | Apache Tika 3 |
 | 切分 | `ingestion/Chunker` | 无 |
 | 问题改写、拼接 Prompt、流式生成 | `chat/ChatController`、`ChatService` | DeepSeek API |
-| 向量检索与召回过滤 | `retrieval/Retriever` | Ollama bge-m3、PostgreSQL |
+| 混合检索与召回过滤 | `retrieval/Retriever`、`KeywordAnalyzer` | Ollama bge-m3、PostgreSQL |
+| 精排 | `retrieval/RerankClient`、`scripts/rerank_server.py` | 本地 Rerank 服务（bge-reranker-v2-m3） |
 
 技术栈：Spring Boot 4 + Spring AI 2、Apache Tika 3、PostgreSQL 17 + pgvector；持久层用 `JdbcClient` 手写 SQL，表结构由 Flyway 管理。下文代码均摘自仓库当前版本，略去了与主流程无关的部分。
 
@@ -244,16 +245,17 @@ private static final String REWRITE_SYSTEM_PROMPT = """
 - **降级**：改写调用抛异常或返回空内容时，退回用原问题检索，只记一条 warn 日志，不影响后续回答。
 - 改写后的问题会作为 `searchQuery` 存进答案消息的 `retrieval_trace`，排查「为什么没检索到」时可以直接看到实际用于检索的是什么。
 
-**问题向量化**在 `Retriever.rank` 里完成：`embeddingModel.embed(query)` 用和摄入时同一个 bge-m3 模型，把问题转成 1024 维向量。问题和片段必须用同一个模型，否则两边的向量不在同一个空间里，距离没有意义。问题不加任何前缀；片段向量化时加的「文件 / 章节 / 位置」头部，是为了让问题里提到的文件名、章节名也能匹配上。
+**问题向量化**在 `Retriever.fuse` 里完成：`embeddingModel.embed(query)` 用和摄入时同一个 bge-m3 模型，把问题转成 1024 维向量。问题和片段必须用同一个模型，否则两边的向量不在同一个空间里，距离没有意义。问题不加任何前缀；片段向量化时加的「文件 / 章节 / 位置」头部，是为了让问题里提到的文件名、章节名也能匹配上。
 
-## 检索问答二：混合检索与召回过滤
+## 检索问答二：混合检索、精排与召回过滤
 
-检索分两路召回再融合，入口是 `Retriever.rank`：
+检索分两路召回、融合后再精排，入口是 `Retriever.rank`：
 
 1. **向量召回**：HNSW 余弦检索，取最相近的 `candidates`（30）个，擅长换了说法的问题；
 2. **关键词召回**：BM25，同样取 30 个，擅长条款号、编号、型号这类向量不敏感的字面信息；
 3. **融合排序**：精确命中问题中编号的片段排最前，其余按加权 RRF 排序；
-4. **召回过滤**（仅问答）：丢掉余弦相似度低于 `min-score`（0.5）且没有精确命中的片段，取前 `top-k`（6）个。
+4. **精排**：RRF 前 `rerank.candidates`（20）个片段交给交叉编码器逐对打分，按精排分数重排，精确命中仍排最前；
+5. **召回过滤**（仅问答）：只保留精排分数 ≥ `rerank.min-score`（0.01）或精确命中的片段，取前 `top-k`（6）个。精排服务不可用时退回 RRF 顺序，改用余弦相似度 ≥ `retrieval.min-score`（0.5）过滤。
 
 为什么要加关键词一路：只有向量召回时，「劳动合同法第三十九条」「民法典第1079条」这类按条款号提问的题，14 道里只有 1 道排第一（`scripts/eval/laws_article.csv`）。bge-m3 把「第三十九条」和「第二十九条」看成几乎一样的东西，而且错误结果的相似度都在 0.5 以上，阈值也拦不住。
 
@@ -319,7 +321,7 @@ rows.sorted(comparing(exactMatch).reversed()
 - **精确命中优先**：问题中的「精确词项」指条款编号、字母数字混合的编号（q5、rw_202607050001）和 5 位以上的数字（商品编码等）。片段包含其中任意一个时 `exactMatch = true`，排在所有片段前面。
 - **加权 RRF**：其余片段的得分为 `1 / (rrf-k + 向量排名) + keyword-weight / (rrf-k + 关键词排名)`，只出现在一路时只算该路。RRF 只看排名、不看分数，余弦相似度和 BM25 分数的量纲不同也能直接融合。
 - **参数**：`rrf-k = 10`、`keyword-weight = 0.25`，是在四份题集上网格搜索得到的。常见的 `k = 60` 等权融合会让 laws 题集的 Hit@1 从 100% 掉到 56%。k 越大，各名次之间的分差越小：k = 60 时向量第 1 名和第 9 名只差 0.002，关键词这一路随便贡献一点就能把顺序翻过来。而二字组 BM25 对改写、口语化的问题噪声很大，例如「租房合同最长能签多少年」会命中一堆含「合同」的劳动合同法条文。
-- **结果中的分数**：`score` 始终是与问题的余弦相似度。只从关键词召回的片段会补算余弦相似度，过滤和前端展示仍然统一用它。另有 `keywordScore`（BM25）、`vectorRank`、`keywordRank`、`exactMatch` 字段，用于排查。
+- **结果中的分数**：`score` 始终是与问题的余弦相似度，只从关键词召回的片段也会补算。另有 `keywordScore`（BM25）、`vectorRank`、`keywordRank`、`rerankScore`（精排分数，未精排时为 null）、`exactMatch` 字段用于排查，`relevant` 表示是否通过召回过滤。
 
 不同方式在四份题集上的 Hit@1 / 问答可用率（`python3 scripts/eval_retrieval.py --mode vector|hybrid ...`）：
 
@@ -330,24 +332,106 @@ rows.sorted(comparing(exactMatch).reversed()
 | `handbook.csv` | 员工手册（双栏 PDF） | 78.9% / 94.7% | 89.5% / 100% |
 | `requirements.csv` | 需求文档中的编码、ID、字段规则 | 80.0% / 85.0% | 95.0% / 100% |
 
-无答案题的拒答率不变（laws 100%，handbook 0%，requirements 33.3%）。混合检索解决的是「找得到、排得准」，判断「库里到底有没有答案」要靠后续的 Reranker。
+无答案题的拒答率不变（laws 100%，handbook 0%，requirements 33.3%）。混合检索解决的是「找得到、排得准」，判断「库里到底有没有答案」交给下面的精排。
+
+### 精排（Rerank）
+
+**为什么要精排**。向量检索是双编码器：问题和片段各自压缩成一个向量再比较余弦，只能反映「话题像不像」。「迟到一次扣多少钱」会以 0.66 的高分命中「考勤处罚」章节，但那一节只写了「依据《员工考勤管理规定》执行」，并没有金额；「转正后辞职要提前多久」和试用期「提前三日」的片段在向量上也几乎分不开。新增的难题集（`handbook_hard.csv`、`laws_hard.csv`）上，正确片段的余弦最低 0.53，无答案题的最高分却有 0.66，阈值怎么调都分不开。
+
+交叉编码器（bge-reranker-v2-m3）把「问题 + 片段」拼成一条输入，让模型逐字对照后直接输出相关性。它比双编码器准得多，但每对都要实时推理，没法对全库做，所以只对 RRF 的前 20 个片段精排：两路召回负责「别漏掉」，精排负责「排准、判断有没有答案」。
+
+**服务**。`scripts/rerank_server.py` 用 sentence-transformers 加载模型，在 Apple Silicon 上走 MPS、fp16 推理（与 fp32 分数相差不到 0.01），默认端口 8081。接口与 HuggingFace text-embeddings-inference 的 `/rerank` 相同，以后可以直接换成 TEI：
+
+```text
+POST /rerank   {"query": "年假有几天", "texts": ["片段1", "片段2"]}
+→              [{"index": 1, "score": 0.93}, {"index": 0, "score": 0.02}]
+```
+
+`score` 经过 sigmoid，范围 0～1。服务按 HTTP/1.1 保持连接，推理串行执行（GPU 上并发没有收益）。
+
+**后端调用**（`RerankClient`、`Retriever.rerank`）：
+
+```java
+private List<RetrievedChunk> rank(long kbId, String query, Mode mode, int poolSize, boolean rerank) {
+    List<RetrievedChunk> fused = fuse(kbId, query, mode, poolSize);
+    // 精排是一次 HTTP 调用，放在数据库事务之外，避免长时间占用连接
+    return rerank && !fused.isEmpty() ? rerank(query, fused) : fused;
+}
+
+private List<RetrievedChunk> rerank(String query, List<RetrievedChunk> fused) {
+    List<RetrievedChunk> head = fused.subList(0, Math.min(rerankCandidates, fused.size()));
+    double[] scores;
+    try {
+        scores = rerankClient.score(query, head.stream().map(Retriever::rerankText).toList());
+    } catch (RuntimeException e) {
+        log.warn("精排失败，退回 RRF 排序：{}", e.getMessage());
+        return fused;
+    }
+    // 精确命中仍排最前，其余按精排分数降序；精排范围之外的片段保持 RRF 顺序，只有精确命中的仍视为相关
+    ...
+}
+```
+
+- **送给模型的文本**：「章节路径 + 换行 + 正文」。「考勤处罚」「试用期终止」这类标题本身就是重要的判断依据。
+- **降级**：服务没启动、超时（`rerank.timeout`，15 秒）或返回异常时记一条 WARN，退回 RRF 顺序和余弦阈值，问答照常进行。`rerank.enabled: false` 可以整体关闭。
+- **事务之外**：两路召回和取详情仍在只读事务里完成；精排在事务提交后调用，不会在等待模型时占着数据库连接。
+- **HTTP 细节**：`RerankClient` 用 `BufferingClientHttpRequestFactory` 缓冲请求体以带上 `Content-Length`。JDK HttpClient 默认按分块传输发送，Python 的 `http.server` 读不到分块的请求体。
+- **候选数取 20**：延迟与片段数成正比。评测中关闭精排、取前 30 时，所有正确片段在 RRF 中都排在前 13，20 留有余量。30 个时单次精排 3～4 秒，P90 超过 10 秒；20 个时检索总耗时中位约 1.9 秒、P90 约 2.1 秒（M2 Pro，含问题向量化和两路召回）。
+
+**效果**（六份题集，118 道有答案题、19 道无答案题；`--rerank off` 为精排前）：
+
+| 题集 | Hit@1 | Hit@6 | 问答可用率 | 无答案题拒答 |
+| --- | --- | --- | --- | --- |
+| `laws.csv` | 100% → 93.8% | 100% | 100% | 4/4 → 4/4 |
+| `laws_article.csv` | 92.9% → 100% | 100% | 100% | — |
+| `laws_hard.csv` | 65.0% → 55.0% | 95.0% → 100% | 90.0% → 95.0% | 2/4 → 4/4 |
+| `handbook.csv` | 89.5% → 94.7% | 100% | 100% | 0/3 → 1/3 |
+| `handbook_hard.csv` | 65.5% → 72.4% | 93.1% → 100% | 93.1% → 100% | 0/5 → 2/5 |
+| `requirements.csv` | 95.0% → 95.0% | 100% | 100% | 1/3 → 3/3 |
+| **合计** | | | **114 → 117** | **7 → 14** |
+
+- **拒答**是最大的收益：「公司公积金按工资的多少比例缴纳」「申请工伤认定需要准备哪些材料」「开具发票需要填写哪些信息」这类库里有相近内容、余弦相似度在 0.5 以上的问题，精排分数都在 0.005 以下，被直接拦下。「迟到一次扣多少钱」的最高分从余弦 0.66 降到精排 0.24，排序更合理，但仍高于阈值。
+- **列举类问题**：「哪些行为会被公司直接解除劳动合同」的两条证据在 RRF 中排第 12、13，精排后升到第 4，进入问答使用的前 6。
+- **法条类 Hit@1 下降**：法律法规的片段往往一块包含好几个条文，模型对整块打分，正确条文被其他条文稀释，分数普遍只有 0.01～0.3，与相邻的相关片段拉不开差距。laws_hard 有 4 道题从第 1 名掉到第 2 名，但都还在前 6 名以内。按条文切分或父子块可以改善。
+- 选型时也试过 bge-reranker-base（约 1.1GB）：员工手册类有提升，法律类反而变差，它对「考勤处罚」这个难负例打了 0.86 分（v2-m3 为 0.24），区分不了「有相关章节但没有答案」。
 
 ### 召回过滤
 
-`retrieve()` 在融合后的候选上过滤，只保留 `score >= skb.retrieval.min-score` **或** `exactMatch` 的片段，再取前 `top-k` 个。向量检索永远会返回「最近的 k 个」，哪怕它们和问题毫不相关。阈值让「知识库里没有的内容」可以得到明确的「没找到」，而不是拿无关片段勉强作答。阈值最初取 bge-m3 的经验值 0.45，用 `scripts/eval/laws.csv` 评测后调整为 0.5：正确片段最低分 0.557，无答案题最高分 0.455（0.45 时会被放行）。
+`retrieve()` 只保留 `relevant` 的片段，再取前 `top-k` 个。向量检索永远会返回「最近的 k 个」，哪怕它们和问题毫不相关；阈值让「知识库里没有的内容」可以得到明确的「没找到」，而不是拿无关片段勉强作答。`relevant` 在排序时就已算好：
 
-精确命中不受阈值限制，是因为编号类问题的余弦相似度往往偏低。例如「Q5 系统是用来做什么的」，正确片段只有 0.426，「商品编码 2025999500042779 对应哪个产品」只有 0.462。
+| 情况 | 判定 |
+| --- | --- |
+| 精确命中问题中的编号 | 始终相关 |
+| 已精排 | `rerankScore >= rerank.min-score`（0.01） |
+| 未精排（服务不可用或已关闭） | `score >= retrieval.min-score`（0.5，余弦相似度） |
+
+**精排阈值 0.01** 是在六份题集上离线扫描得到的。bge-reranker-v2-m3 经 sigmoid 后分数分布很偏，无关片段通常只有 0.001 左右：
+
+| `rerank.min-score` | 问答可用（118） | 无答案题拒答（19） |
+| --- | --- | --- |
+| 精排前（余弦 ≥ 0.5） | 114 | 7 |
+| 0.005 | 117 | 11 |
+| **0.01** | **117** | **14** |
+| 0.02 | 115 | 15 |
+| 0.03 | 114 | 16 |
+| 0.1 | 104 | 17 |
+
+0.01 是唯一在两项上都优于精排前的取值。再往上提，误伤的是「捡到别人的钱包必须还吗」「10岁的孩子自己买游戏装备算数吗」这类口语化问题：正确片段的精排分数只有 0.002～0.02。宁可把无关片段交给 LLM，让它按提示词回答「资料中没有」，也不要把有答案的题直接拒掉。
+
+**余弦阈值 0.5** 只在未精排时使用。它最初取 bge-m3 的经验值 0.45，用 `scripts/eval/laws.csv` 评测后调整为 0.5：正确片段最低分 0.557，无答案题最高分 0.455（0.45 时会被放行）。
+
+精确命中不受阈值限制，是因为编号类问题的分数往往偏低。例如「Q5 系统是用来做什么的」，正确片段的余弦相似度只有 0.426，「商品编码 2025999500042779 对应哪个产品」只有 0.462。
 
 ```java
 public List<RetrievedChunk> retrieve(long kbId, String query) {
-    return rank(kbId, query, Mode.HYBRID, candidates).stream()
-            .filter(c -> c.score() >= minScore || c.exactMatch())
+    return rank(kbId, query, Mode.HYBRID, candidates, rerankEnabled).stream()
+            .filter(RetrievedChunk::relevant)
             .limit(defaultTopK)
             .toList();
 }
 ```
 
-**调试接口**：`POST /api/knowledge-bases/{kbId}/search`，请求体 `{"query": "...", "topK": 10, "mode": "hybrid"}`。topK 限制在 1～50；`mode` 可选 `hybrid`（默认）、`vector`、`keyword`，用来对比单路效果。它直接调用 `search()`，不做相关性过滤，也不调用 LLM，用来观察排名和分数分布、调整参数。前端「检索测试」会显示每条结果的向量 / 关键词排名和「精确命中」标记。
+**调试接口**：`POST /api/knowledge-bases/{kbId}/search`，请求体 `{"query": "...", "topK": 10, "mode": "hybrid", "rerank": true}`。topK 限制在 1～50；`mode` 可选 `hybrid`（默认）、`vector`、`keyword`，用来对比单路效果，单路模式不精排；`rerank` 不传时按配置。它直接调用 `search()`，不做相关性过滤，也不调用 LLM，用来观察排名和分数分布、调整参数。前端「检索测试」会显示每条结果的向量 / 关键词排名、精排分数、「精确命中」和「不相关」标记。评测脚本直接读取结果里的 `relevant`，与问答时的过滤逻辑保持一致；`--rerank off` 用来对比精排前的效果。
 
 **直接用 SQL 验证向量召回**：向量召回本身就是上面那条 SQL，可以在 psql 里手动执行，观察召回结果和分数。SQL 没法把文字转成向量，所以「问题」有两种来源。
 
@@ -436,10 +520,10 @@ private static final String ANSWER_SYSTEM_PROMPT = """
 | 3 | `done` | `{"messageId": 123}` | 答案已入库 |
 | 任意时刻 | `error` | `{"message": "..."}` | 改写、检索或生成失败 |
 
-**答案入库**。流正常结束后，把累积的完整答案、引用列表（`citations` JSONB）和检索轨迹（`retrieval_trace` JSONB）一起写入 `message` 表，然后发送 `done`。检索轨迹记录了实际用于检索的问题和每个命中片段的分数，格式如下（数值为示例）：
+**答案入库**。流正常结束后，把累积的完整答案、引用列表（`citations` JSONB）和检索轨迹（`retrieval_trace` JSONB）一起写入 `message` 表，然后发送 `done`。检索轨迹记录了实际用于检索的问题，以及通过召回过滤的每个片段的余弦相似度和精排分数（未精排时没有 `rerankScore`），格式如下（数值为示例）：
 
 ```json
-{"searchQuery": "病假有几天？", "hits": [{"chunkId": 812, "score": 0.71}, {"chunkId": 640, "score": 0.58}]}
+{"searchQuery": "病假有几天？", "hits": [{"chunkId": 812, "score": 0.71, "rerankScore": 0.93}, {"chunkId": 640, "score": 0.58, "rerankScore": 0.12}]}
 ```
 
 用户中途点「停止」会触发流的 `doOnCancel`：已生成的部分加上「（已停止生成）」后照样入库，刷新页面后不会丢失。
@@ -456,20 +540,27 @@ private static final String ANSWER_SYSTEM_PROMPT = """
 | `chunk.max-chars` | 1000 | 切分 | 片段字数上限；超过它的段落按句拆分 |
 | `chunk.overlap-chars` | 100 | 切分 | 因长度切分时的句子级重叠 |
 | `retrieval.top-k` | 6 | 检索 | 问答时召回的片段数 |
-| `retrieval.min-score` | 0.5 | 召回过滤 | 余弦相似度阈值；精确命中编号的片段不受限制 |
+| `retrieval.min-score` | 0.5 | 召回过滤 | 未精排时的余弦相似度阈值；精确命中编号的片段不受限制 |
 | `retrieval.candidates` | 30 | 混合检索 | 向量、关键词两路各召回的候选数 |
 | `retrieval.rrf-k` | 10 | 融合排序 | RRF 常数，越小名次之间的分差越大 |
 | `retrieval.keyword-weight` | 0.25 | 融合排序 | 关键词一路在 RRF 中的权重（向量为 1） |
+| `rerank.enabled` | true | 精排 | 是否精排；服务不可用时自动降级，无需改配置 |
+| `rerank.base-url` | `http://localhost:8081` | 精排 | Rerank 服务地址 |
+| `rerank.candidates` | 20 | 精排 | 取 RRF 前多少个片段精排，延迟与它成正比 |
+| `rerank.min-score` | 0.01 | 召回过滤 | 精排分数阈值，精排时取代 `retrieval.min-score` |
+| `rerank.timeout` | 15s | 精排 | 单次精排请求超时，超时后退回 RRF |
 | `chat.history-messages` | 6 | 改写、生成 | 携带的历史消息条数 |
 | `chat.max-context-chars` | 12000 | 拼接 Prompt | 参考资料的字数预算 |
 
 **已知限制**：
 
 - **不支持扫描件**：PDF 解析关闭了 OCR，扫描版 PDF 和纯图片内容会以 `FAILED` 结束。图表里的信息也不会被提取。
-- **没有重排**：混合检索只按排名融合，没有用 Reranker 判断片段是否真的回答了问题。员工手册、需求文档这类库里，无答案题的最高相似度（0.55～0.58）高于部分正确片段，单靠余弦阈值无法完全区分，「公司班车几点发车」这类问题仍会拿相近章节作答。
+- **精排依赖本地服务和算力**：Rerank 服务要单独启动，模型约 2.2GB；精排 20 个片段中位约 1.7 秒。没启动时自动降级为 RRF + 余弦阈值，拒答能力回到精排前的水平。
+- **长片段稀释精排分数**：法条类片段一块包含多个条文，正确条文的分数被稀释，Hit@1 不升反降（见上文）。
+- **仍有拒答不了的难负例**：「公司班车几点发车」「迟到一次扣多少钱」「加班费按工资的几倍算」这类问题，库里有高度相关的章节但没有答案，精排分数仍高于阈值，要靠 LLM 按提示词说明「资料中没有」。
 - **二字组分词较粗**：关键词召回没有词典，「合同」会命中「劳动合同」「租赁合同」，所以融合时给它的权重较低；按人名、型号精确检索主要靠「精确命中优先」。
-- **阈值全局统一**：`min-score` 0.5 是在法律法规题集上校准的，不同知识库的分数分布不同，一个全局阈值不能兼顾所有库。调整前先用 `scripts/eval_retrieval.py --min-score` 在各题集上模拟。
+- **阈值全局统一**：`rerank.min-score` 是在六份题集上整体校准的，不同知识库的分数分布不同，一个全局阈值不能兼顾所有库。调整前先用 `scripts/eval_retrieval.py` 在各题集上评测。
 - **向量维度写死**：`vector(1024)` 和 bge-m3 绑定，更换 embedding 模型要改表结构并重新处理全部文档。
 - **引用由模型自觉标注**：`[n]` 是否准确依赖提示词约束，系统没有校验模型引用的编号是否真的支持对应的句子。
 
-**后续演进**（摘自 README）：P2 加入 BM25 与向量的混合召回（RRF 融合）、Reranker 精排、父子块和评估测试集，改动集中在 `Retriever`；P3 引入 MinerU / Docling 处理复杂 PDF 和 OCR，改动集中在 `DocumentParser`。
+**后续演进**（摘自 README）：P2 已完成混合召回、Reranker 精排和评估测试集，剩下父子块（缓解长片段稀释精排分数）和口语化查询改写（「出轨」「钱包」与法条术语对不上），改动集中在 `Chunker`、`Retriever` 和 `ChatService`；P3 引入 MinerU / Docling 处理复杂 PDF 和 OCR，改动集中在 `DocumentParser`。

@@ -55,6 +55,16 @@ skb:
     # 精确命中问题中编号的片段始终排在最前。两个值由 scripts/eval 四份题集网格搜索得出
     rrf-k: 10
     keyword-weight: 0.25
+  rerank:
+    # 交叉编码器精排，需先启动 scripts/rerank_server.py；服务不可用时退回 RRF 排序和上面的 min-score
+    enabled: true
+    base-url: http://localhost:8081
+    # 取 RRF 融合后的前多少个片段精排；评测中正确片段在 RRF 中都排在前 13，延迟与数量成正比
+    candidates: 20
+    # 精排分数（0~1）阈值，启用精排时取代 retrieval.min-score。bge-reranker-v2-m3 对无关片段通常给 0.001 左右；
+    # 按 scripts/eval 六份题集扫描，0.01 时问答可用 117/118、拒答 14/19，再提高会误伤口语化问题的正确片段
+    min-score: 0.01
+    timeout: 15s
   chat:
     history-messages: 6
     max-context-chars: 12000

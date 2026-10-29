@@ -2,6 +2,8 @@ package flyingFish.ai.superKnowledgeBase.retrieval;
 
 import flyingFish.ai.superKnowledgeBase.common.PgVectors;
 import flyingFish.ai.superKnowledgeBase.common.SkbProperties;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.ai.embedding.EmbeddingModel;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Service;
@@ -19,7 +21,9 @@ import java.util.stream.Collectors;
 
 /**
  * 混合检索：向量召回（语义相近）和关键词召回（BM25，擅长编号、型号、专有名词）各取若干候选，
- * 用加权 RRF 按排名融合；精确命中问题中编号（条款号、型号等）的片段排在最前。后续在这里加入 Rerank。
+ * 用加权 RRF 按排名融合，再把前若干个交给交叉编码器精排；精确命中问题中编号（条款号、型号等）的片段始终排在最前。
+ * <p>
+ * 余弦相似度只反映"话题像不像"，无法区分"有相关章节但没有答案"和"真正能回答"，所以启用精排时用精排分数做相关性过滤。
  */
 @Service
 public class Retriever {
@@ -33,22 +37,28 @@ public class Retriever {
                             String content, double score, boolean exactMatch) {
     }
 
+    private static final Logger log = LoggerFactory.getLogger(Retriever.class);
     private static final double BM25_K1 = 1.2;
     private static final double BM25_B = 0.75;
 
     private final JdbcClient jdbc;
     private final EmbeddingModel embeddingModel;
+    private final RerankClient rerankClient;
     private final TransactionTemplate readOnlyTx;
     private final int defaultTopK;
     private final double minScore;
     private final int candidates;
     private final int rrfK;
     private final double keywordWeight;
+    private final boolean rerankEnabled;
+    private final int rerankCandidates;
+    private final double rerankMinScore;
 
-    public Retriever(JdbcClient jdbc, EmbeddingModel embeddingModel, TransactionTemplate transactionTemplate,
-                     SkbProperties properties) {
+    public Retriever(JdbcClient jdbc, EmbeddingModel embeddingModel, RerankClient rerankClient,
+                     TransactionTemplate transactionTemplate, SkbProperties properties) {
         this.jdbc = jdbc;
         this.embeddingModel = embeddingModel;
+        this.rerankClient = rerankClient;
         this.readOnlyTx = new TransactionTemplate(transactionTemplate.getTransactionManager());
         this.readOnlyTx.setReadOnly(true);
         this.defaultTopK = properties.retrieval().topK();
@@ -56,22 +66,36 @@ public class Retriever {
         this.candidates = properties.retrieval().candidates();
         this.rrfK = properties.retrieval().rrfK();
         this.keywordWeight = properties.retrieval().keywordWeight();
+        this.rerankEnabled = properties.rerank().enabled();
+        this.rerankCandidates = properties.rerank().candidates();
+        this.rerankMinScore = properties.rerank().minScore();
     }
 
     /** 问答用：混合检索后去掉不相关的片段，取前 top-k 个。 */
     public List<RetrievedChunk> retrieve(long kbId, String query) {
-        return rank(kbId, query, Mode.HYBRID, candidates).stream()
-                .filter(c -> c.score() >= minScore || c.exactMatch())
+        return rank(kbId, query, Mode.HYBRID, candidates, rerankEnabled).stream()
+                .filter(RetrievedChunk::relevant)
                 .limit(defaultTopK)
                 .toList();
     }
 
-    /** 不做相关性过滤的原始检索结果，供调试接口查看各路排名和分数。 */
-    public List<RetrievedChunk> search(long kbId, String query, int topK, Mode mode) {
-        return rank(kbId, query, mode, Math.max(candidates, topK)).stream().limit(topK).toList();
+    /**
+     * 不做相关性过滤的原始检索结果，供调试接口查看各路排名和分数。
+     *
+     * @param rerank 是否精排，null 时按配置；只在 hybrid 模式下生效，单路模式用于对比召回效果
+     */
+    public List<RetrievedChunk> search(long kbId, String query, int topK, Mode mode, Boolean rerank) {
+        boolean useRerank = mode == Mode.HYBRID && (rerank == null ? rerankEnabled : rerank);
+        return rank(kbId, query, mode, Math.max(candidates, topK), useRerank).stream().limit(topK).toList();
     }
 
-    private List<RetrievedChunk> rank(long kbId, String query, Mode mode, int poolSize) {
+    private List<RetrievedChunk> rank(long kbId, String query, Mode mode, int poolSize, boolean rerank) {
+        List<RetrievedChunk> fused = fuse(kbId, query, mode, poolSize);
+        // 精排是一次 HTTP 调用，放在数据库事务之外，避免长时间占用连接
+        return rerank && !fused.isEmpty() ? rerank(query, fused) : fused;
+    }
+
+    private List<RetrievedChunk> fuse(long kbId, String query, Mode mode, int poolSize) {
         String vector = PgVectors.toLiteral(embeddingModel.embed(query));
         List<String> terms = KeywordAnalyzer.queryTerms(query);
         return readOnlyTx.execute(status -> {
@@ -98,9 +122,48 @@ public class Retriever {
                             .thenComparing(Comparator.comparingDouble(ChunkRow::score).reversed()))
                     .map(r -> new RetrievedChunk(r.chunkId(), r.documentId(), r.filename(), r.headingPath(),
                             r.location(), r.content(), r.score(), keywordScores.get(r.chunkId()),
-                            vectorRanks.get(r.chunkId()), keywordRanks.get(r.chunkId()), r.exactMatch()))
+                            vectorRanks.get(r.chunkId()), keywordRanks.get(r.chunkId()), null, r.exactMatch(),
+                            r.score() >= minScore || r.exactMatch()))
                     .toList();
         });
+    }
+
+    /**
+     * 交叉编码器精排：把问题和片段放在一起逐对打分，能区分"试用期"和"转正后"这类相近规则，
+     * 也能识别"有相关章节但没有答案"的片段。精排范围之外的片段保持 RRF 顺序，只有精确命中的仍视为相关。
+     * 服务不可用时退回 RRF 排序和余弦阈值，问答不受影响。
+     */
+    private List<RetrievedChunk> rerank(String query, List<RetrievedChunk> fused) {
+        List<RetrievedChunk> head = fused.subList(0, Math.min(rerankCandidates, fused.size()));
+        double[] scores;
+        try {
+            scores = rerankClient.score(query, head.stream().map(Retriever::rerankText).toList());
+        } catch (RuntimeException e) {
+            log.warn("精排失败，退回 RRF 排序：{}", e.getMessage());
+            return fused;
+        }
+        List<RetrievedChunk> reranked = new ArrayList<>(fused.size());
+        for (int i = 0; i < head.size(); i++) {
+            RetrievedChunk c = head.get(i);
+            reranked.add(withRerank(c, scores[i], scores[i] >= rerankMinScore || c.exactMatch()));
+        }
+        reranked.sort(Comparator.comparing(RetrievedChunk::exactMatch).reversed()
+                .thenComparing(Comparator.comparingDouble(RetrievedChunk::rerankScore).reversed()));
+        for (RetrievedChunk c : fused.subList(head.size(), fused.size())) {
+            reranked.add(withRerank(c, null, c.exactMatch()));
+        }
+        return reranked;
+    }
+
+    /** 章节路径也交给精排模型，"考勤处罚""试用期终止"这类标题本身就是重要的判断依据。 */
+    private static String rerankText(RetrievedChunk c) {
+        return c.headingPath() == null ? c.content() : c.headingPath() + "\n" + c.content();
+    }
+
+    private static RetrievedChunk withRerank(RetrievedChunk c, Double rerankScore, boolean relevant) {
+        return new RetrievedChunk(c.chunkId(), c.documentId(), c.filename(), c.headingPath(), c.location(),
+                c.content(), c.score(), c.keywordScore(), c.vectorRank(), c.keywordRank(), rerankScore,
+                c.exactMatch(), relevant);
     }
 
     private List<Hit> vectorSearch(long kbId, String vector, int limit) {

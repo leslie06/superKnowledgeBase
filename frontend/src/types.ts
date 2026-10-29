@@ -50,8 +50,12 @@ export interface RetrievedChunk {
   keywordScore: number | null
   vectorRank: number | null
   keywordRank: number | null
+  /** 交叉编码器精排分数（0~1），未精排时为 null */
+  rerankScore: number | null
   /** 是否精确命中问题中的编号（条款号、型号等） */
   exactMatch: boolean
+  /** 是否通过相关性过滤，问答时只使用通过的片段 */
+  relevant: boolean
 }
 
 export interface Citation {

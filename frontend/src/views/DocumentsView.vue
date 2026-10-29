@@ -251,7 +251,9 @@ function extension(filename: string) {
             </el-tag>
             <span v-if="r.vectorRank" class="muted">向量 #{{ r.vectorRank }}</span>
             <span v-if="r.keywordRank" class="muted">关键词 #{{ r.keywordRank }}</span>
+            <span v-if="r.rerankScore != null" class="muted">精排 {{ r.rerankScore.toFixed(3) }}</span>
             <el-tag v-if="r.exactMatch" size="small" type="success" effect="plain">精确命中</el-tag>
+            <el-tag v-if="!r.relevant" size="small" type="info" effect="plain">不相关</el-tag>
             <a :href="fileUrl(r.documentId, r.filename, r.location)" target="_blank">{{ r.filename }}</a>
             <span v-if="r.headingPath" class="muted">{{ r.headingPath }}</span>
             <span v-if="r.location" class="muted">{{ r.location }}</span>
