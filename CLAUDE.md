@@ -17,7 +17,7 @@ export JAVA_HOME=$(/usr/libexec/java_home -v 21)
 ./mvnw test -Dtest=ChunkerTests#splitsOnHeadingChange             # 单个测试方法
 python3 scripts/eval_retrieval.py --kb-id 5 --csv scripts/eval/laws.csv   # 检索评测（需后端运行），题集格式见脚本头注释；基线在 scripts/eval/baseline/
 python3 scripts/eval_retrieval.py --kb-id 5 --csv scripts/eval/laws.csv --rerank off   # 对比不精排的效果
-python3 scripts/rerank_server.py                                  # Rerank 服务 http://localhost:8081（bge-reranker-v2-m3，需 sentence-transformers）
+HF_HUB_OFFLINE=1 python3 scripts/rerank_server.py                # Rerank 服务 http://localhost:8081（bge-reranker-v2-m3，需 sentence-transformers；不在 docker 里，安装与启动见 README）
 
 cd frontend && npm install
 npm run dev          # http://localhost:5173，/api 代理到 8080

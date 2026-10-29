@@ -31,8 +31,7 @@ docker compose up -d
 
 # 2. DeepSeek Key：写在 config/application.yaml（已 gitignore），或设置环境变量 DEEPSEEK_API_KEY
 
-# 3. Rerank 服务（首次运行会下载约 2.2GB 模型，慢时可设 HF_ENDPOINT=https://hf-mirror.com）
-#    不启动也能用，检索会退回 RRF 排序和余弦阈值；不想用时把 skb.rerank.enabled 设为 false
+# 3. Rerank 服务（另开一个终端；首次运行会下载约 2.2GB 模型，详见下方「Rerank 服务（Python）」）
 python3 scripts/rerank_server.py
 
 # 4. 构建前端（产物输出到 src/main/resources/static，随 jar 一起打包）
@@ -45,6 +44,64 @@ JAVA_HOME=$(/usr/libexec/java_home -v 21) ./mvnw spring-boot:run
 打开 http://localhost:8080 。
 
 前端开发：后端启动后执行 `cd frontend && npm run dev`，访问 http://localhost:5173（`/api` 自动代理到 8080）。
+
+### 日常启动（重启电脑后）
+
+首次安装完成后，每次开机按下面的顺序启动。Rerank 服务和后端谁先谁后都可以：后端每次检索都实时调用它，调用失败就跳过精排，所以后端已在运行时再启动 Rerank 服务，精排会立即生效，不用重启后端。
+
+```bash
+cd /path/to/superKnowledgeBase
+docker compose up -d                                   # 1. PostgreSQL（先打开 Docker Desktop）
+                                                       # 2. Ollama：打开 Ollama 应用即可
+HF_HUB_OFFLINE=1 python3 scripts/rerank_server.py      # 3. Rerank 服务（另开一个终端，保持窗口不关）
+JAVA_HOME=$(/usr/libexec/java_home -v 21) ./mvnw spring-boot:run   # 4. 后端（或在 IDE 中启动）
+```
+
+### Rerank 服务（Python）
+
+`scripts/rerank_server.py` 是项目唯一的 Python 服务，用交叉编码器 bge-reranker-v2-m3 给检索结果精排，监听 `http://127.0.0.1:8081`。它不在 docker compose 里：Mac 上的 Docker 用不了 Apple 芯片的 GPU（MPS），只能 CPU 推理，延迟会高出数倍；Ollama 直接装在本机也是同样的原因。
+
+**它是可选的**：没启动时后端会记一条 WARN 日志，退回 RRF 排序和余弦阈值，问答照常进行，只是没有精排效果（主要是无答案问题的拒答能力变弱）。完全不想用时把 `application.yaml` 的 `skb.rerank.enabled` 设为 `false`。
+
+**首次安装**
+
+```bash
+pip install sentence-transformers          # 会一并装上 torch；需要 Python 3.10+
+python3 scripts/rerank_server.py           # 首次运行自动下载模型（约 2.2GB）到 ~/.cache/huggingface
+```
+
+国内网络下载慢时加上镜像：`HF_ENDPOINT=https://hf-mirror.com python3 scripts/rerank_server.py`。下载中断后重新运行会断点续传。
+
+**启动**（模型已下载后）
+
+```bash
+cd /path/to/superKnowledgeBase
+
+# 前台运行，终端窗口要保持打开
+HF_HUB_OFFLINE=1 python3 scripts/rerank_server.py
+
+# 或者后台运行，关掉终端也不会停
+HF_HUB_OFFLINE=1 nohup python3 scripts/rerank_server.py > /tmp/rerank.log 2>&1 &
+```
+
+`HF_HUB_OFFLINE=1` 让它直接用本地缓存的模型、不联网检查更新，启动更快，断网也能用。约 10 秒后出现 `模型已加载（mps），监听 http://127.0.0.1:8081` 即启动完成。
+
+**检查与停止**
+
+```bash
+curl localhost:8081/health          # 正常时返回 {"model": "BAAI/bge-reranker-v2-m3", "device": "mps"}
+tail -f /tmp/rerank.log             # 后台运行时查看日志，每次精排会打印片段数和耗时
+lsof -iTCP:8081 -sTCP:LISTEN        # 查看占用 8081 的进程
+pkill -f rerank_server.py           # 停止
+```
+
+**常用参数**：`--port`（默认 8081，改了要同步修改 `skb.rerank.base-url`）、`--model`（默认 `BAAI/bge-reranker-v2-m3`，内存紧张时可换 `BAAI/bge-reranker-base`，但中文法规类效果明显变差）、`--max-length`（默认 1024 token）、`--batch-size`（默认 16）。
+
+**注意**
+
+- 启动用的 `python3` 必须是装了 sentence-transformers 的那个环境。先运行 `which python3` 和 `python3 -c "import sentence_transformers"` 确认；如果用 conda / venv，先激活对应环境。
+- 设备自动选择：Apple 芯片用 MPS（fp16），有 NVIDIA 显卡用 CUDA，否则用 CPU。日志里的 `device` 显示实际使用的设备，CPU 推理会慢很多。
+- 接口与 HuggingFace text-embeddings-inference（TEI）的 `/rerank` 相同。部署到有 NVIDIA 显卡的 Linux 服务器时，可以直接用 TEI 镜像替代这个脚本，只需修改 `skb.rerank.base-url`。
 
 ## 处理逻辑要点
 

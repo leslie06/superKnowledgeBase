@@ -347,7 +347,7 @@ POST /rerank   {"query": "年假有几天", "texts": ["片段1", "片段2"]}
 →              [{"index": 1, "score": 0.93}, {"index": 0, "score": 0.02}]
 ```
 
-`score` 经过 sigmoid，范围 0～1。服务按 HTTP/1.1 保持连接，推理串行执行（GPU 上并发没有收益）。
+`score` 经过 sigmoid，范围 0～1。服务按 HTTP/1.1 保持连接，推理串行执行（GPU 上并发没有收益）。它不在 docker compose 里，因为 Mac 上的 Docker 用不了 MPS；安装、启动、检查和停止的方法见 README 的「Rerank 服务（Python）」一节。
 
 **后端调用**（`RerankClient`、`Retriever.rerank`）：
 
