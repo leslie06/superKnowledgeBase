@@ -259,6 +259,24 @@ private static final String REWRITE_SYSTEM_PROMPT = """
 
 为什么要加关键词一路：只有向量召回时，「劳动合同法第三十九条」「民法典第1079条」这类按条款号提问的题，14 道里只有 1 道排第一（`scripts/eval/laws_article.csv`）。bge-m3 把「第三十九条」和「第二十九条」看成几乎一样的东西，而且错误结果的相似度都在 0.5 以上，阈值也拦不住。
 
+**调用链**（`retrieval/Retriever`，下面各小节按这个顺序展开）：
+
+```text
+retrieve(kbId, query)                          问答入口；调试接口走 search()，不做过滤
+├─ rank()
+│  ├─ fuse()
+│  │  ├─ embeddingModel.embed(query)           问题向量，事务外先算好
+│  │  ├─ KeywordAnalyzer.queryTerms(query)     查询词项
+│  │  └─ 只读事务 ─────────────────────────────────────────────
+│  │     ├─ vectorSearch()                     → 30 个 (chunkId, 余弦相似度)
+│  │     ├─ keywordSearch()                    → 30 个 (chunkId, BM25 分数)
+│  │     ├─ 加权 RRF 合并两路排名
+│  │     └─ loadChunks()                       → 片段详情、补算余弦、判断精确命中
+│  └─ rerank()                                 事务外
+│     └─ RerankClient.score() ──HTTP──▶ scripts/rerank_server.py（前 20 个）
+└─ filter(relevant).limit(6)
+```
+
 ### 向量召回
 
 ```java
@@ -298,7 +316,58 @@ PostgreSQL 自带的全文检索不会切中文，装 zhparser / pg_jieba 又要
 
 条款号不切二字组，是因为「三十」「九条」会命中所有「第三十X条」，反而把要找的那条挤下去。疑问词要去掉，是因为它们在制度、法规正文里很少出现，IDF 反而很高。
 
+**分词**（`KeywordAnalyzer.analyze`，略去英文数字部分）：先抽出条款编号，再对剩下的连续汉字切二字组。
+
+```java
+String normalized = Normalizer.normalize(text, Normalizer.Form.NFKC).toLowerCase(Locale.ROOT);
+
+// ① 条款编号整体抽出，统一成"第N条"，并从原文中挖掉，后面不再对它切二字组
+Matcher article = ARTICLE.matcher(normalized);
+StringBuilder rest = new StringBuilder();
+while (article.find()) {
+    String number = article.group(1) != null ? article.group(1) : article.group(2);
+    long value = Character.isDigit(number.charAt(0)) ? parseArabic(number) : parseChinese(number);
+    if (value > 0) {
+        terms.add("第" + value + article.group(3));
+        article.appendReplacement(rest, " ");
+    }
+}
+article.appendTail(rest);
+String remaining = rest.toString();
+
+// ② 连续汉字按二字组滑动切分，只有一个字的单独保留
+Matcher han = HAN_RUN.matcher(remaining);
+while (han.find()) {
+    String run = han.group();
+    if (run.length() == 1) terms.add(run);
+    for (int i = 0; i + 2 <= run.length(); i++) terms.add(run.substring(i, i + 2));
+}
+
+// ③ 英文、数字按 [a-z0-9_]+ 整词保留，带下划线的再拆段，长度不足 2 的丢弃
+```
+
+查询时先去掉疑问词，再用同一个 `analyze` 切分，并对结果去重：
+
+```java
+public static List<String> queryTerms(String query) {
+    String stripped = query == null ? null : QUESTION_WORDS.matcher(query).replaceAll(" ");
+    return List.copyOf(new LinkedHashSet<>(analyze(stripped)));
+}
+```
+
 **索引**：V4 迁移给 `chunk` 加了 `keyword_tsv`（GIN 索引）和 `keyword_token_count`（词项总数，即 BM25 的文档长度）两列。词项来自「章节路径 + 正文」，章节名里的「证件办理」「车辆管理」往往就是用户的检索词。新片段在 `ChunkRepository.insertAll` 写入时生成；V4 之前入库的片段由 `KeywordIndexBackfill` 在应用启动后于后台补齐，只需分词，不用重新向量化。
+
+```java
+// ChunkRepository.insertAll（略去其他列）
+List<String> terms = KeywordAnalyzer.analyze(headingPath == null ? content : headingPath + "\n" + content);
+args.add(new Object[]{..., KeywordAnalyzer.toTsvector(terms), terms.size()});
+jdbcTemplate.batchUpdate("""
+        INSERT INTO chunk (..., keyword_tsv, keyword_token_count)
+        VALUES (..., ?::tsvector, ?)
+        """, args);
+```
+
+`toTsvector` 把词项拼成 tsvector 字面量，比如 `'q5':1 '年假':2,7`，冒号后面是该词项出现的位置，位置个数就是 BM25 里的词频 tf。这里直接把字面量转换成 `tsvector`，而不是调用 `to_tsvector()`：后者会用 PG 自己的解析器重新分词，而它不认识中文。
 
 **打分**：标准 BM25，`k1 = 1.2`、`b = 0.75`。文档数 N、每个词的文档频率 df、平均文档长度都按当前知识库实时统计；词频 tf 取 `tsvector` 中该词项的位置个数：
 
@@ -307,15 +376,85 @@ idf(t)  = ln(1 + (N - df + 0.5) / (df + 0.5))
 score   = Σ idf(t) · tf · (k1 + 1) / (tf + k1 · (1 - b + b · 文档长度 / 平均文档长度))
 ```
 
+```java
+// Retriever.keywordSearch：:terms 是空格连接的查询词项，:tsquery 是 'q5' | '系统' | ...
+jdbc.sql("""
+        WITH stats AS (                                    -- 当前知识库的片段数 N、平均文档长度
+            SELECT count(*) AS n, greatest(avg(keyword_token_count), 1) AS avgdl
+            FROM chunk WHERE kb_id = :kbId
+        ), idf AS (                                        -- 每个查询词项的 df 和 idf，库里没有的词项直接丢掉
+            SELECT q.term, ln(1 + (s.n - d.df + 0.5) / (d.df + 0.5)) AS idf
+            FROM unnest(string_to_array(:terms, ' ')) AS q(term)
+            CROSS JOIN stats s
+            CROSS JOIN LATERAL (
+                SELECT count(*) AS df FROM chunk c
+                WHERE c.kb_id = :kbId AND c.keyword_tsv @@ CAST(quote_literal(q.term) AS tsquery)
+            ) d
+            WHERE d.df > 0
+        ), tf AS (                                         -- 候选片段中每个命中词项的 tf
+            SELECT c.id, c.keyword_token_count AS dl, u.lexeme, coalesce(cardinality(u.positions), 1) AS tf
+            FROM chunk c CROSS JOIN LATERAL unnest(c.keyword_tsv) AS u
+            WHERE c.kb_id = :kbId AND c.keyword_tsv @@ CAST(:tsquery AS tsquery)
+              AND u.lexeme = ANY (string_to_array(:terms, ' '))
+        )
+        SELECT tf.id AS chunk_id,
+               sum(i.idf * tf.tf * (:k1 + 1) / (tf.tf + :k1 * (1 - :b + :b * tf.dl / s.avgdl))) AS score
+        FROM tf JOIN idf i ON i.term = tf.lexeme CROSS JOIN stats s
+        GROUP BY tf.id
+        ORDER BY score DESC
+        LIMIT :limit
+        """)...;
+```
+
+- **stats**：N 和平均长度都按 `kb_id` 实时统计，不同知识库的 idf 互不影响，新增文档后也不需要重建统计。
+- **idf**：每个词项单独查一次 df（`@@` 单个词项，走 GIN 索引）。df = 0 的词项在库里不存在，不参与打分。
+- **tf**：`unnest(tsvector)` 把片段的 tsvector 展开成 `(lexeme, positions)` 行，只保留查询中出现的词项，`positions` 的个数就是 tf。
+- **最终得分**：按片段把各词项的 BM25 贡献相加。只返回 `chunk_id` 和分数，片段详情在融合后由 `loadChunks` 统一查询。
+
 SQL 先用 `keyword_tsv @@ 'q5' | '系统' | ...`（任一词项命中，走 GIN 索引）筛出候选，再 `unnest(keyword_tsv)` 取出命中词项的 tf 求和。在当前几百个片段的库上单次查询 15～100 ms。它要对每个候选展开全部词项，片段数到几万时需要关注耗时。
 
 ### 融合排序
 
 ```java
-// 问题里写明了"第39条""Q5"这类编号时，包含它的片段几乎一定是用户要找的，直接排到最前
-rows.sorted(comparing(exactMatch).reversed()
-        .thenComparing(fused 得分降序)
-        .thenComparing(余弦相似度降序))
+private List<RetrievedChunk> fuse(long kbId, String query, Mode mode, int poolSize) {
+    String vector = PgVectors.toLiteral(embeddingModel.embed(query));
+    List<String> terms = KeywordAnalyzer.queryTerms(query);
+    return readOnlyTx.execute(status -> {
+        List<Hit> vectorHits = mode == Mode.KEYWORD ? List.of() : vectorSearch(kbId, vector, poolSize);
+        List<Hit> keywordHits = mode == Mode.VECTOR || terms.isEmpty() ? List.of() : keywordSearch(kbId, terms, poolSize);
+
+        // 两路结果只取排名（从 1 开始），按加权 RRF 累加
+        Map<Long, Integer> vectorRanks = ranks(vectorHits);
+        Map<Long, Integer> keywordRanks = ranks(keywordHits);
+        Map<Long, Double> fused = new HashMap<>();
+        vectorRanks.forEach((id, rank) -> fused.merge(id, 1.0 / (rrfK + rank), Double::sum));
+        keywordRanks.forEach((id, rank) -> fused.merge(id, keywordWeight / (rrfK + rank), Double::sum));
+        if (fused.isEmpty()) {
+            return List.of();
+        }
+
+        Set<String> exactTerms = mode == Mode.VECTOR ? Set.of() : KeywordAnalyzer.exactTerms(terms);
+        Map<Long, ChunkRow> rows = loadChunks(fused.keySet(), vector, exactTerms);
+        // 问题里写明了"第39条""Q5"这类编号时，包含它的片段几乎一定是用户要找的，直接排到最前
+        return rows.values().stream()
+                .sorted(Comparator.comparing(ChunkRow::exactMatch).reversed()
+                        .thenComparing(Comparator.comparingDouble((ChunkRow r) -> fused.get(r.chunkId())).reversed())
+                        .thenComparing(Comparator.comparingDouble(ChunkRow::score).reversed()))
+                .map(r -> new RetrievedChunk(..., null /* rerankScore */, r.exactMatch(),
+                        r.score() >= minScore || r.exactMatch()))   // 未精排时的 relevant
+                .toList();
+    });
+}
+```
+
+`loadChunks` 用一条 SQL 取出所有候选的详情，同时补算余弦相似度，并用 tsquery 判断是否包含问题中的精确词项：
+
+```sql
+SELECT c.id AS chunk_id, c.document_id, d.filename, c.heading_path, c.location, c.content,
+       1 - (c.embedding <=> CAST(:vector AS vector)) AS score,
+       coalesce(c.keyword_tsv @@ CAST(:exact AS tsquery), false) AS exact_match   -- 问题中没有精确词项时为 false
+FROM chunk c JOIN document d ON d.id = c.document_id
+WHERE c.id IN (:ids)
 ```
 
 - **精确命中优先**：问题中的「精确词项」指条款编号、字母数字混合的编号（q5、rw_202607050001）和 5 位以上的数字（商品编码等）。片段包含其中任意一个时 `exactMatch = true`，排在所有片段前面。
@@ -347,6 +486,20 @@ POST /rerank   {"query": "年假有几天", "texts": ["片段1", "片段2"]}
 →              [{"index": 1, "score": 0.93}, {"index": 0, "score": 0.02}]
 ```
 
+核心是 `CrossEncoder.predict`：把问题和每个片段配成一对，逐对打分，经 sigmoid 转成 0～1。
+
+```python
+# scripts/rerank_server.py：Reranker.rerank
+def rerank(self, query: str, texts: list[str]) -> list[dict]:
+    if not texts:
+        return []
+    with self.lock:
+        scores = self.model.predict([(query, t) for t in texts], batch_size=self.batch_size,
+                                    activation_fn=torch.nn.Sigmoid(), show_progress_bar=False)
+    ranked = sorted(range(len(texts)), key=lambda i: scores[i], reverse=True)
+    return [{"index": i, "score": float(scores[i])} for i in ranked]
+```
+
 `score` 经过 sigmoid，范围 0～1。服务按 HTTP/1.1 保持连接，推理串行执行（GPU 上并发没有收益）。它不在 docker compose 里，因为 Mac 上的 Docker 用不了 MPS；安装、启动、检查和停止的方法见 README 的「Rerank 服务（Python）」一节。
 
 **后端调用**（`RerankClient`、`Retriever.rerank`）：
@@ -365,17 +518,55 @@ private List<RetrievedChunk> rerank(String query, List<RetrievedChunk> fused) {
         scores = rerankClient.score(query, head.stream().map(Retriever::rerankText).toList());
     } catch (RuntimeException e) {
         log.warn("精排失败，退回 RRF 排序：{}", e.getMessage());
-        return fused;
+        return fused;   // relevant 仍是 fuse() 里按余弦阈值算出的值
     }
-    // 精确命中仍排最前，其余按精排分数降序；精排范围之外的片段保持 RRF 顺序，只有精确命中的仍视为相关
-    ...
+    List<RetrievedChunk> reranked = new ArrayList<>(fused.size());
+    for (int i = 0; i < head.size(); i++) {
+        RetrievedChunk c = head.get(i);
+        // 相关性改用精排分数判断；精确命中的始终相关
+        reranked.add(withRerank(c, scores[i], scores[i] >= rerankMinScore || c.exactMatch()));
+    }
+    // 精确命中仍排最前，其余按精排分数降序
+    reranked.sort(Comparator.comparing(RetrievedChunk::exactMatch).reversed()
+            .thenComparing(Comparator.comparingDouble(RetrievedChunk::rerankScore).reversed()));
+    // 精排范围之外的片段保持 RRF 顺序接在后面，只有精确命中的仍视为相关
+    for (RetrievedChunk c : fused.subList(head.size(), fused.size())) {
+        reranked.add(withRerank(c, null, c.exactMatch()));
+    }
+    return reranked;
+}
+
+/** 章节路径也交给精排模型，"考勤处罚""试用期终止"这类标题本身就是重要的判断依据。 */
+private static String rerankText(RetrievedChunk c) {
+    return c.headingPath() == null ? c.content() : c.headingPath() + "\n" + c.content();
+}
+```
+
+`RerankClient.score` 发送请求，并按 `index` 把分数放回片段原来的位置（服务返回时已按分数排序）：
+
+```java
+public double[] score(String query, List<String> texts) {
+    RerankResult[] results = restClient.post()
+            .uri("/rerank")
+            .contentType(MediaType.APPLICATION_JSON)
+            .body(new RerankRequest(query, texts))
+            .retrieve()
+            .body(RerankResult[].class);
+    if (results == null || results.length != texts.size()) {
+        throw new IllegalStateException("Rerank 服务返回的结果数量与片段数不一致");
+    }
+    double[] scores = new double[texts.size()];
+    for (RerankResult r : results) {
+        scores[r.index()] = r.score();
+    }
+    return scores;
 }
 ```
 
 - **送给模型的文本**：「章节路径 + 换行 + 正文」。「考勤处罚」「试用期终止」这类标题本身就是重要的判断依据。
 - **降级**：服务没启动、超时（`rerank.timeout`，15 秒）或返回异常时记一条 WARN，退回 RRF 顺序和余弦阈值，问答照常进行。`rerank.enabled: false` 可以整体关闭。
 - **事务之外**：两路召回和取详情仍在只读事务里完成；精排在事务提交后调用，不会在等待模型时占着数据库连接。
-- **HTTP 细节**：`RerankClient` 用 `BufferingClientHttpRequestFactory` 缓冲请求体以带上 `Content-Length`。JDK HttpClient 默认按分块传输发送，Python 的 `http.server` 读不到分块的请求体。
+- **HTTP 细节**：`RerankClient` 基于 JDK HttpClient，固定使用 HTTP/1.1（Python 的 `http.server` 不支持 HTTP/2），连接超时 2 秒，服务没启动时能很快失败并降级。它还用 `BufferingClientHttpRequestFactory` 缓冲请求体以带上 `Content-Length`：JDK HttpClient 默认按分块传输发送，Python 的 `http.server` 读不到分块的请求体。
 - **候选数取 20**：延迟与片段数成正比。评测中关闭精排、取前 30 时，所有正确片段在 RRF 中都排在前 13，20 留有余量。30 个时单次精排 3～4 秒，P90 超过 10 秒；20 个时检索总耗时中位约 1.9 秒、P90 约 2.1 秒（M2 Pro，含问题向量化和两路召回）。
 
 **效果**（六份题集，118 道有答案题、19 道无答案题；`--rerank off` 为精排前）：
