@@ -27,17 +27,28 @@ import java.util.stream.Collectors;
 @Component
 public class DocumentParser {
 
-    private static final int MAX_HEADING_LEVEL = 6;
+    private static final int MAX_HEADING_LEVEL = 8;
     private static final int MAX_HEURISTIC_HEADING_CHARS = 40;
 
     private static final Pattern MARKDOWN_HEADING = Pattern.compile("^(#{1,6})\\s+(.+)$");
-    private static final Pattern CHAPTER_HEADING = Pattern.compile("^第[一二三四五六七八九十百零〇\\d]+([章篇部分])\\s*.*");
+    /** 法律的"编""分编"在"章"之上，如民法典"第二编 物权 > 第一分编 通则 > 第一章 一般规定" */
+    private static final Pattern BOOK_HEADING = Pattern.compile("^第[一二三四五六七八九十百零〇\\d]+编\\s*.*");
+    private static final Pattern SUB_BOOK_HEADING = Pattern.compile("^第[一二三四五六七八九十百零〇\\d]+分编\\s*.*");
+    private static final Pattern APPENDIX_HEADING = Pattern.compile("^附\\s*则$");
+    private static final Pattern CHAPTER_HEADING = Pattern.compile("^第[一二三四五六七八九十百零〇\\d]+(?:章|篇|部分)\\s*.*");
     private static final Pattern SECTION_HEADING = Pattern.compile("^第[一二三四五六七八九十百零〇\\d]+节\\s*.*");
     private static final Pattern CN_NUMBER_HEADING = Pattern.compile("^[一二三四五六七八九十]+、.+");
     private static final Pattern CN_PAREN_HEADING = Pattern.compile("^[（(][一二三四五六七八九十]+[)）].+");
     /** 首段编号限两位数，避免把"300 高工、主管"这类表格残行、"2026 年计划"这类年份误认成标题 */
     private static final Pattern DECIMAL_HEADING = Pattern.compile("^(\\d{1,2}(?:\\.\\d+){0,4})\\s+\\S.*");
     private static final Pattern SENTENCE_END = Pattern.compile(".*[。；;：:，,！!？?]$");
+    /**
+     * 样式标题前的自动编号。Tika 计算 Word 多级列表编号时经常出错（如"1.4.1.4.1.1.1. 查看活动"），
+     * 错误的编号进入章节路径后会干扰向量和精排，章节路径只保留标题文字
+     */
+    private static final Pattern STYLED_HEADING_NUMBER = Pattern.compile("^\\d{1,2}(?:\\.\\d{1,2})*\\.?\\s+(?=\\S)");
+    /** 没有检索价值的独立行：页码（"－1－"、"- 2 -"）、目录标题 */
+    private static final Pattern NOISE_LINE = Pattern.compile("^(?:[－\\-—–]\\s*\\d+\\s*[－\\-—–]|目\\s*录)$");
 
     private final AutoDetectParser parser = new AutoDetectParser();
 
@@ -79,8 +90,11 @@ public class DocumentParser {
         for (Block block : blocks) {
             String location = type == DocType.PDF && block.unit() > 0 ? "第" + block.unit() + "页" : null;
             switch (block.kind()) {
-                case HEADING -> pushHeading(headings, block.level(), block.text());
+                case HEADING -> pushHeading(headings, block.level(), stripHeadingNumber(block.text()));
                 case PARAGRAPH -> {
+                    if (NOISE_LINE.matcher(block.text()).matches()) {
+                        continue;
+                    }
                     int level = hasStyledHeadings ? 0 : guessHeadingLevel(block.text());
                     if (level > 0) {
                         Matcher md = MARKDOWN_HEADING.matcher(block.text());
@@ -200,21 +214,32 @@ public class DocumentParser {
         if (text.length() > MAX_HEURISTIC_HEADING_CHARS || SENTENCE_END.matcher(text).matches()) {
             return 0;
         }
-        if (CHAPTER_HEADING.matcher(text).matches()) {
+        if (BOOK_HEADING.matcher(text).matches() || APPENDIX_HEADING.matcher(text).matches()) {
             return 1;
         }
-        if (SECTION_HEADING.matcher(text).matches() || CN_NUMBER_HEADING.matcher(text).matches()) {
+        if (SUB_BOOK_HEADING.matcher(text).matches()) {
             return 2;
         }
-        if (CN_PAREN_HEADING.matcher(text).matches()) {
+        if (CHAPTER_HEADING.matcher(text).matches()) {
             return 3;
+        }
+        if (SECTION_HEADING.matcher(text).matches() || CN_NUMBER_HEADING.matcher(text).matches()) {
+            return 4;
+        }
+        if (CN_PAREN_HEADING.matcher(text).matches()) {
+            return 5;
         }
         Matcher decimal = DECIMAL_HEADING.matcher(text);
         if (decimal.matches()) {
             int depth = decimal.group(1).split("\\.").length;
-            return Math.min(depth + 1, MAX_HEADING_LEVEL);
+            return Math.min(depth + 3, MAX_HEADING_LEVEL);
         }
         return 0;
+    }
+
+    static String stripHeadingNumber(String text) {
+        String stripped = STYLED_HEADING_NUMBER.matcher(text).replaceFirst("");
+        return stripped.isEmpty() ? text : stripped;
     }
 
     private static void pushHeading(String[] headings, int level, String text) {

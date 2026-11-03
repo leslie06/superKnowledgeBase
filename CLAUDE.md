@@ -49,7 +49,8 @@ npm run typecheck    # vue-tsc 类型检查
 上传（`DocumentService`）→ 按 SHA-256 在同一知识库内去重 → 文件存到 `skb.storage-dir/{kbId}/{sha256}.{ext}` → `IngestionService.submit` 异步处理。处理在固定大小的虚拟线程池中进行（`skb.ingestion.concurrency`，避免压垮本地 Ollama），文档状态依次为 `PENDING → PARSING → EMBEDDING → READY / FAILED`。旧 chunk 删除与新 chunk 写入在同一事务中完成，所以 reindex 是原子替换。应用启动时（`ApplicationReadyEvent`）会自动重新提交所有未完成状态的文档。
 
 - `DocumentParser` + `TikaBlockHandler`：Tika 输出 → `TextUnit`（文本 + 章节路径 + 位置）。Word 优先用标题样式，没有样式时用中文编号正则（"第X章"、"一、"、"2.1" 等）推断标题；PDF 记录页码，并先经 `PdfTextCleaner` 去掉页眉页脚和目录、接回被换行截断的句子；PPT 每张幻灯片首行作为标题；Excel 每行转成"列名: 值"。
-- `Chunker`：不跨章节、不跨幻灯片/工作表（PDF 跨页允许合并，位置记为"第1-2页"）；按 `skb.chunk.*` 的目标/上限字数切分，句子级重叠。
+- `Chunker`：不跨章节、不跨幻灯片/工作表（PDF 跨页允许合并，位置记为"第1-2页"）。先把不可分的段落归组（法律条文及其款项、冒号结尾的引导句与其后的列举项、连续列举项），只在组之间按 `skb.chunk.*` 的目标/上限字数切分，组间不重叠；超长组在组内切分，后续片段重复最近的引导句，没有引导句时用句子级重叠。改切块规则后要对已有文档 reindex 才生效。
+- 标题识别：编号规则的层级为 编 1 > 分编 2 > 章 3 > 节/"一、" 4 > "（一）" 5 > 小数编号（段数 + 3）；样式标题开头的小数编号（Tika 常算错）会被去掉。
 - 向量化时把"文件名 + 章节 + 位置"拼在片段前面（`IngestionService.embeddingText`），但数据库中 `chunk.content` 只存原文。
 
 ### 检索与问答
