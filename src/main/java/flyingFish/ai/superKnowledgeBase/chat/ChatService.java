@@ -3,6 +3,7 @@ package flyingFish.ai.superKnowledgeBase.chat;
 import flyingFish.ai.superKnowledgeBase.common.NotFoundException;
 import flyingFish.ai.superKnowledgeBase.common.SkbProperties;
 import flyingFish.ai.superKnowledgeBase.kb.KnowledgeBaseService;
+import flyingFish.ai.superKnowledgeBase.retrieval.QueryRewriter;
 import flyingFish.ai.superKnowledgeBase.retrieval.RetrievedChunk;
 import flyingFish.ai.superKnowledgeBase.retrieval.Retriever;
 import org.slf4j.Logger;
@@ -27,7 +28,7 @@ import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * RAG 问答：问题改写 → 检索 → 组装带编号的参考资料 → LLM 流式生成（要求标注 [n] 引用）。
+ * RAG 问答：查询改写（{@link QueryRewriter}） → 检索 → 组装带编号的参考资料 → LLM 流式生成（要求标注 [n] 引用）。
  * <p>
  * SSE 事件：citations（检索到的引用）→ delta（增量文本）* → done（消息 id）；出错时发送 error。
  */
@@ -42,7 +43,6 @@ public class ChatService {
     private static final String NO_API_KEY = "not-configured";
     private static final String DEFAULT_TITLE = "新对话";
     private static final int TITLE_MAX_CHARS = 30;
-    private static final int REWRITE_HISTORY_CHARS = 300;
 
     private static final String ANSWER_SYSTEM_PROMPT = """
             你是一个严谨的知识库问答助手，根据用户提供的【参考资料】回答问题。
@@ -50,12 +50,6 @@ public class ChatService {
             1. 只依据参考资料作答，不要编造资料中没有的信息；资料不足以回答时，直接说明"知识库中没有找到相关信息"，可以给出资料中已有的相关部分。
             2. 在使用了资料的句子末尾标注来源编号，格式为 [1]、[2]；一句话来自多个来源时写成 [1][3]。不要在末尾单独列出参考文献。
             3. 用中文回答，先给出结论，再展开说明；内容较多时使用 Markdown 列表或表格。
-            """;
-
-    private static final String REWRITE_SYSTEM_PROMPT = """
-            你是检索查询改写助手。根据对话历史，把用户的最新问题改写成一个语义完整、可以独立用于知识库检索的问题：
-            补全代词和省略的主语，保留专有名词、编号和数字。只输出改写后的问题，不要任何解释。
-            如果最新问题本身已经完整，原样输出。
             """;
 
     /** @param hits 检索命中的片段及分数，写入 retrieval_trace 便于排查 bad case */
@@ -66,6 +60,7 @@ public class ChatService {
     private final ConversationRepository conversations;
     private final KnowledgeBaseService knowledgeBaseService;
     private final Retriever retriever;
+    private final QueryRewriter queryRewriter;
     private final ChatClient chatClient;
     private final JsonMapper jsonMapper;
     private final int historyMessages;
@@ -73,11 +68,13 @@ public class ChatService {
     private final boolean apiKeyConfigured;
 
     public ChatService(ConversationRepository conversations, KnowledgeBaseService knowledgeBaseService,
-                       Retriever retriever, ChatClient.Builder chatClientBuilder, JsonMapper jsonMapper,
+                       Retriever retriever, QueryRewriter queryRewriter, ChatClient.Builder chatClientBuilder,
+                       JsonMapper jsonMapper,
                        SkbProperties properties, @Value("${spring.ai.deepseek.api-key:}") String apiKey) {
         this.conversations = conversations;
         this.knowledgeBaseService = knowledgeBaseService;
         this.retriever = retriever;
+        this.queryRewriter = queryRewriter;
         this.chatClient = chatClientBuilder.build();
         this.jsonMapper = jsonMapper;
         this.historyMessages = properties.chat().historyMessages();
@@ -146,7 +143,10 @@ public class ChatService {
             conversations.updateTitle(conversationId,
                     question.length() > TITLE_MAX_CHARS ? question.substring(0, TITLE_MAX_CHARS) + "…" : question);
         }
-        String searchQuery = history.isEmpty() ? question : rewriteQuery(history, question);
+        List<QueryRewriter.Turn> turns = history.stream()
+                .map(m -> new QueryRewriter.Turn(ChatMessage.USER.equals(m.role()), m.content()))
+                .toList();
+        String searchQuery = queryRewriter.searchQuery(turns, question);
         List<RetrievedChunk> chunks = retriever.retrieve(conversation.kbId(), searchQuery);
         return new PreparedChat(conversation, history, question, searchQuery, toCitations(chunks), trace(chunks));
     }
@@ -190,24 +190,6 @@ public class ChatService {
         Map<String, Object> trace = Map.of("searchQuery", chat.searchQuery(), "hits", chat.hits());
         return conversations.insertMessage(chat.conversation().id(), ChatMessage.ASSISTANT, answer,
                 chat.citations(), trace);
-    }
-
-    /** 多轮对话时把"那病假呢？"这类问题改写成独立问题，否则检索会失效。改写失败时退回原问题。 */
-    private String rewriteQuery(List<ChatMessage> history, String question) {
-        StringBuilder sb = new StringBuilder("对话历史：\n");
-        for (ChatMessage m : history) {
-            String content = m.content().length() > REWRITE_HISTORY_CHARS
-                    ? m.content().substring(0, REWRITE_HISTORY_CHARS) + "…" : m.content();
-            sb.append(ChatMessage.USER.equals(m.role()) ? "用户：" : "助手：").append(content).append('\n');
-        }
-        sb.append("\n最新问题：").append(question);
-        try {
-            String rewritten = chatClient.prompt().system(REWRITE_SYSTEM_PROMPT).user(sb.toString()).call().content();
-            return StringUtils.hasText(rewritten) ? rewritten.trim() : question;
-        } catch (Exception e) {
-            log.warn("问题改写失败，使用原问题检索", e);
-            return question;
-        }
     }
 
     private static List<Map<String, Object>> trace(List<RetrievedChunk> chunks) {

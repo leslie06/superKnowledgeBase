@@ -19,6 +19,10 @@ spring:
     async:
       # 流式回答可能较长
       request-timeout: 5m
+  http:
+    clients:
+      # 同步 HTTP 调用（DeepSeek 非流式调用、Ollama embedding）的读超时，防止连接卡住时请求无限期挂起
+      read-timeout: 60s
   ai:
     model:
       chat: deepseek
@@ -55,15 +59,18 @@ skb:
     # 精确命中问题中编号的片段始终排在最前。两个值由 scripts/eval 四份题集网格搜索得出
     rrf-k: 10
     keyword-weight: 0.25
+    # 查询改写每个问题多一次 DeepSeek 调用（通常 1~2 秒），超过这个时间就放弃改写、用原问题检索
+    rewrite-timeout: 10s
   rerank:
     # 交叉编码器精排，需先启动 scripts/rerank_server.py；服务不可用时退回 RRF 排序和上面的 min-score
     enabled: true
     base-url: http://localhost:8081
     # 取 RRF 融合后的前多少个片段精排；评测中正确片段在 RRF 中都排在前 13，延迟与数量成正比
     candidates: 20
-    # 精排分数（0~1）阈值，启用精排时取代 retrieval.min-score。bge-reranker-v2-m3 对无关片段通常给 0.001 左右；
-    # 按 scripts/eval 六份题集扫描，0.01 时问答可用 117/118、拒答 14/19，再提高会误伤口语化问题的正确片段
-    min-score: 0.01
+    # 精排分数（0~1）阈值，启用精排时取代 retrieval.min-score。精排输入是查询改写后的"原问题 + 术语"，
+    # 正确片段的分数整体抬高：按 scripts/eval 六份题集扫描，0.03~0.1 之间问答可用 118/118、拒答 13/19，取 0.05。
+    # 不改写时（/search 传 rewrite=false）口语化问题的分数偏低，这个阈值会误伤，当时用的是 0.01
+    min-score: 0.05
     timeout: 15s
   chat:
     history-messages: 6

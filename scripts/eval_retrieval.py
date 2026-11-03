@@ -9,6 +9,9 @@
 
     python3 scripts/eval_retrieval.py --kb-id 5 --csv scripts/eval/laws.csv --mode vector   # 只看向量召回
     python3 scripts/eval_retrieval.py --kb-id 5 --csv scripts/eval/laws.csv --rerank off    # 对比不精排的效果
+    python3 scripts/eval_retrieval.py --kb-id 5 --csv scripts/eval/laws.csv --rewrite off   # 对比不做查询改写的效果
+
+默认与问答一致：先由后端调用 LLM 做查询改写（原问题 + 术语改写）再检索，每题多一次 DeepSeek 调用。
 
 题集 CSV 列（第一行为表头）：
     question         必填，用户问题
@@ -136,13 +139,16 @@ def is_relevant(chunk: dict, min_score: float) -> bool:
     return chunk["score"] >= min_score or bool(chunk.get("exactMatch"))
 
 
-def search(base_url: str, kb_id: int, query: str, top_k: int, mode: str | None, rerank: str | None) -> list[dict]:
+def search(base_url: str, kb_id: int, query: str, top_k: int, mode: str | None, rerank: str | None,
+           rewrite: str | None) -> list[dict]:
     url = f"{base_url.rstrip('/')}/api/knowledge-bases/{kb_id}/search"
     payload = {"query": query, "topK": top_k}
     if mode:
         payload["mode"] = mode
     if rerank:
         payload["rerank"] = rerank == "on"
+    if rewrite:
+        payload["rewrite"] = rewrite == "on"
     body = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
     try:
@@ -166,9 +172,10 @@ def matches(case: Case, chunk: dict) -> bool:
     return all(any(alt in normalize(value) for alt in alts) for alts, value in checks if alts)
 
 
-def evaluate(case: Case, base_url: str, kb_id: int, top_k: int, mode: str | None, rerank: str | None) -> Outcome:
+def evaluate(case: Case, base_url: str, kb_id: int, top_k: int, mode: str | None, rerank: str | None,
+             rewrite: str | None) -> Outcome:
     try:
-        results = search(base_url, kb_id, case.question, top_k, mode, rerank)
+        results = search(base_url, kb_id, case.question, top_k, mode, rerank, rewrite)
     except (RuntimeError, urllib.error.URLError, TimeoutError) as e:
         return Outcome(case, [], error=str(e))
     outcome = Outcome(case, results)
@@ -204,7 +211,7 @@ def pct(n: int, d: int) -> str:
 
 
 def print_report(outcomes: list[Outcome], top_k: int, retrieval_top_k: int, min_score: float, show: int,
-                 mode: str | None, rerank: str | None):
+                 mode: str | None, rerank: str | None, rewrite: str | None):
     answerable = [o for o in outcomes if o.case.answerable and not o.error]
     no_answer = [o for o in outcomes if not o.case.answerable and not o.error]
     errors = [o for o in outcomes if o.error]
@@ -213,7 +220,7 @@ def print_report(outcomes: list[Outcome], top_k: int, retrieval_top_k: int, min_
     print(f"共 {len(outcomes)} 题：有答案 {len(answerable)}，无答案 {len(no_answer)}，请求失败 {len(errors)}")
     reranked = any(c.get("rerankScore") is not None for o in outcomes for c in o.results)
     print(f"参数：mode={mode or 'hybrid（后端默认）'}，rerank={rerank or '后端默认'}（{'已精排' if reranked else '未精排'}），"
-          f"search topK={top_k}，问答 top-k={retrieval_top_k}")
+          f"rewrite={rewrite or 'on（后端默认）'}，search topK={top_k}，问答 top-k={retrieval_top_k}")
     print("=" * 72)
 
     if answerable:
@@ -310,6 +317,7 @@ def main():
     parser.add_argument("--mode", choices=["hybrid", "vector", "keyword"],
                         help="召回方式，默认用后端默认的 hybrid；对比单路效果时使用")
     parser.add_argument("--rerank", choices=["on", "off"], help="是否精排，默认按后端配置；只在 hybrid 模式下生效")
+    parser.add_argument("--rewrite", choices=["on", "off"], help="是否先做查询改写，默认 on（与问答一致）")
     parser.add_argument("--show", type=int, default=3, help="未通过的题展示前几条结果，默认 %(default)s")
     parser.add_argument("--out", type=Path, help="把逐题明细写入 CSV")
     args = parser.parse_args()
@@ -320,7 +328,7 @@ def main():
 
     outcomes = []
     for i, case in enumerate(cases, start=1):
-        outcome = evaluate(case, args.base_url, args.kb_id, args.top_k, args.mode, args.rerank)
+        outcome = evaluate(case, args.base_url, args.kb_id, args.top_k, args.mode, args.rerank, args.rewrite)
         outcomes.append(outcome)
         if outcome.error:
             flag = "错误"
@@ -330,7 +338,8 @@ def main():
             flag = f"最高分 {outcome.top1_score:.3f}" if outcome.top1_score is not None else "无结果"
         print(f"[{i}/{len(cases)}] {flag:<12} {case.question}", flush=True)
 
-    print_report(outcomes, args.top_k, args.retrieval_top_k, args.min_score, args.show, args.mode, args.rerank)
+    print_report(outcomes, args.top_k, args.retrieval_top_k, args.min_score, args.show, args.mode, args.rerank,
+                 args.rewrite)
     if args.out:
         write_details(args.out, outcomes)
         print(f"逐题明细已写入 {args.out}")

@@ -20,8 +20,10 @@ public record SkbProperties(String storageDir, Ingestion ingestion, Chunk chunk,
      * @param candidates    向量、关键词两路各自召回的候选数
      * @param rrfK          RRF 融合常数，片段得分 = 1 / (rrfK + 向量排名) + keywordWeight / (rrfK + 关键词排名)
      * @param keywordWeight 关键词一路在 RRF 中的权重；二字组 BM25 对改写、口语化的问题噪声较大，所以低于向量
+     * @param rewriteTimeout 查询改写（同步调用 LLM）的最长等待时间，超时后用原问题检索
      */
-    public record Retrieval(int topK, double minScore, int candidates, int rrfK, double keywordWeight) {
+    public record Retrieval(int topK, double minScore, int candidates, int rrfK, double keywordWeight,
+                            Duration rewriteTimeout) {
     }
 
     /**
