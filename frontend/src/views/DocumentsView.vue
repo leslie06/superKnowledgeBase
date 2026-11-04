@@ -1,16 +1,16 @@
 <script setup lang="ts">
-import { computed, h, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Delete, Document, Refresh, Search, UploadFilled, View } from '@element-plus/icons-vue'
+import { Delete, Document, Refresh, Search, View } from '@element-plus/icons-vue'
 import { api, fileUrl } from '../api'
+import DocumentUploader from '../components/DocumentUploader.vue'
+import { formatSize } from '../format'
 import { loadKbs } from '../store'
 import type { ChunkView, DocumentStatus, KbDocument, RetrievedChunk } from '../types'
 
 const props = defineProps<{ kbId: string }>()
 const kbId = computed(() => Number(props.kbId))
 
-const ACCEPT = '.doc,.docx,.xls,.xlsx,.ppt,.pptx,.pdf,.txt,.md'
-const UPLOAD_BATCH = 10
 const POLL_INTERVAL = 2000
 
 const STATUS: Record<DocumentStatus, { label: string; type: 'info' | 'warning' | 'primary' | 'success' | 'danger' }> = {
@@ -24,13 +24,12 @@ const STATUS: Record<DocumentStatus, { label: string; type: 'info' | 'warning' |
 const documents = ref<KbDocument[]>([])
 const loading = ref(true)
 const keyword = ref('')
-const uploading = ref(0)
-const dragging = ref(false)
-const fileInput = ref<HTMLInputElement>()
+const statusFilter = ref<DocumentStatus | ''>('')
 let pollTimer: number | undefined
 
 const filtered = computed(() =>
-  documents.value.filter((d) => d.filename.toLowerCase().includes(keyword.value.trim().toLowerCase())))
+  documents.value.filter((d) => d.filename.toLowerCase().includes(keyword.value.trim().toLowerCase())
+    && (!statusFilter.value || d.status === statusFilter.value)))
 const stats = computed(() => ({
   total: documents.value.length,
   ready: documents.value.filter((d) => d.status === 'READY').length,
@@ -59,42 +58,10 @@ function schedulePoll() {
 onMounted(refresh)
 onBeforeUnmount(() => window.clearTimeout(pollTimer))
 
-async function upload(files: File[]) {
-  if (!files.length) return
-  uploading.value = files.length
-  const problems: string[] = []
-  let accepted = 0
-  try {
-    for (let i = 0; i < files.length; i += UPLOAD_BATCH) {
-      const results = await api.uploadDocuments(kbId.value, files.slice(i, i + UPLOAD_BATCH))
-      for (const r of results) {
-        if (r.status === 'ACCEPTED') accepted++
-        else problems.push(`${r.filename}：${r.message}`)
-      }
-      uploading.value = Math.max(0, files.length - i - UPLOAD_BATCH)
-    }
-  } catch (e) {
-    problems.push(`上传失败：${(e as Error).message}`)
-  } finally {
-    uploading.value = 0
-  }
-  if (accepted) ElMessage.success(`已上传 ${accepted} 个文件，正在后台处理`)
-  if (problems.length) {
-    ElMessageBox.alert(h('div', problems.map((p) => h('div', p))), `${problems.length} 个文件未加入`)
-  }
+/** 每上传完一批就刷新列表，新文档处于处理中，会触发轮询 */
+async function onUploaded() {
   await refresh()
   loadKbs()
-}
-
-function onPick(e: Event) {
-  const input = e.target as HTMLInputElement
-  upload(Array.from(input.files ?? []))
-  input.value = ''
-}
-
-function onDrop(e: DragEvent) {
-  dragging.value = false
-  upload(Array.from(e.dataTransfer?.files ?? []))
 }
 
 async function remove(doc: KbDocument) {
@@ -149,12 +116,6 @@ async function runSearch() {
   }
 }
 
-function formatSize(bytes: number) {
-  if (bytes < 1024) return `${bytes} B`
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
-  return `${(bytes / 1024 / 1024).toFixed(1)} MB`
-}
-
 function formatTime(iso: string) {
   return new Date(iso).toLocaleString('zh-CN', { hour12: false })
 }
@@ -166,22 +127,7 @@ function extension(filename: string) {
 
 <template>
   <div class="docs-page">
-    <section
-      class="dropzone"
-      :class="{ dragging }"
-      @click="fileInput?.click()"
-      @dragover.prevent="dragging = true"
-      @dragleave.prevent="dragging = false"
-      @drop.prevent="onDrop"
-    >
-      <input ref="fileInput" type="file" multiple :accept="ACCEPT" hidden @change="onPick" />
-      <el-icon class="dropzone-icon"><UploadFilled /></el-icon>
-      <div v-if="uploading" class="dropzone-title">正在上传，剩余 {{ uploading }} 个文件…</div>
-      <template v-else>
-        <div class="dropzone-title">拖拽文件到这里，或<em>点击选择文件</em></div>
-        <div class="dropzone-hint">支持 Word、Excel、PPT、PDF（以及 txt、md），可多选；内容重复的文件会自动跳过</div>
-      </template>
-    </section>
+    <DocumentUploader :kb-id="kbId" :documents="documents" @uploaded="onUploaded" @show-failed="statusFilter = 'FAILED'" />
 
     <section class="stats">
       <div><b>{{ stats.total }}</b><span>文件</span></div>
@@ -195,6 +141,9 @@ function extension(filename: string) {
       <div class="panel-header">
         <h3>文件列表</h3>
         <el-input v-model="keyword" placeholder="按文件名筛选" clearable :prefix-icon="Search" class="filter" />
+        <el-select v-model="statusFilter" placeholder="全部状态" clearable class="status-filter">
+          <el-option v-for="(s, key) in STATUS" :key="key" :label="s.label" :value="key" />
+        </el-select>
         <el-button :icon="Refresh" @click="refresh">刷新</el-button>
       </div>
       <el-table v-loading="loading" :data="filtered" empty-text="还没有文件，先上传一些资料吧">

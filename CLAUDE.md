@@ -18,6 +18,7 @@ export JAVA_HOME=$(/usr/libexec/java_home -v 21)
 python3 scripts/eval_retrieval.py --kb-id 5 --csv scripts/eval/laws.csv   # 检索评测（需后端运行），题集格式见脚本头注释；基线在 scripts/eval/baseline/
 python3 scripts/eval_retrieval.py --kb-id 5 --csv scripts/eval/laws.csv --rerank off   # 对比不精排的效果
 python3 scripts/eval_answer.py --kb-id 5 --csv scripts/eval/answers/laws.csv    # 答案级评测：真实问答 + DeepSeek 裁判（要点、编造、引用、拒答），基线在 scripts/eval/baseline/answers/
+python3 scripts/import_dir.py --kb-id 7 --dir ~/资料 --out import.csv   # 目录批量导入（需后端运行），等处理完输出报告；--dry-run 只扫描，可重复运行
 HF_HUB_OFFLINE=1 python3 scripts/rerank_server.py                # Rerank 服务 http://localhost:8081（bge-reranker-v2-m3，需 sentence-transformers；不在 docker 里，安装与启动见 README）
 
 cd frontend && npm install

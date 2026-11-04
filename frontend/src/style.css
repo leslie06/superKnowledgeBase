@@ -187,6 +187,84 @@ a:hover {
   font-size: 12px;
 }
 
+.folder-button {
+  margin-top: 6px;
+}
+
+.dropzone.disabled {
+  cursor: default;
+}
+
+.import-panel .panel-hint {
+  font-variant-numeric: tabular-nums;
+}
+
+.import-close {
+  margin-left: auto;
+}
+
+.import-row {
+  display: grid;
+  grid-template-columns: 96px 1fr 120px;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.import-label {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.import-count {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.import-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 24px;
+  margin-top: 12px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.import-summary b {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.import-summary b.danger {
+  color: #f56c6c;
+}
+
+.import-problems {
+  margin-top: 12px;
+}
+
+.import-problems .el-collapse-item__content {
+  max-height: 240px;
+  overflow-y: auto;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.plan-total {
+  margin: 0 0 12px;
+}
+
+.plan-subtitle {
+  margin: 16px 0 6px;
+  font-weight: 600;
+}
+
+.plan-hint {
+  margin: 16px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .stats {
   display: grid;
   grid-template-columns: repeat(5, 1fr);
@@ -242,6 +320,10 @@ a:hover {
 .filter {
   width: 220px;
   margin-left: auto;
+}
+
+.status-filter {
+  width: 120px;
 }
 
 .file-cell {
