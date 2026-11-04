@@ -8,6 +8,7 @@ import org.springframework.http.ContentDisposition;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.util.MultiValueMap;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -29,9 +30,14 @@ public class DocumentController {
         return service.list(kbId);
     }
 
+    /**
+     * 上传文件；文件夹导入时，表单里为每个文件带一个 paths 字段（顺序与 files 一致），记录文件的相对路径。
+     * paths 从原始参数中读取：用 {@code @RequestParam List<String>} 接收时，只有一个值会被按逗号拆开，含逗号的路径会出错。
+     */
     @PostMapping("/knowledge-bases/{kbId}/documents")
-    public List<UploadResult> upload(@PathVariable long kbId, @RequestParam("files") List<MultipartFile> files) {
-        return service.upload(kbId, files);
+    public List<UploadResult> upload(@PathVariable long kbId, @RequestParam("files") List<MultipartFile> files,
+                                     @RequestParam MultiValueMap<String, String> form) {
+        return service.upload(kbId, files, form.get("paths"));
     }
 
     @GetMapping("/documents/{id}")

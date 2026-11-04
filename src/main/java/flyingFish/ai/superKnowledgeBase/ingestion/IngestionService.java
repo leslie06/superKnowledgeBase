@@ -106,7 +106,7 @@ public class IngestionService {
             }
 
             documents.updateStatus(documentId, DocumentStatus.EMBEDDING, null);
-            List<float[]> embeddings = embed(doc.filename(), drafts);
+            List<float[]> embeddings = embed(doc.sourcePath() != null ? doc.sourcePath() : doc.filename(), drafts);
 
             transactionTemplate.executeWithoutResult(status -> {
                 chunks.deleteByDocument(documentId);
@@ -128,21 +128,25 @@ public class IngestionService {
         }
     }
 
-    private List<float[]> embed(String filename, List<ChunkDraft> drafts) {
+    private List<float[]> embed(String source, List<ChunkDraft> drafts) {
         List<float[]> result = new ArrayList<>(drafts.size());
         for (int from = 0; from < drafts.size(); from += embeddingBatchSize) {
             List<String> texts = drafts.subList(from, Math.min(from + embeddingBatchSize, drafts.size())).stream()
-                    .map(d -> embeddingText(filename, d))
+                    .map(d -> embeddingText(source, d))
                     .toList();
             result.addAll(embeddingModel.embed(texts));
         }
         return result;
     }
 
-    /** 把文件名和章节路径拼进向量文本，"员工手册里的年假规定"这类问题更容易命中。 */
-    static String embeddingText(String filename, ChunkDraft draft) {
+    /**
+     * 把文件出处和章节路径拼进向量文本，"员工手册里的年假规定"这类问题更容易命中。
+     *
+     * @param source 文件夹导入的文件是相对路径（目录名就是分类，如"人事制度/2024/考勤管理办法.docx"），否则是文件名
+     */
+    static String embeddingText(String source, ChunkDraft draft) {
         StringJoiner header = new StringJoiner("\n");
-        header.add("文件：" + filename);
+        header.add("文件：" + source);
         if (draft.headingPath() != null) {
             header.add("章节：" + draft.headingPath());
         }

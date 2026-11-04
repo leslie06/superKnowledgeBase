@@ -34,12 +34,13 @@ public class DocumentRepository {
                 .param("statuses", statuses).query(Long.class).list();
     }
 
-    public long insert(long kbId, String filename, String filePath, String sha256, String mimeType, long size) {
+    public long insert(long kbId, String filename, String sourcePath, String filePath, String sha256, String mimeType,
+                       long size) {
         return jdbc.sql("""
-                        INSERT INTO document (kb_id, filename, file_path, sha256, mime_type, size_bytes, status)
-                        VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id
+                        INSERT INTO document (kb_id, filename, source_path, file_path, sha256, mime_type, size_bytes, status)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id
                         """)
-                .params(kbId, filename, filePath, sha256, mimeType, size, DocumentStatus.PENDING.name())
+                .params(kbId, filename, sourcePath, filePath, sha256, mimeType, size, DocumentStatus.PENDING.name())
                 .query(Long.class).single();
     }
 

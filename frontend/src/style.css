@@ -333,6 +333,20 @@ a:hover {
   min-width: 0;
 }
 
+.file-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.file-dir {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .file-name {
   overflow: hidden;
   text-overflow: ellipsis;

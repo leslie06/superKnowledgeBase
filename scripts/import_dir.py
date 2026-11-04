@@ -7,7 +7,7 @@
     python3 scripts/import_dir.py --kb-id 7 --dir ~/资料 --dry-run         # 只扫描，统计文件类型，不上传
     python3 scripts/import_dir.py --kb-id 7 --dir ~/资料 --out report.csv  # 上传、等待处理完成、输出报告
 
-上传走 /api/knowledge-bases/{kbId}/documents，后端按 SHA-256 去重，所以重复运行是安全的：已导入的文件记为"已存在"，
+上传走 /api/knowledge-bases/{kbId}/documents，并带上文件的相对路径（以所选目录名开头，与页面上选择文件夹一致）。后端按 SHA-256 去重，所以重复运行是安全的：已导入的文件记为"已存在"，
 不会重复处理，这时脚本相当于重新生成一次报告。中途按 Ctrl-C 退出不影响后端继续处理，之后重新运行同一命令即可看到结果。
 --retry-failed 会对之前处理失败的文件重新处理（例如改进解析之后）。
 
@@ -88,10 +88,13 @@ def http_json(method: str, url: str, body: bytes | None = None, content_type="ap
         raise RuntimeError(f"HTTP {e.code}：{detail[:200]}") from None
 
 
-def upload(api: str, kb_id: int, item: Item):
+def upload(api: str, kb_id: int, item: Item, root_name: str):
     boundary = uuid.uuid4().hex
     filename = item.path.name.replace('"', "'")
-    head = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"files\"; filename=\"{filename}\"\r\n"
+    # 相对路径与页面上选择文件夹时一致，以所选文件夹的名字开头；后端记录下来并拼进向量文本
+    source_path = f"{root_name}/{Path(item.rel).as_posix()}"
+    head = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"paths\"\r\n\r\n{source_path}\r\n"
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"files\"; filename=\"{filename}\"\r\n"
             f"Content-Type: application/octet-stream\r\n\r\n").encode("utf-8")
     body = head + item.path.read_bytes() + f"\r\n--{boundary}--\r\n".encode("utf-8")
     try:
@@ -265,7 +268,7 @@ def main():
     http_json("GET", f"{api}/knowledge-bases/{args.kb_id}")  # 知识库不存在时尽早报错
     print(f"\n上传到知识库 {args.kb_id}：")
     for n, item in enumerate(todo, 1):
-        upload(api, args.kb_id, item)
+        upload(api, args.kb_id, item, root.name)
         print(f"\r  [{n}/{len(todo)}] {item.result}  {item.rel[:50]}" + " " * 20, end="", flush=True)
     print()
 

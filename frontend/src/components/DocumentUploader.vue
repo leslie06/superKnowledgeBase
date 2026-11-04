@@ -39,7 +39,7 @@ interface Picked {
 
 interface Plan {
   name: string
-  files: File[]
+  files: Picked[]
   bytes: number
   formats: { label: string; count: number; bytes: number; exts: string }[]
   skipped: { reason: string; count: number; examples: string }[]
@@ -101,21 +101,21 @@ function extension(filename: string) {
 }
 
 function makePlan(picked: Picked[]): Plan {
-  const files: File[] = []
+  const files: Picked[] = []
   const skipped = new Map<string, string[]>()
   for (const p of picked) {
     const reason = skipReason(p)
-    if (reason === undefined) files.push(p.file)
+    if (reason === undefined) files.push(p)
     else if (reason) skipped.set(reason, [...(skipped.get(reason) ?? []), p.path])
   }
   const formats = FORMATS.map((f) => {
-    const group = files.filter((file) => f.exts.includes(extension(file.name)))
-    const exts = f.exts.map((e) => [e, group.filter((file) => extension(file.name) === e).length] as const)
+    const group = files.filter(({ file }) => f.exts.includes(extension(file.name)))
+    const exts = f.exts.map((e) => [e, group.filter(({ file }) => extension(file.name) === e).length] as const)
       .filter(([, n]) => n > 0)
     return {
       label: f.label,
       count: group.length,
-      bytes: group.reduce((sum, file) => sum + file.size, 0),
+      bytes: group.reduce((sum, { file }) => sum + file.size, 0),
       exts: exts.map(([e, n]) => `.${e} ${n}`).join('、'),
     }
   }).filter((f) => f.count > 0)
@@ -130,7 +130,7 @@ function makePlan(picked: Picked[]): Plan {
   return {
     name: roots.size === 1 ? [...roots][0] : '所选文件',
     files,
-    bytes: files.reduce((sum, file) => sum + file.size, 0),
+    bytes: files.reduce((sum, { file }) => sum + file.size, 0),
     formats,
     skipped: skippedRows,
     skippedCount: skippedRows.reduce((sum, r) => sum + r.count, 0),
@@ -189,18 +189,18 @@ async function collect(entry: FileSystemEntry, out: Picked[]) {
 }
 
 /** 按数量和总大小分批，每批一个请求 */
-function batches(files: File[]): File[][] {
-  const result: File[][] = []
-  let current: File[] = []
+function batches(files: Picked[]): Picked[][] {
+  const result: Picked[][] = []
+  let current: Picked[] = []
   let bytes = 0
-  for (const f of files) {
-    if (current.length && (current.length >= UPLOAD_BATCH || bytes + f.size > UPLOAD_BATCH_BYTES)) {
+  for (const p of files) {
+    if (current.length && (current.length >= UPLOAD_BATCH || bytes + p.file.size > UPLOAD_BATCH_BYTES)) {
       result.push(current)
       current = []
       bytes = 0
     }
-    current.push(f)
-    bytes += f.size
+    current.push(p)
+    bytes += p.file.size
   }
   if (current.length) result.push(current)
   return result
@@ -221,7 +221,9 @@ async function start(p: Plan) {
   clock = window.setInterval(() => (now.value = Date.now()), 1000)
   for (const batch of batches(p.files)) {
     try {
-      for (const r of await api.uploadDocuments(props.kbId, batch)) {
+      // 相对路径随文件一起上传，后端记录下来并拼进向量文本；单独选的文件路径就是文件名，后端会忽略
+      const results = await api.uploadDocuments(props.kbId, batch.map((p) => p.file), batch.map((p) => p.path))
+      for (const r of results) {
         if (r.status === 'ACCEPTED' && r.documentId != null) {
           current.accepted++
           current.docIds.add(r.documentId)
@@ -232,7 +234,7 @@ async function start(p: Plan) {
       }
     } catch (e) {
       // 一批失败不影响后面的批次
-      current.problems.push(...batch.map((f) => `${f.name}：上传失败，${(e as Error).message}`))
+      current.problems.push(...batch.map((p) => `${p.path}：上传失败，${(e as Error).message}`))
     }
     current.uploaded += batch.length
     emit('uploaded')

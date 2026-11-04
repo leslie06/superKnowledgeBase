@@ -201,10 +201,12 @@ if (boundary || full) {
 
 **向量文本 = 出处信息 + 原文**（`IngestionService.embeddingText`）。片段本身往往不包含文件名和章节名，比如「员工手册」里的「年假」一节正文可能只写「入职满一年享有 5 天……」。把出处拼在前面再向量化，「员工手册里的年假规定」这类问题更容易命中。数据库里只存原文，展示和拼 Prompt 时不会重复这些头部。
 
+文件夹导入的文件（页面上「选择文件夹」或 `scripts/import_dir.py`），「文件」一行用的是相对路径而不是文件名，例如「资料/人事制度/2024/考勤管理办法.docx」。资料通常按部门、产品、年份分文件夹存放，目录名就是现成的分类，「人事制度里的考勤规定」这类问题能靠它命中。路径在上传时随表单的 `paths` 字段传入，`DocumentService.sourcePath` 统一分隔符、去掉开头的 `/`，只有文件名或试图跳出所选文件夹（`../`）时不记录；存在 `document.source_path`。
+
 ```java
-static String embeddingText(String filename, ChunkDraft draft) {
+static String embeddingText(String source, ChunkDraft draft) {   // source：相对路径，没有时为文件名
     StringJoiner header = new StringJoiner("\n");
-    header.add("文件：" + filename);
+    header.add("文件：" + source);
     if (draft.headingPath() != null) header.add("章节：" + draft.headingPath());
     if (draft.location() != null)    header.add("位置：" + draft.location());
     return header + "\n\n" + draft.content();

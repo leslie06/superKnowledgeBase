@@ -13,6 +13,8 @@ export interface KbDocument {
   id: number
   kbId: number
   filename: string
+  /** 文件夹导入时的相对路径（含文件夹名和文件名），单独上传的文件为 null */
+  sourcePath: string | null
   mimeType: string
   sizeBytes: number
   status: DocumentStatus

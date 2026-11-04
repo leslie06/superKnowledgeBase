@@ -27,9 +27,11 @@ const keyword = ref('')
 const statusFilter = ref<DocumentStatus | ''>('')
 let pollTimer: number | undefined
 
-const filtered = computed(() =>
-  documents.value.filter((d) => d.filename.toLowerCase().includes(keyword.value.trim().toLowerCase())
-    && (!statusFilter.value || d.status === statusFilter.value)))
+const filtered = computed(() => {
+  const kw = keyword.value.trim().toLowerCase()
+  return documents.value.filter((d) => (d.sourcePath ?? d.filename).toLowerCase().includes(kw)
+    && (!statusFilter.value || d.status === statusFilter.value))
+})
 const stats = computed(() => ({
   total: documents.value.length,
   ready: documents.value.filter((d) => d.status === 'READY').length,
@@ -120,6 +122,11 @@ function formatTime(iso: string) {
   return new Date(iso).toLocaleString('zh-CN', { hour12: false })
 }
 
+/** 文件夹导入的文件所在目录（相对路径去掉文件名） */
+function directory(doc: KbDocument) {
+  return doc.sourcePath?.includes('/') ? doc.sourcePath.slice(0, doc.sourcePath.lastIndexOf('/')) : null
+}
+
 function extension(filename: string) {
   return filename.split('.').pop()?.toUpperCase() ?? ''
 }
@@ -140,7 +147,7 @@ function extension(filename: string) {
     <section class="panel">
       <div class="panel-header">
         <h3>文件列表</h3>
-        <el-input v-model="keyword" placeholder="按文件名筛选" clearable :prefix-icon="Search" class="filter" />
+        <el-input v-model="keyword" placeholder="按文件名或目录筛选" clearable :prefix-icon="Search" class="filter" />
         <el-select v-model="statusFilter" placeholder="全部状态" clearable class="status-filter">
           <el-option v-for="(s, key) in STATUS" :key="key" :label="s.label" :value="key" />
         </el-select>
@@ -151,7 +158,10 @@ function extension(filename: string) {
           <template #default="{ row }">
             <div class="file-cell">
               <span class="ext" :data-ext="extension(row.filename)">{{ extension(row.filename) }}</span>
-              <a :href="fileUrl(row.id, row.filename)" target="_blank" class="file-name">{{ row.filename }}</a>
+              <div class="file-text">
+                <a :href="fileUrl(row.id, row.filename)" target="_blank" class="file-name">{{ row.filename }}</a>
+                <div v-if="directory(row)" class="file-dir" :title="directory(row)!">{{ directory(row) }}</div>
+              </div>
             </div>
           </template>
         </el-table-column>

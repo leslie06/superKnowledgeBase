@@ -50,16 +50,36 @@ public class DocumentService {
         return documents.findById(id).orElseThrow(() -> new NotFoundException("文档不存在：" + id));
     }
 
-    public List<UploadResult> upload(long kbId, List<MultipartFile> files) {
+    /**
+     * @param paths 与 files 一一对应的相对路径（文件夹导入时由前端或脚本提供），可以为 null
+     */
+    public List<UploadResult> upload(long kbId, List<MultipartFile> files, List<String> paths) {
         knowledgeBaseService.get(kbId);
+        if (paths != null && paths.size() != files.size()) {
+            throw new IllegalArgumentException("paths 的数量（" + paths.size() + "）与文件数量（" + files.size() + "）不一致");
+        }
         List<UploadResult> results = new ArrayList<>();
-        for (MultipartFile file : files) {
-            results.add(uploadOne(kbId, file));
+        for (int i = 0; i < files.size(); i++) {
+            results.add(uploadOne(kbId, files.get(i), paths == null ? null : sourcePath(paths.get(i))));
         }
         return results;
     }
 
-    private UploadResult uploadOne(long kbId, MultipartFile file) {
+    /**
+     * 规范化文件夹导入时的相对路径：统一用 / 分隔、去掉开头的 /；只有文件名（不在文件夹里）或试图跳出所选文件夹时返回 null。
+     */
+    static String sourcePath(String raw) {
+        if (!StringUtils.hasText(raw)) {
+            return null;
+        }
+        String path = StringUtils.cleanPath(raw.strip());
+        while (path.startsWith("/")) {
+            path = path.substring(1);
+        }
+        return path.contains("/") && !path.startsWith("../") ? path : null;
+    }
+
+    private UploadResult uploadOne(long kbId, MultipartFile file, String sourcePath) {
         String filename = StringUtils.getFilename(StringUtils.cleanPath(String.valueOf(file.getOriginalFilename())));
         try {
             DocType.fromFilename(filename);
@@ -75,7 +95,7 @@ public class DocumentService {
             if (existing.isPresent()) {
                 return duplicate(filename, existing.get());
             }
-            long id = documents.insert(kbId, filename, stored.relativePath(), stored.sha256(),
+            long id = documents.insert(kbId, filename, sourcePath, stored.relativePath(), stored.sha256(),
                     mediaType(filename).toString(), stored.size());
             ingestionService.submit(id);
             return new UploadResult(filename, UploadStatus.ACCEPTED, id, "已加入处理队列");

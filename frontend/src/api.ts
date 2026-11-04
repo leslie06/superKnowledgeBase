@@ -31,9 +31,11 @@ export const api = {
   deleteKb: (id: number) => request<void>(`/api/knowledge-bases/${id}`, { method: 'DELETE' }),
 
   listDocuments: (kbId: number) => request<KbDocument[]>(`/api/knowledge-bases/${kbId}/documents`),
-  uploadDocuments: (kbId: number, files: File[]) => {
+  /** paths 与 files 一一对应，是文件夹导入时文件的相对路径 */
+  uploadDocuments: (kbId: number, files: File[], paths?: string[]) => {
     const form = new FormData()
     files.forEach((f) => form.append('files', f))
+    paths?.forEach((p) => form.append('paths', p))
     return request<UploadResult[]>(`/api/knowledge-bases/${kbId}/documents`, { method: 'POST', body: form })
   },
   deleteDocument: (id: number) => request<void>(`/api/documents/${id}`, { method: 'DELETE' }),
