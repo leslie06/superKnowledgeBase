@@ -1,5 +1,5 @@
 import type {
-  ChatMessage, ChunkView, Citation, Conversation, KbDocument, KnowledgeBase, RetrievedChunk, SearchScope, UploadResult,
+  AnswerVerification, ChatMessage, ChunkView, Citation, Conversation, KbDocument, KnowledgeBase, RetrievedChunk, SearchScope, UploadResult,
 } from './types'
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
@@ -66,6 +66,8 @@ export interface ChatStreamHandlers {
   onCitations: (citations: Citation[]) => void
   onDelta: (text: string) => void
   onDone: (messageId: number) => void
+  /** 回答核对结果，在 done 之后到达；未开启核对或核对失败时没有 */
+  onVerification?: (verification: AnswerVerification) => void
   onError: (message: string) => void
 }
 
@@ -109,6 +111,7 @@ function dispatch(raw: string, handlers: ChatStreamHandlers) {
     case 'citations': handlers.onCitations(payload); break
     case 'delta': handlers.onDelta(payload.text); break
     case 'done': handlers.onDone(payload.messageId); break
+    case 'verification': handlers.onVerification?.(payload); break
     case 'error': handlers.onError(payload.message); break
   }
 }

@@ -41,8 +41,9 @@ public record SkbProperties(String storageDir, Ingestion ingestion, Chunk chunk,
      * @param historyMessages 携带的历史消息条数
      * @param maxContextChars 参考资料的总字数预算
      * @param expandChars     每条参考资料扩展到的最大字数：把命中片段在同一章节里的前后片段一起交给模型，0 表示不扩展
+     * @param verifyAnswers   生成回答后是否再请 LLM 对照参考资料核对（找出无依据内容和引用错误），每个问题多一次调用
      */
-    public record Chat(int historyMessages, int maxContextChars, int expandChars) {
+    public record Chat(int historyMessages, int maxContextChars, int expandChars, boolean verifyAnswers) {
     }
 
     /**

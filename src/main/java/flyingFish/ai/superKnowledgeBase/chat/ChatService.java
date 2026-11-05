@@ -26,6 +26,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -33,7 +34,8 @@ import java.util.concurrent.atomic.AtomicLong;
  * RAG 问答：查询改写（{@link QueryRewriter}） → 检索 → 扩展相邻片段（{@link Retriever#expand}）→ 组装带编号的参考资料
  * → LLM 流式生成（要求标注 [n] 引用）。
  * <p>
- * SSE 事件：citations（检索到的引用）→ delta（增量文本）* → done（消息 id）；出错时发送 error。
+ * SSE 事件：citations（检索到的引用）→ delta（增量文本）* → done（消息 id）→ verification（回答核对结果，
+ * 开启 skb.chat.verify-answers 且核对成功时才有）；出错时发送 error。
  */
 @Service
 public class ChatService {
@@ -53,8 +55,10 @@ public class ChatService {
             你是一个严谨的知识库问答助手，根据用户提供的【参考资料】回答问题。
             规则：
             1. 只依据参考资料作答，不要编造资料中没有的信息；资料不足以回答时，直接说明"知识库中没有找到相关信息"，可以给出资料中已有的相关部分。
-            2. 在使用了资料的句子末尾标注来源编号，格式为 [1]、[2]；一句话来自多个来源时写成 [1][3]。不要在末尾单独列出参考文献。
-            3. 用中文回答，先给出结论，再展开说明；内容较多时使用 Markdown 列表或表格。
+            2. 不要用自己的知识补充资料之外的内容：资料没有写明的数字、期限、计算标准、法律后果、编号或术语的含义，不要推断或解释；
+               确实需要提及时，写明"资料中没有说明"。
+            3. 在使用了资料的句子末尾标注来源编号，格式为 [1]、[2]；一句话来自多个来源时写成 [1][3]。不要在末尾单独列出参考文献。
+            4. 用中文回答，先给出结论，再展开说明；内容较多时使用 Markdown 列表或表格。
             """;
 
     /**
@@ -70,26 +74,31 @@ public class ChatService {
     private final KnowledgeBaseService knowledgeBaseService;
     private final Retriever retriever;
     private final QueryRewriter queryRewriter;
+    private final AnswerVerifier answerVerifier;
     private final ChatClient chatClient;
     private final JsonMapper jsonMapper;
     private final int historyMessages;
     private final int maxContextChars;
     private final int expandChars;
+    private final boolean verifyAnswers;
     private final boolean apiKeyConfigured;
 
     public ChatService(ConversationRepository conversations, KnowledgeBaseService knowledgeBaseService,
-                       Retriever retriever, QueryRewriter queryRewriter, ChatClient.Builder chatClientBuilder,
+                       Retriever retriever, QueryRewriter queryRewriter, AnswerVerifier answerVerifier,
+                       ChatClient.Builder chatClientBuilder,
                        JsonMapper jsonMapper,
                        SkbProperties properties, @Value("${spring.ai.deepseek.api-key:}") String apiKey) {
         this.conversations = conversations;
         this.knowledgeBaseService = knowledgeBaseService;
         this.retriever = retriever;
         this.queryRewriter = queryRewriter;
+        this.answerVerifier = answerVerifier;
         this.chatClient = chatClientBuilder.build();
         this.jsonMapper = jsonMapper;
         this.historyMessages = properties.chat().historyMessages();
         this.maxContextChars = properties.chat().maxContextChars();
         this.expandChars = properties.chat().expandChars();
+        this.verifyAnswers = properties.chat().verifyAnswers();
         this.apiKeyConfigured = StringUtils.hasText(apiKey) && !NO_API_KEY.equals(apiKey) && !"sk-xxxx".equals(apiKey);
     }
 
@@ -216,7 +225,31 @@ public class ChatService {
                     }
                 })
                 .map(text -> event("delta", Map.of("text", text)));
-        return Flux.concat(head, body, Flux.defer(() -> saveAnswer(chat, answer.toString())));
+        return Flux.concat(head, body, Flux.defer(() -> {
+            Mono<Long> saved = Mono.fromCallable(() -> saveAssistantMessage(chat, answer.toString()))
+                    .subscribeOn(Schedulers.boundedElastic())
+                    .cache();
+            Flux<ServerSentEvent<String>> done = saved.map(id -> event("done", Map.of("messageId", id))).flux();
+            return verifyAnswers ? Flux.concat(done, verify(chat, answer.toString(), saved)) : done;
+        }));
+    }
+
+    /** 回答保存后再核对，结果写回消息并推给前端；核对失败时不发送事件，回答本身不受影响 */
+    private Flux<ServerSentEvent<String>> verify(PreparedChat chat, String answer, Mono<Long> saved) {
+        return saved.flatMap(id -> Mono.fromCallable(() -> {
+                            long start = System.nanoTime();
+                            Optional<Verification> result = answerVerifier.verify(chat.citations(), answer);
+                            result.ifPresent(v -> {
+                                conversations.updateVerification(id, v);
+                                log.info("回答核对完成：{} ms，无依据 {} 处，引用错误 {} 处", (System.nanoTime() - start) / 1_000_000,
+                                        v.unsupported().size(), v.citationErrors().size());
+                            });
+                            return result;
+                        })
+                        .subscribeOn(Schedulers.boundedElastic()))
+                .flatMap(Mono::justOrEmpty)
+                .map(v -> event("verification", v))
+                .flux();
     }
 
     private Flux<ServerSentEvent<String>> saveAnswer(PreparedChat chat, String answer) {

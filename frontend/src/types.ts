@@ -94,11 +94,29 @@ export interface Conversation {
   updatedAt: string
 }
 
+export interface VerificationIssue {
+  /** 回答中的原句 */
+  text: string
+  reason: string
+}
+
+/** 回答核对结果：两个列表都为空表示回答内容都能在参考资料中找到依据 */
+export interface AnswerVerification {
+  /** 参考资料无法支持的内容（编造、常识补充、资料之外的推断） */
+  unsupported: VerificationIssue[]
+  /** 标注了 [n] 但第 n 条资料并不支持的句子 */
+  citationErrors: VerificationIssue[]
+}
+
 export interface ChatMessage {
   id: number | null
   role: 'user' | 'assistant'
   content: string
   citations: Citation[]
+  /** 没有核对时为 null（未开启、无命中直接拒答、停止生成或核对失败） */
+  verification?: AnswerVerification | null
   streaming?: boolean
+  /** 回答已生成，正在核对 */
+  verifying?: boolean
   error?: string
 }

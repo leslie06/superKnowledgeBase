@@ -90,9 +90,16 @@ public class ConversationRepository {
         return scope == null || scope.isAll() ? null : toJson(scope);
     }
 
+    public void updateVerification(long messageId, Verification verification) {
+        jdbc.sql("UPDATE message SET verification = CAST(? AS jsonb) WHERE id = ?")
+                .params(toJson(verification), messageId).update();
+    }
+
     private ChatMessage mapMessage(ResultSet rs, int rowNum) throws SQLException {
+        String verification = rs.getString("verification");
         return new ChatMessage(rs.getLong("id"), rs.getLong("conversation_id"), rs.getString("role"),
                 rs.getString("content"), parseCitations(rs.getString("citations")),
+                verification == null ? null : jsonMapper.readValue(verification, Verification.class),
                 rs.getObject("created_at", OffsetDateTime.class));
     }
 

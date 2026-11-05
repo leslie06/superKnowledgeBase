@@ -8,7 +8,7 @@ import ScopeSelector from '../components/ScopeSelector.vue'
 import { api, streamChat } from '../api'
 import { renderMarkdown } from '../markdown'
 import { store } from '../store'
-import type { ChatMessage, Citation, Conversation, SearchScope } from '../types'
+import type { AnswerVerification, ChatMessage, Citation, Conversation, SearchScope } from '../types'
 
 const props = defineProps<{ kbId: string; convId?: string }>()
 const router = useRouter()
@@ -115,7 +115,8 @@ async function send(text = question.value) {
   const answer = messages.value[messages.value.length - 1]
   scrollToBottom(true)
 
-  abortController = new AbortController()
+  const controller = new AbortController()
+  abortController = controller
   try {
     await streamChat(id, q, {
       onCitations: (c) => { answer.citations = c },
@@ -123,15 +124,30 @@ async function send(text = question.value) {
         answer.content += t
         scrollToBottom()
       },
-      onDone: (messageId) => { answer.id = messageId },
+      onDone: (messageId) => {
+        answer.id = messageId
+        // 回答已保存，之后的核对在后台进行，不妨碍继续提问
+        answer.streaming = false
+        answer.verifying = true
+        streaming.value = false
+        loadConversations()
+      },
+      onVerification: (v) => {
+        answer.verification = v
+        scrollToBottom()
+      },
       onError: (message) => { answer.error = message },
-    }, abortController.signal)
+    }, controller.signal)
   } catch (e) {
     if ((e as Error).name !== 'AbortError') answer.error = `连接中断：${(e as Error).message}`
   } finally {
     answer.streaming = false
-    streaming.value = false
-    abortController = null
+    answer.verifying = false
+    // 核对期间已经开始了下一次提问时，不要清掉新提问的状态
+    if (abortController === controller) {
+      streaming.value = false
+      abortController = null
+    }
     loadConversations()
   }
 }
@@ -155,6 +171,10 @@ function scrollToBottom(force = false) {
     const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120
     if (force || nearBottom) el.scrollTop = el.scrollHeight
   })
+}
+
+function issueCount(v: AnswerVerification) {
+  return v.unsupported.length + v.citationErrors.length
 }
 
 /** 回答中实际引用到的来源；模型没标注编号时展示全部检索结果 */
@@ -244,6 +264,21 @@ async function onConversationCommand(command: string, conv: Conversation) {
                 <b>{{ c.index }}</b>{{ c.filename }}
                 <span v-if="c.headingPath || c.location" class="muted">· {{ c.location || c.headingPath }}</span>
               </button>
+            </div>
+            <div v-if="m.verifying" class="verify verify-pending">正在核对回答与参考资料…</div>
+            <div v-else-if="m.verification && !issueCount(m.verification)" class="verify verify-ok">
+              ✓ 已核对：回答内容都能在参考资料中找到依据
+            </div>
+            <div v-else-if="m.verification" class="verify verify-warn">
+              <div class="verify-title">⚠ 核对发现 {{ issueCount(m.verification) }} 处需要确认</div>
+              <ul>
+                <li v-for="(i, k) in m.verification.unsupported" :key="'u' + k">
+                  「{{ i.text }}」<span class="muted">资料中找不到依据：{{ i.reason }}</span>
+                </li>
+                <li v-for="(i, k) in m.verification.citationErrors" :key="'c' + k">
+                  「{{ i.text }}」<span class="muted">引用与内容不符：{{ i.reason }}</span>
+                </li>
+              </ul>
             </div>
           </div>
         </div>
