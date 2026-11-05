@@ -61,6 +61,10 @@ public class DocumentParser {
     /** PDF / PostScript 设置字典中的"/设置名 true|false"，一段里出现多次说明整段都是设置 */
     private static final Pattern PDF_SETTING = Pattern.compile("/[A-Z][A-Za-z0-9]+ (?:true|false)\\b");
     private static final int MIN_PDF_SETTINGS = 3;
+    /** 识别结果中与同页文字层某行相似度达到这个值的行视为重复（文字层的水印渲染后又被识别了一遍） */
+    private static final double TEXT_LAYER_DUPLICATE_SIMILARITY = 0.6;
+    /** 比较相似度时只保留文字、字母和数字，识别结果的空格、标点经常和原文不一致 */
+    private static final Pattern NON_WORD = Pattern.compile("[^\\p{IsHan}\\p{L}\\p{N}]");
 
     private final AutoDetectParser parser = new AutoDetectParser();
     private final OcrService ocr;
@@ -131,31 +135,81 @@ public class DocumentParser {
         if (!ocr.available() || pageCount == 0) {
             return blocks;
         }
-        int[] chars = new int[pageCount + 1];
-        for (Block block : blocks) {
-            if (block.unit() > 0 && block.unit() <= pageCount) {
-                chars[block.unit()] += textLength(block);
-            }
-        }
-        List<Integer> scanned = IntStream.rangeClosed(1, pageCount)
-                .filter(p -> chars[p] < ocr.minPageChars())
-                .boxed()
-                .toList();
+        List<Integer> scanned = scannedPages(blocks, pageCount, ocr.minPageChars());
         if (scanned.isEmpty()) {
             return blocks;
         }
         Map<Integer, String> texts = ocr.recognize(sha256, file, scanned, progress);
+        Map<Integer, List<String>> layerLines = blocks.stream()
+                .filter(b -> b.kind() == Kind.PARAGRAPH && b.unit() > 0)
+                .collect(Collectors.groupingBy(Block::unit, Collectors.mapping(Block::text, Collectors.toList())));
         List<Block> merged = new ArrayList<>(blocks);
         for (int page : scanned) {
             String text = texts.get(page);
             if (text != null) {
-                text.lines().map(TikaBlockHandler::normalize).filter(line -> !line.isEmpty())
+                List<String> layer = layerLines.getOrDefault(page, List.of());
+                text.lines().map(TikaBlockHandler::normalize)
+                        .filter(line -> !line.isEmpty() && !duplicatesTextLayer(line, layer))
                         .forEach(line -> merged.add(new Block(Kind.PARAGRAPH, 0, line, null, page)));
             }
         }
         // 稳定排序，同一页内保持原有顺序；不属于任何页的内容（如 PDF 书签）放在最后
         merged.sort(Comparator.comparingInt(b -> b.unit() > 0 ? b.unit() : Integer.MAX_VALUE));
         return merged;
+    }
+
+    /**
+     * 文字层少于 minPageChars 个字的页。先去掉每页重复的页眉页脚再计数：有些扫描版每页都带一行文字水印
+     * （"更多资源请访问……"），只按字数算会把整本书当成有文字层。
+     */
+    static List<Integer> scannedPages(List<Block> blocks, int pageCount, int minPageChars) {
+        int[] chars = new int[pageCount + 1];
+        for (Block block : PdfTextCleaner.removeHeadersAndFooters(blocks)) {
+            if (block.unit() > 0 && block.unit() <= pageCount) {
+                chars[block.unit()] += textLength(block);
+            }
+        }
+        return IntStream.rangeClosed(1, pageCount)
+                .filter(p -> chars[p] < minPageChars)
+                .boxed()
+                .toList();
+    }
+
+    /**
+     * 扫描页上的少量文字层（如水印）渲染成图片后会被再识别一遍，识别结果带错字（"更多资源"识别成"雨多咨源"），
+     * 每页写法都不同，PdfTextCleaner 按完全相同去重去不掉，所以这里按编辑距离和同页文字层比较。
+     */
+    static boolean duplicatesTextLayer(String ocrLine, List<String> layerLines) {
+        String line = NON_WORD.matcher(ocrLine).replaceAll("");
+        if (line.isEmpty()) {
+            return false;
+        }
+        for (String layerLine : layerLines) {
+            String other = NON_WORD.matcher(layerLine).replaceAll("");
+            int longer = Math.max(line.length(), other.length());
+            // 长度差太多时相似度不可能达标，省去计算
+            if (Math.min(line.length(), other.length()) >= longer * TEXT_LAYER_DUPLICATE_SIMILARITY
+                    && 1 - (double) editDistance(line, other) / longer >= TEXT_LAYER_DUPLICATE_SIMILARITY) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static int editDistance(String a, String b) {
+        int[] previous = IntStream.rangeClosed(0, b.length()).toArray();
+        int[] current = new int[b.length() + 1];
+        for (int i = 1; i <= a.length(); i++) {
+            current[0] = i;
+            for (int j = 1; j <= b.length(); j++) {
+                int substitute = previous[j - 1] + (a.charAt(i - 1) == b.charAt(j - 1) ? 0 : 1);
+                current[j] = Math.min(substitute, Math.min(previous[j], current[j - 1]) + 1);
+            }
+            int[] swap = previous;
+            previous = current;
+            current = swap;
+        }
+        return previous[b.length()];
     }
 
     private static int textLength(Block block) {

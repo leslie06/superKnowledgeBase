@@ -27,6 +27,27 @@ class PdfTextCleanerTests {
     }
 
     @Test
+    void watermarkDoesNotCountAsTextLayer() {
+        List<Block> blocks = new ArrayList<>();
+        for (int page = 1; page <= 4; page++) {
+            blocks.add(line("更多资源请访问稀酷客(www.ckook.com)", page));
+        }
+        blocks.add(line("第 2 页有真正的文字层，字数超过识别阈值。", 2));
+
+        assertThat(DocumentParser.scannedPages(blocks, 5, 20)).containsExactly(1, 3, 4, 5);
+    }
+
+    @Test
+    void dropsOcrLinesDuplicatingTextLayer() {
+        List<String> layer = List.of("更多资源请访问稀酷客(www.ckook.com)");
+
+        assertThat(DocumentParser.duplicatesTextLayer("雨多咨源请访问稀酷客(www ckook coni", layer)).isTrue();
+        assertThat(DocumentParser.duplicatesTextLayer("自多瓷源请访问森酷安（wwwckook com", layer)).isTrue();
+        assertThat(DocumentParser.duplicatesTextLayer("第1条：考虑用静态工厂方法代替构造器", layer)).isFalse();
+        assertThat(DocumentParser.duplicatesTextLayer("更多资源", layer)).isFalse();
+    }
+
+    @Test
     void keepsRepeatedLinesWhenDocumentIsTooShort() {
         List<Block> blocks = List.of(line("公司名称", 1), line("公司名称", 2));
 

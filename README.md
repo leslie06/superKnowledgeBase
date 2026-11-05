@@ -108,7 +108,7 @@ pkill -f rerank_server.py           # 停止
 
 ### 扫描版 PDF 的文字识别（OCR）
 
-扫描版 PDF 的页面是图片，没有文字层。解析时文字少于 20 个字的页会交给 `scripts/ocr/vision-ocr` 识别，它用 macOS 自带的 Vision 框架，不需要另外启动服务，也几乎不占内存。首次使用先编译（编译产物已 gitignore）：
+扫描版 PDF 的页面是图片，没有文字层。解析时文字少于 20 个字的页（每页重复的水印、页眉页脚不算）会交给 `scripts/ocr/vision-ocr` 识别，它用 macOS 自带的 Vision 框架，不需要另外启动服务，也几乎不占内存。首次使用先编译（编译产物已 gitignore）：
 
 ```bash
 swiftc -O scripts/ocr/vision_ocr.swift -o scripts/ocr/vision-ocr
