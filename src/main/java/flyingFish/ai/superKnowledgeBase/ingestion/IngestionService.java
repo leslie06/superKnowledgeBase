@@ -24,7 +24,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * 文档摄入管线：解析 → 切块 → 向量化 → 入库。异步执行，并发数受限以免压垮本地 embedding 服务。
+ * 文档摄入管线：解析 → 切块 → 生成文档摘要 → 向量化 → 入库。异步执行，并发数受限以免压垮本地 embedding 服务。
  */
 @Service
 public class IngestionService {
@@ -41,6 +41,7 @@ public class IngestionService {
     private final TransactionTemplate transactionTemplate;
     private final int embeddingBatchSize;
     private final OcrService ocr;
+    private final DocumentSummarizer summarizer;
     private final ExecutorService executor;
     private final Set<Long> inFlight = ConcurrentHashMap.newKeySet();
     /** 应用正在关闭：此时处理中断不算失败，保持原状态，下次启动后继续 */
@@ -48,7 +49,8 @@ public class IngestionService {
 
     public IngestionService(DocumentRepository documents, ChunkRepository chunks, FileStorage fileStorage,
                             DocumentParser parser, Chunker chunker, EmbeddingModel embeddingModel,
-                            TransactionTemplate transactionTemplate, OcrService ocr, SkbProperties properties) {
+                            TransactionTemplate transactionTemplate, OcrService ocr, DocumentSummarizer summarizer,
+                            SkbProperties properties) {
         this.documents = documents;
         this.chunks = chunks;
         this.fileStorage = fileStorage;
@@ -57,6 +59,7 @@ public class IngestionService {
         this.embeddingModel = embeddingModel;
         this.transactionTemplate = transactionTemplate;
         this.ocr = ocr;
+        this.summarizer = summarizer;
         this.embeddingBatchSize = properties.ingestion().embeddingBatchSize();
         this.executor = Executors.newFixedThreadPool(properties.ingestion().concurrency(),
                 Thread.ofVirtual().name("ingest-", 0).factory());
@@ -77,6 +80,44 @@ public class IngestionService {
 
     public boolean isProcessing(long documentId) {
         return inFlight.contains(documentId);
+    }
+
+    boolean isStopping() {
+        return stopping;
+    }
+
+    /**
+     * 为已处理完成的文档补生成摘要片段，不重新解析和向量化正文。由 {@link SummaryBackfill} 在后台逐个调用；
+     * 与正常处理共用"处理中"标记，同一文档不会同时被重新处理和补摘要。
+     *
+     * @return 是否写入了摘要片段
+     */
+    boolean addSummary(long documentId) {
+        if (!inFlight.add(documentId)) {
+            return false;
+        }
+        try {
+            Document doc = documents.findById(documentId).orElse(null);
+            if (doc == null || !DocumentStatus.READY.name().equals(doc.status())) {
+                return false;
+            }
+            String source = source(doc);
+            List<ChunkDraft> drafts = chunks.findTextByDocument(documentId).stream()
+                    .map(c -> new ChunkDraft(c.content(), c.headingPath(), c.location()))
+                    .toList();
+            String summary = summary(doc, source, drafts);
+            if (summary == null) {
+                return false;
+            }
+            float[] embedding = embeddingModel.embed(summaryEmbeddingText(source, summary));
+            transactionTemplate.executeWithoutResult(status -> {
+                chunks.deleteSummary(documentId);
+                chunks.insertSummary(documentId, doc.kbId(), source, summary, embedding);
+            });
+            return true;
+        } finally {
+            inFlight.remove(documentId);
+        }
     }
 
     /** 应用重启后，继续处理上次未完成的文档。 */
@@ -115,11 +156,17 @@ public class IngestionService {
             }
 
             documents.updateStatus(documentId, DocumentStatus.EMBEDDING, null);
-            List<float[]> embeddings = embed(doc.sourcePath() != null ? doc.sourcePath() : doc.filename(), drafts);
+            String source = source(doc);
+            String summary = summary(doc, source, drafts);
+            List<float[]> embeddings = embed(source, drafts);
+            float[] summaryEmbedding = summary == null ? null : embeddingModel.embed(summaryEmbeddingText(source, summary));
 
             transactionTemplate.executeWithoutResult(status -> {
                 chunks.deleteByDocument(documentId);
                 chunks.insertAll(documentId, doc.kbId(), drafts, embeddings);
+                if (summary != null) {
+                    chunks.insertSummary(documentId, doc.kbId(), source, summary, summaryEmbedding);
+                }
                 documents.markReady(documentId, drafts.size());
             });
             log.info("文档处理完成：{}（{} 个片段，耗时 {} ms）", doc.filename(), drafts.size(),
@@ -139,6 +186,27 @@ public class IngestionService {
                 log.debug("更新文档状态失败：{}", documentId, updateError);
             }
         }
+    }
+
+    /** 文件夹导入的文件用相对路径（目录名就是分类），否则用文件名 */
+    private static String source(Document doc) {
+        return doc.sourcePath() != null ? doc.sourcePath() : doc.filename();
+    }
+
+    /** 摘要只取决于文件内容，重新处理时复用已有的；文件换成新版本时 replaceFile 已把它清空 */
+    private String summary(Document doc, String source, List<ChunkDraft> drafts) {
+        if (doc.summary() != null) {
+            return doc.summary();
+        }
+        String summary = summarizer.summarize(source, drafts).orElse(null);
+        if (summary != null) {
+            documents.updateSummary(doc.id(), summary);
+        }
+        return summary;
+    }
+
+    private static String summaryEmbeddingText(String source, String summary) {
+        return embeddingText(source, new ChunkDraft(summary, ChunkRepository.SUMMARY_HEADING, null));
     }
 
     private List<float[]> embed(String source, List<ChunkDraft> drafts) {

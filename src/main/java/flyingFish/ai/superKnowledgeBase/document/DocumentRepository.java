@@ -46,11 +46,15 @@ public class DocumentRepository {
     public void replaceFile(long id, String filename, String filePath, String sha256, String mimeType, long size) {
         jdbc.sql("""
                         UPDATE document SET filename = ?, file_path = ?, sha256 = ?, mime_type = ?, size_bytes = ?,
-                                            status = ?, error_msg = NULL, updated_at = now()
+                                            summary = NULL, status = ?, error_msg = NULL, updated_at = now()
                         WHERE id = ?
                         """)
                 .params(filename, filePath, sha256, mimeType, size, DocumentStatus.PENDING.name(), id)
                 .update();
+    }
+
+    public void updateSummary(long id, String summary) {
+        jdbc.sql("UPDATE document SET summary = ? WHERE id = ?").params(summary, id).update();
     }
 
     public List<Long> findIdsByStatus(List<String> statuses) {

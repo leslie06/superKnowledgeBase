@@ -24,6 +24,8 @@ export interface KbDocument {
   ocrPages: number
   /** 已完成文字识别的页数 */
   ocrDone: number
+  /** LLM 生成的文档摘要，作为特殊片段参与检索；还没有生成时为 null */
+  summary: string | null
   createdAt: string
   updatedAt: string
 }

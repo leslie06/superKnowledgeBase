@@ -6,7 +6,7 @@ import java.time.Duration;
 
 @ConfigurationProperties("skb")
 public record SkbProperties(String storageDir, Ingestion ingestion, Chunk chunk, Retrieval retrieval, Rerank rerank,
-                            Chat chat, Ocr ocr) {
+                            Chat chat, Ocr ocr, Summary summary) {
 
     public record Ingestion(int concurrency, int embeddingBatchSize) {
     }
@@ -52,5 +52,12 @@ public record SkbProperties(String storageDir, Ingestion ingestion, Chunk chunk,
      * @param minPageChars 文字层少于这么多个字（不含空白）的页视为扫描页
      */
     public record Ocr(boolean enabled, String command, int dpi, int minPageChars) {
+    }
+
+    /**
+     * @param enabled    是否为文档生成摘要（需要配置 DeepSeek Key）；已有文档在启动时后台补生成
+     * @param inputChars 交给 LLM 的文档信息字数上限（目录 + 开头 + 均匀抽取的几段正文）
+     */
+    public record Summary(boolean enabled, int inputChars) {
     }
 }

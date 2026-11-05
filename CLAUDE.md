@@ -55,6 +55,7 @@ npm run typecheck    # vue-tsc 类型检查
 - 扫描版 PDF：`DocumentParser.withOcr` 把文字层（去掉每页重复的页眉页脚和水印后）少于 `skb.ocr.min-page-chars` 的页交给 `OcrService`，它调用 `skb.ocr.command`（`scripts/ocr/vision-ocr`，Swift + 苹果 Vision，每识别一页输出一行 JSON），结果按文件 SHA-256 + 页码缓存在 `ocr_page` 表（reindex 不重复识别），进度写入 `document.ocr_done/ocr_pages`。识别出的行作为该页的段落（与同页文字层编辑距离相似的行丢弃，水印渲染后会被再识别一遍），再统一经过 `PdfTextCleaner`。命令不存在时跳过识别。
 - `DocumentParser.stripEncoded` 去掉 PDF 里嵌入的编码内容（含字母的长串十六进制、Adobe 设置字典），这类乱码片段向量几乎相同，会把 HNSW 检索引偏。
 - 标题识别：编号规则的层级为 编 1 > 分编 2 > 章 3 > 节/"一、" 4 > "（一）" 5 > 小数编号（段数 + 3）；样式标题开头的小数编号（Tika 常算错）会被去掉。
+- 文档摘要（`DocumentSummarizer`，`skb.summary.*`）：切块后把文件路径、目录、开头和均匀抽取的 8 段正文交给 DeepSeek 写一段摘要，作为 `chunk.kind = 'SUMMARY'`、`chunk_index = -1`、章节为「文档摘要」的特殊片段和正文一起参与检索（关键词索引额外加上文件出处），用于「这本书讲了什么」「哪些资料讲到了 XX」这类问题。摘要原文存在 `document.summary`，重新处理时复用，`replaceFile` 换新版本时清空；生成失败只记 WARN。`SummaryBackfill` 在启动时后台为已有文档逐个补生成（只调 LLM 和向量化一次，与摄入共用"处理中"标记）。`chunk_count` 不含摘要片段；`SuperKnowledgeBaseApplicationTests` 关掉了摘要，避免测试调用 DeepSeek。
 - 向量化时把"文件名 + 章节 + 位置"拼在片段前面（`IngestionService.embeddingText`），但数据库中 `chunk.content` 只存原文。文件夹导入（页面「选择文件夹」或 `scripts/import_dir.py`）时上传接口会带 `paths` 字段，记录到 `document.source_path`（相对路径，含所选文件夹名），向量文本中用它代替文件名；该字段只影响之后处理的文档。
 
 ### 检索与问答

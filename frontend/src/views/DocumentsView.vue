@@ -161,6 +161,12 @@ function extension(filename: string) {
               <span class="ext" :data-ext="extension(row.filename)">{{ extension(row.filename) }}</span>
               <div class="file-text">
                 <a :href="fileUrl(row.id, row.filename)" target="_blank" class="file-name">{{ row.filename }}</a>
+                <el-popover v-if="row.summary" placement="bottom-start" :width="420" trigger="click">
+                  <template #reference>
+                    <el-button class="summary-link" link type="primary" size="small">摘要</el-button>
+                  </template>
+                  <div class="doc-summary">{{ row.summary }}</div>
+                </el-popover>
                 <div v-if="directory(row)" class="file-dir" :title="directory(row)!">{{ directory(row) }}</div>
               </div>
             </div>
