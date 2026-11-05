@@ -49,6 +49,15 @@ public class DocumentParser {
     private static final Pattern STYLED_HEADING_NUMBER = Pattern.compile("^\\d{1,2}(?:\\.\\d{1,2})*\\.?\\s+(?=\\S)");
     /** 没有检索价值的独立行：页码（"－1－"、"- 2 -"）、目录标题 */
     private static final Pattern NOISE_LINE = Pattern.compile("^(?:[－\\-—–]\\s*\\d+\\s*[－\\-—–]|目\\s*录)$");
+    /**
+     * 编码后的二进制内容：200 个字符以上、含 a~f 字母的连续十六进制串。PDF 里嵌入的元数据（如 Adobe 导出设置中
+     * 几十种语言的说明，以 UTF-16 十六进制存放）会被 Tika 当成正文提取出来。这类片段彼此几乎相同，向量聚成一团，
+     * 会把 HNSW 检索引偏。要求含字母，是为了保留教材里纯 0/1 的二进制示例；带空格的十六进制转储也不受影响
+     */
+    private static final Pattern HEX_RUN = Pattern.compile("[0-9A-Fa-f]{200,}");
+    /** PDF / PostScript 设置字典中的"/设置名 true|false"，一段里出现多次说明整段都是设置 */
+    private static final Pattern PDF_SETTING = Pattern.compile("/[A-Z][A-Za-z0-9]+ (?:true|false)\\b");
+    private static final int MIN_PDF_SETTINGS = 3;
 
     private final AutoDetectParser parser = new AutoDetectParser();
 
@@ -63,11 +72,39 @@ public class DocumentParser {
             throw new IOException("文件解析失败：" + e.getMessage(), e);
         }
         List<Block> blocks = type == DocType.PDF ? PdfTextCleaner.clean(handler.blocks()) : handler.blocks();
-        return switch (type) {
+        List<TextUnit> units = switch (type) {
             case EXCEL -> excelUnits(blocks);
             case PPT -> pptUnits(blocks);
             case WORD, PDF, TEXT -> flowUnits(blocks, type);
         };
+        return units.stream()
+                .map(u -> new TextUnit(stripEncoded(u.text()), u.headingPath(), u.unit(), u.location()))
+                .filter(u -> !u.text().isBlank())
+                .toList();
+    }
+
+    /**
+     * 去掉编码后的二进制内容。整段是设置字典，或编码内容超过一半（剩下的多是"> /CZE <FEFF"这类语法残片）时返回空串，整段丢弃。
+     */
+    static String stripEncoded(String text) {
+        if (PDF_SETTING.matcher(text).results().limit(MIN_PDF_SETTINGS).count() >= MIN_PDF_SETTINGS) {
+            return "";
+        }
+        Matcher m = HEX_RUN.matcher(text);
+        StringBuilder kept = new StringBuilder();
+        int removed = 0;
+        while (m.find()) {
+            // 纯数字（如 0/1 二进制示例）不算编码内容；没有调用 appendReplacement 的匹配会由后续 append 原样保留
+            if (m.group().chars().anyMatch(Character::isLetter)) {
+                removed += m.end() - m.start();
+                m.appendReplacement(kept, "");
+            }
+        }
+        if (removed == 0) {
+            return text;
+        }
+        m.appendTail(kept);
+        return removed * 2 > text.length() ? "" : kept.toString().strip();
     }
 
     private static ParseContext parseContext() {

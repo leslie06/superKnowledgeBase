@@ -61,6 +61,9 @@ skb:
     keyword-weight: 0.25
     # 查询改写每个问题多一次 DeepSeek 调用（通常 1~2 秒），超过这个时间就放弃改写、用原问题检索
     rewrite-timeout: 10s
+    # 向量召回时 HNSW 索引的搜索范围（hnsw.ef_search）。pgvector 默认 40，只比 candidates 多一点：
+    # 2.6 万个片段的库里，40 时与精确结果的前 30 名可能一个都不重合；200 时完全一致，耗时仍是毫秒级
+    ef-search: 200
   rerank:
     # 交叉编码器精排，需先启动 scripts/rerank_server.py；服务不可用时退回 RRF 排序和上面的 min-score
     enabled: true

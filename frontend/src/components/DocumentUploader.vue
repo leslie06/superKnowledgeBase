@@ -305,8 +305,9 @@ function close() {
     @dragleave.prevent="dragging = false"
     @drop.prevent="onDrop"
   >
-    <input ref="fileInput" type="file" multiple :accept="ACCEPT" hidden @change="onPick" />
-    <input ref="folderInput" type="file" hidden @change="onPick" />
+    <!-- input.click() 产生的点击事件会冒泡到上传区，再次触发选文件，必须阻止 -->
+    <input ref="fileInput" type="file" multiple :accept="ACCEPT" hidden @click.stop @change="onPick" />
+    <input ref="folderInput" type="file" hidden @click.stop @change="onPick" />
     <el-icon class="dropzone-icon"><UploadFilled /></el-icon>
     <div v-if="reading" class="dropzone-title">正在读取文件夹…</div>
     <div v-else-if="job?.uploading" class="dropzone-title">正在上传，完成后可以继续导入</div>

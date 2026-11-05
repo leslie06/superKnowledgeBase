@@ -128,6 +128,25 @@ class ChunkerTests {
     }
 
     @Test
+    void stripsEncodedContent() {
+        String utf16Hex = "0065002000410064006f00620065".repeat(10);
+        // 编码内容占大半：整段丢弃
+        assertThat(DocumentParser.stripEncoded("> /CZE <FEFF" + utf16Hex + "> /DAN <FEFF" + utf16Hex)).isEmpty();
+        // 编码内容只占一小部分：去掉编码串，保留正文
+        String text = "第五章 并发容器。".repeat(40);
+        assertThat(DocumentParser.stripEncoded(text + utf16Hex)).isEqualTo(text);
+        // PDF 设置字典
+        assertThat(DocumentParser.stripEncoded("<< /ASCII85EncodePages false /AllowTransparency false /AutoPositionEPSFiles true"))
+                .isEmpty();
+        // 纯 0/1 的二进制示例、路径、带空格的十六进制转储都保留
+        String bits = "0000000000000001111111000000011111111111".repeat(10);
+        assertThat(DocumentParser.stripEncoded(bits)).isEqualTo(bits);
+        assertThat(DocumentParser.stripEncoded("PATH=/bin:/usr/bin /Applications true")).isEqualTo("PATH=/bin:/usr/bin /Applications true");
+        String dump = "4f 07 16 0f 0f 04 04 09 0d ".repeat(20);
+        assertThat(DocumentParser.stripEncoded(dump)).isEqualTo(dump);
+    }
+
+    @Test
     void normalizeJoinsPdfLineBreaksButKeepsRealSpaces() {
         assertThat(TikaBlockHandler.normalize("员工密码长度\n不少于12位")).isEqualTo("员工密码长度不少于12位");
         assertThat(TikaBlockHandler.normalize("第一章 总则")).isEqualTo("第一章 总则");

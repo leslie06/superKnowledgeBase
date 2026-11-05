@@ -21,9 +21,10 @@ public record SkbProperties(String storageDir, Ingestion ingestion, Chunk chunk,
      * @param rrfK          RRF 融合常数，片段得分 = 1 / (rrfK + 向量排名) + keywordWeight / (rrfK + 关键词排名)
      * @param keywordWeight 关键词一路在 RRF 中的权重；二字组 BM25 对改写、口语化的问题噪声较大，所以低于向量
      * @param rewriteTimeout 查询改写（同步调用 LLM）的最长等待时间，超时后用原问题检索
+     * @param efSearch      向量召回时 HNSW 索引的搜索范围（hnsw.ef_search），越大越接近精确结果；必须明显大于 candidates
      */
     public record Retrieval(int topK, double minScore, int candidates, int rrfK, double keywordWeight,
-                            Duration rewriteTimeout) {
+                            Duration rewriteTimeout, int efSearch) {
     }
 
     /**

@@ -50,6 +50,7 @@ public class Retriever {
     private final int candidates;
     private final int rrfK;
     private final double keywordWeight;
+    private final int efSearch;
     private final boolean rerankEnabled;
     private final int rerankCandidates;
     private final double rerankMinScore;
@@ -66,6 +67,7 @@ public class Retriever {
         this.candidates = properties.retrieval().candidates();
         this.rrfK = properties.retrieval().rrfK();
         this.keywordWeight = properties.retrieval().keywordWeight();
+        this.efSearch = properties.retrieval().efSearch();
         this.rerankEnabled = properties.rerank().enabled();
         this.rerankCandidates = properties.rerank().candidates();
         this.rerankMinScore = properties.rerank().minScore();
@@ -169,6 +171,9 @@ public class Retriever {
     private List<Hit> vectorSearch(long kbId, String vector, int limit) {
         // 带 kb_id 过滤时让 HNSW 继续扫描，避免存在多个知识库时召回数量不足
         jdbc.sql("SET LOCAL hnsw.iterative_scan = relaxed_order").update();
+        // 默认搜索范围 40 太小：库大了以后，HNSW 会困在一团相似的片段（如大量近似的乱码、目录）里，漏掉真正最近的片段。
+        // SET 不支持参数绑定，efSearch 是配置里的整数，直接拼接
+        jdbc.sql("SET LOCAL hnsw.ef_search = " + efSearch).update();
         List<Hit> hits = jdbc.sql("""
                         SELECT c.id AS chunk_id, 1 - (c.embedding <=> CAST(:vector AS vector)) AS score
                         FROM chunk c
