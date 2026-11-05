@@ -10,6 +10,7 @@
     python3 scripts/eval_retrieval.py --kb-id 5 --csv scripts/eval/laws.csv --mode vector   # 只看向量召回
     python3 scripts/eval_retrieval.py --kb-id 5 --csv scripts/eval/laws.csv --rerank off    # 对比不精排的效果
     python3 scripts/eval_retrieval.py --kb-id 5 --csv scripts/eval/laws.csv --rewrite off   # 对比不做查询改写的效果
+    python3 scripts/eval_retrieval.py --kb-id 12 --csv scripts/eval/library.csv --scope off # 忽略 scope 列，在整个知识库里检索
 
 默认与问答一致：先由后端调用 LLM 做查询改写（原问题 + 术语改写）再检索，每题多一次 DeepSeek 调用。
 
@@ -19,6 +20,8 @@
     expected_section 预期章节路径（子串匹配，对应 headingPath）
     expected_text    预期片段中包含的原文（子串匹配，最精确）
     note             备注，不参与计算
+    scope            可选，检索范围：文件夹路径（对应 document.source_path 的前缀，如"电子书/计算机"），| 分隔多个；
+                     为空时在整个知识库里检索，与问答页面选择范围的效果相同
 
 匹配规则：非空的 expected_* 列必须同时满足；每列可用 | 分隔多个可接受的值；
 比较前忽略大小写和所有空白字符。三个 expected_* 列都为空的题视为"无答案题"，
@@ -51,6 +54,7 @@ class Case:
     expected_section: list[str]
     expected_text: list[str]
     note: str
+    scope: list[str] = field(default_factory=list)
 
     @property
     def answerable(self) -> bool:
@@ -124,6 +128,7 @@ def load_cases(path: Path) -> list[Case]:
                 expected_section=split_alternatives(row.get("expected_section")),
                 expected_text=split_alternatives(row.get("expected_text")),
                 note=(row.get("note") or "").strip(),
+                scope=[v.strip().strip("/") for v in (row.get("scope") or "").split("|") if v.strip().strip("/")],
             ))
     return cases
 
@@ -140,9 +145,11 @@ def is_relevant(chunk: dict, min_score: float) -> bool:
 
 
 def search(base_url: str, kb_id: int, query: str, top_k: int, mode: str | None, rerank: str | None,
-           rewrite: str | None) -> list[dict]:
+           rewrite: str | None, folders: list[str]) -> list[dict]:
     url = f"{base_url.rstrip('/')}/api/knowledge-bases/{kb_id}/search"
     payload = {"query": query, "topK": top_k}
+    if folders:
+        payload["folders"] = folders
     if mode:
         payload["mode"] = mode
     if rerank:
@@ -173,10 +180,10 @@ def matches(case: Case, chunk: dict) -> bool:
 
 
 def evaluate(case: Case, base_url: str, kb_id: int, top_k: int, mode: str | None, rerank: str | None,
-             rewrite: str | None) -> Outcome:
+             rewrite: str | None, scope: bool) -> Outcome:
     try:
-        results = search(base_url, kb_id, case.question, top_k, mode, rerank, rewrite)
-    except (RuntimeError, urllib.error.URLError, TimeoutError) as e:
+        results = search(base_url, kb_id, case.question, top_k, mode, rerank, rewrite, case.scope if scope else [])
+    except (RuntimeError, OSError) as e:  # OSError 含 URLError、超时和连接被断开
         return Outcome(case, [], error=str(e))
     outcome = Outcome(case, results)
     if case.answerable:
@@ -211,7 +218,7 @@ def pct(n: int, d: int) -> str:
 
 
 def print_report(outcomes: list[Outcome], top_k: int, retrieval_top_k: int, min_score: float, show: int,
-                 mode: str | None, rerank: str | None, rewrite: str | None):
+                 mode: str | None, rerank: str | None, rewrite: str | None, scope: bool):
     answerable = [o for o in outcomes if o.case.answerable and not o.error]
     no_answer = [o for o in outcomes if not o.case.answerable and not o.error]
     errors = [o for o in outcomes if o.error]
@@ -221,6 +228,9 @@ def print_report(outcomes: list[Outcome], top_k: int, retrieval_top_k: int, min_
     reranked = any(c.get("rerankScore") is not None for o in outcomes for c in o.results)
     print(f"参数：mode={mode or 'hybrid（后端默认）'}，rerank={rerank or '后端默认'}（{'已精排' if reranked else '未精排'}），"
           f"rewrite={rewrite or 'on（后端默认）'}，search topK={top_k}，问答 top-k={retrieval_top_k}")
+    scoped = sum(1 for o in outcomes if o.case.scope)
+    if scoped:
+        print(f"检索范围：{scoped} 题限定了范围，" + ("按 scope 列检索" if scope else "已忽略（--scope off），全部在整个知识库检索"))
     print("=" * 72)
 
     if answerable:
@@ -268,7 +278,7 @@ def print_report(outcomes: list[Outcome], top_k: int, retrieval_top_k: int, min_
                 status = f"未召回（前 {top_k} 条中没有）" if not o.rank else f"排名 {o.rank}，分数 {o.score:.3f}"
             else:
                 status = f"无答案题但有片段被判为相关（最高分 {o.top1_score:.3f}）"
-            print(f"\n  第 {c.line} 行：{c.question}")
+            print(f"\n  第 {c.line} 行：{c.question}" + (f"    范围：{' | '.join(c.scope)}" if c.scope and scope else ""))
             print(f"    结果：{status}" + (f"    备注：{c.note}" if c.note else ""))
             for i, chunk in enumerate(o.results[:show], start=1):
                 mark = "✓" if c.answerable and matches(c, chunk) else " "
@@ -318,6 +328,8 @@ def main():
                         help="召回方式，默认用后端默认的 hybrid；对比单路效果时使用")
     parser.add_argument("--rerank", choices=["on", "off"], help="是否精排，默认按后端配置；只在 hybrid 模式下生效")
     parser.add_argument("--rewrite", choices=["on", "off"], help="是否先做查询改写，默认 on（与问答一致）")
+    parser.add_argument("--scope", choices=["on", "off"], default="on",
+                        help="是否按题集的 scope 列限定检索范围，默认 %(default)s；off 用于对比不限定范围的效果")
     parser.add_argument("--show", type=int, default=3, help="未通过的题展示前几条结果，默认 %(default)s")
     parser.add_argument("--out", type=Path, help="把逐题明细写入 CSV")
     args = parser.parse_args()
@@ -328,7 +340,8 @@ def main():
 
     outcomes = []
     for i, case in enumerate(cases, start=1):
-        outcome = evaluate(case, args.base_url, args.kb_id, args.top_k, args.mode, args.rerank, args.rewrite)
+        outcome = evaluate(case, args.base_url, args.kb_id, args.top_k, args.mode, args.rerank, args.rewrite,
+                           args.scope == "on")
         outcomes.append(outcome)
         if outcome.error:
             flag = "错误"
@@ -339,7 +352,7 @@ def main():
         print(f"[{i}/{len(cases)}] {flag:<12} {case.question}", flush=True)
 
     print_report(outcomes, args.top_k, args.retrieval_top_k, args.min_score, args.show, args.mode, args.rerank,
-                 args.rewrite)
+                 args.rewrite, args.scope == "on")
     if args.out:
         write_details(args.out, outcomes)
         print(f"逐题明细已写入 {args.out}")

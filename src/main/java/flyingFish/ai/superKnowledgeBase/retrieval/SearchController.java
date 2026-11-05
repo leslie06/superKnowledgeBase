@@ -17,7 +17,9 @@ public class SearchController {
      * @param rerank  是否精排，不传时按配置；只在 hybrid 模式下生效
      * @param rewrite 是否先做查询改写（与问答一致，会调用 LLM），不传时为 true
      */
-    public record SearchRequest(String query, Integer topK, String mode, Boolean rerank, Boolean rewrite) {
+    /** folders、documentIds 为检索范围（见 {@link SearchScope}），都不传时在整个知识库里检索 */
+    public record SearchRequest(String query, Integer topK, String mode, Boolean rerank, Boolean rewrite,
+                                List<String> folders, List<Long> documentIds) {
     }
 
     private final Retriever retriever;
@@ -36,7 +38,8 @@ public class SearchController {
         int topK = request.topK() == null ? 10 : Math.clamp(request.topK(), 1, 50);
         String query = Boolean.FALSE.equals(request.rewrite())
                 ? request.query() : queryRewriter.searchQuery(List.of(), request.query());
-        return retriever.search(kbId, query, topK, mode(request.mode()), request.rerank());
+        return retriever.search(kbId, query, SearchScope.of(request.folders(), request.documentIds()), topK,
+                mode(request.mode()), request.rerank());
     }
 
     private static Retriever.Mode mode(String mode) {

@@ -351,7 +351,7 @@ private static final String SYSTEM_PROMPT = """
 1. **向量召回**：HNSW 余弦检索，取最相近的 `candidates`（30）个，擅长换了说法的问题；
 2. **关键词召回**：BM25，同样取 30 个，擅长条款号、编号、型号这类向量不敏感的字面信息；
 3. **融合排序**：精确命中问题中编号的片段排最前，其余按加权 RRF 排序；
-4. **精排**：RRF 前 `rerank.candidates`（20）个片段交给交叉编码器逐对打分，按精排分数重排，精确命中仍排最前；
+4. **精排**：`rerank.candidates`（20）个片段交给交叉编码器逐对打分（关键词召回的前 3 名一定在内，其余按 RRF 顺序补足，见下文「精排」），按精排分数重排，精确命中仍排最前；
 5. **召回过滤**（仅问答）：只保留精排分数 ≥ `rerank.min-score`（0.05）或精确命中的片段，取前 `top-k`（6）个。精排服务不可用时退回 RRF 顺序，改用余弦相似度 ≥ `retrieval.min-score`（0.5）过滤。
 
 为什么要加关键词一路：只有向量召回时，「劳动合同法第三十九条」「民法典第1079条」这类按条款号提问的题，14 道里只有 1 道排第一（`scripts/eval/laws_article.csv`）。bge-m3 把「第三十九条」和「第二十九条」看成几乎一样的东西，而且错误结果的相似度都在 0.5 以上，阈值也拦不住。
@@ -359,12 +359,13 @@ private static final String SYSTEM_PROMPT = """
 **调用链**（`retrieval/Retriever`，下面各小节按这个顺序展开）：
 
 ```text
-retrieve(kbId, query)                          问答入口；调试接口走 search()，不做过滤
+retrieve(kbId, query, scope)                   问答入口；调试接口走 search()，不做过滤
 ├─ rank()
 │  ├─ fuse()
 │  │  ├─ embeddingModel.embed(query)           问题向量，事务外先算好
 │  │  ├─ KeywordAnalyzer.queryTerms(query)     查询词项
 │  │  └─ 只读事务 ─────────────────────────────────────────────
+│  │     ├─ scopeDocuments()                   限定范围时先解析出文档 ID
 │  │     ├─ vectorSearch()                     → 30 个 (chunkId, 余弦相似度)
 │  │     ├─ keywordSearch()                    → 30 个 (chunkId, BM25 分数)
 │  │     ├─ 加权 RRF 合并两路排名
@@ -399,10 +400,32 @@ return hits.stream().sorted(Comparator.comparingDouble(Hit::score).reversed()).t
 - **走索引**：`ORDER BY 距离 LIMIT k` 正好是 HNSW 索引能加速的查询形式，不会对全表做距离计算。
 - **按知识库过滤**：`chunk.kb_id` 是冗余列，过滤时不用先关联 `document`。
 - **`ef_search`**：HNSW 不逐个比较全部向量，而是沿近邻图向更近的方向搜索，`ef_search` 是搜索时保留的候选数，pgvector 默认 40，只比每路召回的 30 个多一点。片段少时够用；导入 2.6 万个片段的电子书库后，「康昱的学校 专业是什么」与精确计算的前 30 名一个都不重合：正确答案（学籍报告，余弦 0.564）没有召回，返回的是一本书里余弦只有 0.43 的乱码片段。这些乱码彼此几乎相同，在图里聚成一团，搜索容易被困在里面。`ef_search` 调到 200 后，测试的几个问题都与精确结果完全一致；即使不走索引做精确计算也只要约 170 毫秒，200 的开销可以忽略。
+- **索引参数 `m = 32, ef_construction = 128`**（V8，pgvector 默认 16、64）：库涨到 5 万个片段后，只调 `ef_search` 不够了。库里有大量彼此几乎相同的片段（激活码文件、表格行、扫描页识别出的碎片），在默认参数建出的图里聚成一团，搜索会困在里面。用真实资料库的 35 道评测题对比索引召回与精确计算的前 30 名：默认参数在 `ef_search` = 200 时平均只重合 83%，6 道题漏掉了真正最相似的片段，「武松打虎」返回的是《黄帝内经》（余弦 0.46，真正最近的《金瓶梅》片段是 0.61），只有一两个片段的小文档（居住证、租房合同）最容易漏；`REINDEX` 重建后没有改善，说明不是索引损坏。`m = 32` 让每个节点连更多邻居，同样 `ef_search` = 200 下 35 道题全部与精确结果一致，索引大小基本不变，建索引从 31 秒变成 80 秒。另外，`ef_search` 调大后 PG 会估算走索引不划算，自己改成并行全表精确计算（5 万片段约 150 毫秒），所以对比召回时要先看 `EXPLAIN` 里有没有 Index Scan。
+- **执行方式由代码决定**：全表精确计算要把每个 4KB 的向量从 TOAST 表里读出来，5 万片段要访问 22 万个数据页（约 1.8GB），内存紧张时超过 1 秒；走 HNSW 只访问 5 千个页，约 5～40 毫秒。PG 的代价估算会选前者，所以 `vectorSearch` 先用 `document.chunk_count` 算出范围内的片段数：超过 5000 个时 `SET LOCAL enable_sort = off`，迫使 PG 走 HNSW；不超过时 `enable_indexscan = off`，按 `document_id` / `kb_id` 索引取出后精确计算（一个文档不到 1 毫秒），避免范围太小时 HNSW 边扫边过滤凑不够数量。查询结束后恢复这两个开关。
+- **`plan_cache_mode = force_custom_plan`**：PgJDBC 同一条语句执行 5 次后改用服务端预编译，PG 随后可能换成不看参数值的通用计划。通用计划里 `CAST(:vector AS vector)` 不能提前算好，变成对每一行重新解析 1024 个数字的文本再整表排序，实测一次 8.4 秒（按实际参数规划只要几十毫秒）。检索事务开头设置这个参数，每次按实际参数重新规划。
 - **`iterative_scan`**：HNSW 先在所有知识库的向量里取出一批候选（`ef_search` 个），再按 `kb_id` 过滤。如果候选大多属于别的知识库，过滤后可能凑不够数。pgvector 0.8 的 `iterative_scan` 在数量不够时会继续沿图向外搜。`relaxed_order` 模式为了速度允许结果顺序有轻微偏差，所以代码最后在 Java 里按 score 重新排序。
 - **只读事务**：`SET LOCAL` 只在当前事务内有效，必须和查询在同一个事务里，所以两路召回和取详情都放在一个只读的 `TransactionTemplate` 里。设置不会泄漏到连接池里的其他请求。
 
+### 限定检索范围
+
+知识库里资料很杂时，可以只在部分文档里检索。范围是 `retrieval/SearchScope`：文件夹列表（对应 `document.source_path` 的前缀，含子文件夹）和文档 ID 列表，取并集，都为空表示整个知识库。问答的范围保存在 `conversation.scope`（JSONB），由问答页输入框上方的选择器修改，追问沿用；调试接口 `/search` 在请求体里传 `folders`、`documentIds`。
+
+```java
+// Retriever.scopeDocuments：先把范围解析成文档 ID
+SELECT id FROM document
+WHERE kb_id = :kbId
+  AND (id = ANY (:documentIds)
+       OR EXISTS (SELECT 1 FROM unnest(CAST(:folders AS text[])) AS f(folder)
+                  WHERE starts_with(source_path, f.folder || '/')))
+```
+
+- **按文件夹保存**：勾选整个文件夹时存的是路径而不是展开后的文档 ID，之后导入到这个文件夹的文档自动在范围内。用 `starts_with` 而不是 `LIKE`，文件夹名里的 `_`、`%`（如 `learning_materials`）不会被当成通配符；拼上 `/` 再比较，「计算机」不会匹配到「计算机网络」。
+- **两路召回都过滤**：向量召回和 BM25 的 SQL 都加上 `c.document_id IN (:documentIds)`，范围解析出 0 个文档时直接返回空结果。BM25 的 N、df、平均长度仍按整个知识库统计，词的稀有程度不随所选范围变化。
+- **不用自己选执行方式**：HNSW 带过滤时，如果范围只占全库很小一部分，`iterative_scan` 要扫很多节点才能凑够数量（上限 `hnsw.max_scan_tuples`，默认 2 万），可能召回不足。实测 PostgreSQL 会按范围大小自己选：在 5 万片段的库里，范围是几千个片段（一个子文件夹）时改走 `idx_chunk_document` 取出后精确计算距离（66～146 毫秒），范围是 4 万个片段（「计算机」整个文件夹）时走 HNSW 过滤（约 130 毫秒），两种情况召回都完整。
+
 ### 关键词召回（BM25）
+
+> 性能：命中超过一成片段（且超过 1000 个）的常见词不参与关键词召回。「租房一个月多钱」里的「一个」在 5 万片段的库中命中 2.1 万个，idf 只有 0.85，对排序几乎没有贡献，却让 tf 统计展开两万多个片段的词表，关键词召回要 2～4 秒；跳过后约 0.1 秒。片段少的库不跳过。
 
 PostgreSQL 自带的全文检索不会切中文，装 zhparser / pg_jieba 又要自己构建数据库镜像。所以分词在 Java 里完成（`KeywordAnalyzer`），切好的词项直接写成 `tsvector` 存进 `chunk.keyword_tsv`，PG 只负责 GIN 索引和打分，不再分词。建索引和查询用同一套规则：
 
@@ -578,6 +601,8 @@ WHERE c.id IN (:ids)
 **为什么要精排**。向量检索是双编码器：问题和片段各自压缩成一个向量再比较余弦，只能反映「话题像不像」。「迟到一次扣多少钱」会以 0.66 的高分命中「考勤处罚」章节，但那一节只写了「依据《员工考勤管理规定》执行」，并没有金额；「转正后辞职要提前多久」和试用期「提前三日」的片段在向量上也几乎分不开。新增的难题集（`handbook_hard.csv`、`laws_hard.csv`）上，正确片段的余弦最低 0.53，无答案题的最高分却有 0.66，阈值怎么调都分不开。
 
 交叉编码器（bge-reranker-v2-m3）把「问题 + 片段」拼成一条输入，让模型逐字对照后直接输出相关性。它比双编码器准得多，但每对都要实时推理，没法对全库做，所以只对 RRF 的前 20 个片段精排：两路召回负责「别漏掉」，精排负责「排准、判断有没有答案」。
+
+**关键词召回前 3 名必进候选**（`Retriever.rerankPool`）。关键词一路在 RRF 中的权重是 0.25，只被它召回的片段，即使排关键词第 1 名也只得 0.25/11 ≈ 0.023，比向量第 30 名（1/40 = 0.025）还低，永远进不了前 20。真实资料库里的「简历里的求职目标是什么？」：简历片段的关键词排第 2，余弦只有 0.545，在 5 万片段里排不进向量前 30，于是从来没被精排看到。现在精排候选先放关键词前 3 名，再按 RRF 顺序补足 20 个，候选总数不变，精排耗时也不变。
 
 **服务**。`scripts/rerank_server.py` 用 sentence-transformers 加载模型，在 Apple Silicon 上走 MPS、fp16 推理（与 fp32 分数相差不到 0.01），默认端口 8081。接口与 HuggingFace text-embeddings-inference 的 `/rerank` 相同，以后可以直接换成 TEI：
 
@@ -890,7 +915,7 @@ private static final String ANSWER_SYSTEM_PROMPT = """
 | `ocr.enabled` / `ocr.command` | true / `scripts/ocr/vision-ocr` | 解析 | 扫描页文字识别；命令不存在时跳过 |
 | `ocr.dpi` | 200 | 解析 | 页面渲染分辨率，越高越慢 |
 | `ocr.min-page-chars` | 20 | 解析 | 文字层少于这么多字的页视为扫描页 |
-| `retrieval.ef-search` | 200 | 向量召回 | HNSW 搜索范围，越大越接近精确结果；要明显大于 `candidates` |
+| `retrieval.ef-search` | 200 | 向量召回 | HNSW 搜索范围，越大越接近精确结果；要明显大于 `candidates`。索引本身用 `m = 32, ef_construction = 128` 建（迁移 V8） |
 | `rerank.enabled` | true | 精排 | 是否精排；服务不可用时自动降级，无需改配置 |
 | `rerank.base-url` | `http://localhost:8081` | 精排 | Rerank 服务地址 |
 | `rerank.candidates` | 20 | 精排 | 取 RRF 前多少个片段精排，延迟与它成正比 |
@@ -912,4 +937,4 @@ private static final String ANSWER_SYSTEM_PROMPT = """
 - **向量维度写死**：`vector(1024)` 和 bge-m3 绑定，更换 embedding 模型要改表结构并重新处理全部文档。
 - **引用由模型自觉标注**：`[n]` 是否准确依赖提示词约束，线上没有校验模型引用的编号是否真的支持对应的句子；目前只在答案级评测中离线检查，116 个回答没有发现引用错误。
 
-**后续演进**（摘自 README）：P2 已完成混合召回、Reranker 精排、检索评测、答案级评测、按组切分（条文、列举项不切开）和口语化查询改写；P3 已完成扫描件 OCR（苹果 Vision），复杂版面与公式（MinerU / Docling）留待以后，改动集中在 `DocumentParser`。
+**后续演进**（摘自 README）：P2 已完成混合召回、Reranker 精排、检索评测、答案级评测、按组切分（条文、列举项不切开）和口语化查询改写；P3 已完成扫描件 OCR（苹果 Vision）和按文件夹限定检索范围，复杂版面与公式（MinerU / Docling）留待以后，改动集中在 `DocumentParser`。

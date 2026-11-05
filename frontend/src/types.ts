@@ -75,10 +75,18 @@ export interface Citation {
   score: number
 }
 
+/** 检索范围：所选文件夹下的文档与单独选中的文档取并集，两者都为空表示整个知识库 */
+export interface SearchScope {
+  /** 文件夹路径，对应文档 sourcePath 的前缀，包含子文件夹 */
+  folders: string[]
+  documentIds: number[]
+}
+
 export interface Conversation {
   id: number
   kbId: number
   title: string
+  scope: SearchScope
   createdAt: string
   updatedAt: string
 }

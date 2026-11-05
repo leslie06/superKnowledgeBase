@@ -4,10 +4,11 @@ import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { ChatLineSquare, Delete, EditPen, MoreFilled, Plus, Promotion, VideoPause } from '@element-plus/icons-vue'
 import CitationDrawer from '../components/CitationDrawer.vue'
+import ScopeSelector from '../components/ScopeSelector.vue'
 import { api, streamChat } from '../api'
 import { renderMarkdown } from '../markdown'
 import { store } from '../store'
-import type { ChatMessage, Citation, Conversation } from '../types'
+import type { ChatMessage, Citation, Conversation, SearchScope } from '../types'
 
 const props = defineProps<{ kbId: string; convId?: string }>()
 const router = useRouter()
@@ -22,6 +23,8 @@ const question = ref('')
 const streaming = ref(false)
 const messagesEl = ref<HTMLElement>()
 const activeCitation = ref<Citation | null>(null)
+/** 当前会话的检索范围；还没有会话时，新建会话会带上它 */
+const scope = ref<SearchScope>({ folders: [], documentIds: [] })
 let abortController: AbortController | null = null
 /** 发送首条消息时新建会话并跳转路由，这次路由变化不需要重新加载消息 */
 let skipLoadFor: number | null = null
@@ -30,6 +33,26 @@ const EXAMPLES = ['这些资料主要讲了什么？', '年假怎么计算？', 
 
 async function loadConversations() {
   conversations.value = await api.listConversations(kbId.value)
+  syncScope()
+}
+
+/** 打开已有会话时显示它的范围；新对话沿用当前选择 */
+function syncScope() {
+  const conv = conversations.value.find((c) => c.id === convId.value)
+  if (conv) scope.value = conv.scope
+}
+
+async function changeScope(value: SearchScope) {
+  const previous = scope.value
+  scope.value = value
+  if (convId.value === null) return
+  try {
+    const conv = await api.updateConversationScope(convId.value, value)
+    conversations.value = conversations.value.map((c) => (c.id === conv.id ? conv : c))
+  } catch (e) {
+    scope.value = previous
+    ElMessage.error((e as Error).message)
+  }
 }
 
 async function loadMessages() {
@@ -56,7 +79,10 @@ onMounted(() => {
   loadMessages()
 })
 onBeforeUnmount(() => abortController?.abort())
-watch(convId, loadMessages)
+watch(convId, () => {
+  loadMessages()
+  syncScope()
+})
 
 function newConversation() {
   abortController?.abort()
@@ -72,7 +98,7 @@ async function send(text = question.value) {
   let id = convId.value
   if (id === null) {
     try {
-      id = (await api.createConversation(kbId.value)).id
+      id = (await api.createConversation(kbId.value, scope.value)).id
     } catch (e) {
       ElMessage.error((e as Error).message)
       streaming.value = false
@@ -223,6 +249,9 @@ async function onConversationCommand(command: string, conv: Conversation) {
         </div>
       </div>
 
+      <div class="composer-bar">
+        <ScopeSelector :kb-id="kbId" :model-value="scope" @update:model-value="changeScope" />
+      </div>
       <div class="composer">
         <el-input
           v-model="question"

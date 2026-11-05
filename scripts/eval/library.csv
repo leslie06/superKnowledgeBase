@@ -1,0 +1,29 @@
+question,expected_file,expected_section,expected_text,note,scope
+InnoDB 的插入缓冲是干什么用的？,MySQL技术内幕|高性能MySQL,,Insert Buffer|插入缓冲,概念：两本 MySQL 书都可,电子书/计算机/数据库
+Redis 的跳跃表节点是怎么定义的？,Redis设计与实现,,zskiplistNode,源码结构,电子书/计算机/数据库
+volatile 是怎么保证可见性的？,Java并发编程的艺术|Java并发编程实战|深入理解Java虚拟机,,volatile,多本并发书都可,电子书/计算机
+为什么不建议用 Executors 创建线程池？,阿里巴巴Java开发规范,,线程池不允许使用Executors去创建,规范条目,电子书/计算机
+Kafka 里什么样的副本算同步副本？,Kafka权威指南,,同步的副本|同步副本,概念,电子书/计算机/kafka
+TCP 建立连接为什么要三次握手？,计算机网络-自顶向下方法|Computer Networking,,三次握手|three-way handshake,中英两版都可,电子书/计算机/网络
+决策树用信息增益怎么选划分属性？,机器学习_周志华,,信息增益,扫描书 OCR,电子书/计算机/大模型
+Linux 怎么修改文件权限？,vbird-linux,,chmod,命令,电子书/计算机/操作系统
+Nginx 为什么采用事件驱动架构？,深入理解Nginx,,事件驱动,扫描书 OCR,电子书/计算机/nginx
+延迟初始化的双重检查模式怎么写？,Effective,,双重检查|double check,三个版本的 Effective Java 都可,电子书/计算机
+快速排序的时间复杂度是多少？,hello-algo|算法|数据结构与算法分析,,快速排序,多本算法书都可,电子书/计算机
+康威定律讲的是什么？,微服务设计,,康威定律,扫描书 OCR,电子书/计算机/微服务
+程序员修炼之道里说的破窗是什么意思？,程序员修炼之道,,破窗,书名限定,电子书/计算机/程序员
+ZooKeeper 默认的客户端端口是多少？,zookeeper,,2181,配置项,电子书/计算机/learning_materials
+微信小程序的 app.json 是做什么的？,微信小程序入门指南,,app.json,文件名,电子书/计算机/learning_materials
+H100 的 Transformer 引擎有什么作用？,nvidia-h100,,Transformer引擎|Transformer Engine,中英两版都可,电子书/AI
+DeepSeek 提示词有哪些常用框架？,DeepSeek：从入门到精通,,提示词,PPT 转 PDF,电子书/AI
+AI Agent 里的 ReAct 是什么？,AI-Agents-in-Depth,,ReAct,术语,电子书/AI
+黄帝内经里女子的生长发育是怎么分阶段的？,内经,,女子七岁,三个版本都可,电子书/中医
+林黛玉第一次进贾府时是什么心态？,红楼梦,,步步留心,原书和副本都可,电子书/名著
+武松在景阳冈打虎是怎么回事？,金瓶梅,,景阳冈|景陽岡,三个版本都可,电子书/小说
+2024 年第一季度大模型有哪些新进展？,2024年第1季度中国大模型季度监测报告,,,只要求文件,电子书/计算机/大模型
+能力网关里「任务执行」能力的 REST 地址是什么？,能力REST地址,,M_ABILITY_UNITPRO_102000008,表格行,电子书/网关-NEW
+JetBrains 软件怎么激活？,操作教程,,install.sh,单页 PDF,电子书/报表
+司库奇尤单抗治疗成人银屑病的推荐剂量是多少？,YPSN202200140,,推荐剂量为每次300mg,放在根目录的 PPT,
+VoicePilot 从线索到付费的综合转化率是多少？,VoicePilot,,7.5%,PPT 数值,电子书/计算机
+公司的年终奖怎么发？,,,,无答案,
+iPhone 16 的电池容量是多少？,,,,无答案,

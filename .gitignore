@@ -41,3 +41,6 @@ scripts/ocr/vision-ocr
 
 ### macOS ###
 .DS_Store
+
+# 含个人信息的评测题集（证件、简历、合同），只在本机使用
+scripts/eval/private/

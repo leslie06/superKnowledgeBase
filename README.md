@@ -104,6 +104,7 @@ pkill -f rerank_server.py           # 停止
 
 - 启动用的 `python3` 必须是装了 sentence-transformers 的那个环境。先运行 `which python3` 和 `python3 -c "import sentence_transformers"` 确认；如果用 conda / venv，先激活对应环境。
 - 设备自动选择：Apple 芯片用 MPS（fp16），有 NVIDIA 显卡用 CUDA，否则用 CPU。日志里的 `device` 显示实际使用的设备，CPU 推理会慢很多。
+- **内存紧张时精排会变得很慢**：正常精排 20 个片段约 2 秒。交换区接近用满时模型会被换出到磁盘，每次精排都要先读回来，一次 15 秒以上，超过 `skb.rerank.timeout`（15 秒）后退回不精排的排序，整次问答可能拖到 30～40 秒。用 `sysctl vm.swapusage` 查看交换区，关掉暂时不用的程序和 docker 容器；Docker Desktop 停掉容器后不会把内存还给系统，要在 Settings → Resources 调小 Memory（只跑本项目的 PostgreSQL 时 3GB 足够）并重启 Docker，然后重启 Rerank 服务，让模型重新完整加载到内存。
 - 接口与 HuggingFace text-embeddings-inference（TEI）的 `/rerank` 相同。部署到有 NVIDIA 显卡的 Linux 服务器时，可以直接用 TEI 镜像替代这个脚本，只需修改 `skb.rerank.base-url`。
 
 ### 扫描版 PDF 的文字识别（OCR）
@@ -143,6 +144,15 @@ python3 scripts/import_dir.py --kb-id 7 --dir ~/资料 --out import.csv    # 上
 - 改进解析后，加 `--retry-failed` 重新处理之前失败的文件。
 - 两种方式都会记录文件在所选文件夹中的相对路径（如「资料/人事制度/考勤管理办法.docx」），文件列表里显示在文件名下方，筛选框也可以按目录名筛。路径会代替文件名拼进向量文本，资料按文件夹分类时，「人事制度里的考勤规定」这类问题能靠目录名命中。单独上传的文件不记录路径。
 
+### 限定检索范围
+
+知识库里资料很杂时（技术书、小说、个人证件放在一起），别的书里措辞相近的片段会挤掉真正的答案。问答页输入框上方的「检索范围」可以按文件夹树勾选文件夹或单个文件，只在所选范围内检索：
+
+- 范围保存在对话上，追问沿用同一范围，随时可以修改；新对话沿用当前的选择。
+- 勾选整个文件夹时按文件夹保存，之后导入到这个文件夹的文件也在范围内；单独上传的文件（没有文件夹）可以单独勾选。
+- 范围内找不到相关内容时，回答会提示扩大范围。
+- 检索调试接口和评测脚本同样支持：`/search` 请求体加 `folders`、`documentIds`，题集 CSV 加 `scope` 列（`--scope off` 忽略它，用于对比）。
+
 ## 处理逻辑要点
 
 - **解析**（`ingestion/DocumentParser`）：Word 按标题样式建立章节路径，没有样式时按"第X章 / 一、/ 2.1"等编号识别；PDF 记录页码；PPT 按幻灯片切分，首行作为标题；Excel 每行转成"列名: 值"，保证切块后每行仍带表头语义。扫描版 PDF 中没有文字层的页用苹果 Vision 识别（见上文）。
@@ -168,11 +178,12 @@ python3 scripts/import_dir.py --kb-id 7 --dir ~/资料 --out import.csv    # 上
 | POST | `/api/knowledge-bases/{id}/documents` | 上传（multipart，字段名 `files`，可多个） |
 | GET | `/api/documents/{id}/chunks` | 查看切块结果 |
 | POST | `/api/documents/{id}/reindex` | 重新处理 |
-| POST | `/api/knowledge-bases/{id}/search` | 检索调试（不调用 LLM） |
+| POST | `/api/knowledge-bases/{id}/search` | 检索调试（不调用 LLM），可用 `folders`、`documentIds` 限定范围 |
+| PUT | `/api/conversations/{id}/scope` | 修改对话的检索范围（`{"folders": [...], "documentIds": [...]}`，都为空表示整个知识库） |
 | POST | `/api/conversations/{id}/chat` | 问答，SSE 事件：`citations` → `delta`* → `done` / `error` |
 
 ## 后续路线
 
 - **P2 效果**：~~BM25 关键词检索 + 向量的混合召回（RRF 融合）~~、~~评估测试集~~、~~Reranker 精排~~、~~答案级评测~~、~~按组切分（条文、列举项不切开）~~、~~口语化查询改写~~（已完成）。
-- **P3 规模**：~~扫描件 OCR~~（已完成，苹果 Vision）、复杂版面与公式（MinerU / Docling）、目录监听自动同步、标签过滤。
+- **P3 规模**：~~扫描件 OCR~~（已完成，苹果 Vision）、复杂版面与公式（MinerU / Docling）、目录监听自动同步、~~按文件夹限定检索范围~~（已完成）。
 - **P4 进阶**：Agentic RAG、跨文档关系问答、图表理解。

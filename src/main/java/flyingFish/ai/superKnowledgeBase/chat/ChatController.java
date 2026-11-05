@@ -1,5 +1,6 @@
 package flyingFish.ai.superKnowledgeBase.chat;
 
+import flyingFish.ai.superKnowledgeBase.retrieval.SearchScope;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.codec.ServerSentEvent;
@@ -12,7 +13,8 @@ import java.util.List;
 @RequestMapping("/api")
 public class ChatController {
 
-    public record ConversationRequest(String title) {
+    /** @param scope 新建会话时的检索范围，不传表示整个知识库 */
+    public record ConversationRequest(String title, SearchScope scope) {
     }
 
     public record ChatRequest(String question) {
@@ -32,12 +34,18 @@ public class ChatController {
     @PostMapping("/knowledge-bases/{kbId}/conversations")
     @ResponseStatus(HttpStatus.CREATED)
     public Conversation create(@PathVariable long kbId, @RequestBody(required = false) ConversationRequest request) {
-        return service.create(kbId, request == null ? null : request.title());
+        return service.create(kbId, request == null ? null : request.title(),
+                request == null || request.scope() == null ? SearchScope.ALL : request.scope());
     }
 
     @PutMapping("/conversations/{id}")
     public Conversation rename(@PathVariable long id, @RequestBody ConversationRequest request) {
         return service.rename(id, request.title());
+    }
+
+    @PutMapping("/conversations/{id}/scope")
+    public Conversation updateScope(@PathVariable long id, @RequestBody(required = false) SearchScope scope) {
+        return service.updateScope(id, scope == null ? SearchScope.ALL : scope);
     }
 
     @DeleteMapping("/conversations/{id}")

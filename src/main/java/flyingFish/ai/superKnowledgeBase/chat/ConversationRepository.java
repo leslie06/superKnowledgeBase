@@ -1,5 +1,6 @@
 package flyingFish.ai.superKnowledgeBase.chat;
 
+import flyingFish.ai.superKnowledgeBase.retrieval.SearchScope;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Repository;
 import tools.jackson.core.type.TypeReference;
@@ -27,16 +28,20 @@ public class ConversationRepository {
 
     public List<Conversation> findByKb(long kbId) {
         return jdbc.sql("SELECT * FROM conversation WHERE kb_id = ? ORDER BY updated_at DESC, id DESC")
-                .param(kbId).query(Conversation.class).list();
+                .param(kbId).query(this::mapConversation).list();
     }
 
     public Optional<Conversation> findById(long id) {
-        return jdbc.sql("SELECT * FROM conversation WHERE id = ?").param(id).query(Conversation.class).optional();
+        return jdbc.sql("SELECT * FROM conversation WHERE id = ?").param(id).query(this::mapConversation).optional();
     }
 
-    public long insert(long kbId, String title) {
-        return jdbc.sql("INSERT INTO conversation (kb_id, title) VALUES (?, ?) RETURNING id")
-                .params(kbId, title).query(Long.class).single();
+    public long insert(long kbId, String title, SearchScope scope) {
+        return jdbc.sql("INSERT INTO conversation (kb_id, title, scope) VALUES (?, ?, CAST(? AS jsonb)) RETURNING id")
+                .params(kbId, title, scopeJson(scope)).query(Long.class).single();
+    }
+
+    public void updateScope(long id, SearchScope scope) {
+        jdbc.sql("UPDATE conversation SET scope = CAST(? AS jsonb) WHERE id = ?").params(scopeJson(scope), id).update();
     }
 
     public void updateTitle(long id, String title) {
@@ -71,6 +76,18 @@ public class ConversationRepository {
                 .query(Long.class).single();
         jdbc.sql("UPDATE conversation SET updated_at = now() WHERE id = ?").param(conversationId).update();
         return id;
+    }
+
+    private Conversation mapConversation(ResultSet rs, int rowNum) throws SQLException {
+        String scope = rs.getString("scope");
+        return new Conversation(rs.getLong("id"), rs.getLong("kb_id"), rs.getString("title"),
+                scope == null ? SearchScope.ALL : jsonMapper.readValue(scope, SearchScope.class),
+                rs.getObject("created_at", OffsetDateTime.class), rs.getObject("updated_at", OffsetDateTime.class));
+    }
+
+    /** 不限范围时存 NULL */
+    private String scopeJson(SearchScope scope) {
+        return scope == null || scope.isAll() ? null : toJson(scope);
     }
 
     private ChatMessage mapMessage(ResultSet rs, int rowNum) throws SQLException {

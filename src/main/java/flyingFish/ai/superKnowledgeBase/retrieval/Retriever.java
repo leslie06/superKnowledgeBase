@@ -40,6 +40,24 @@ public class Retriever {
     private static final Logger log = LoggerFactory.getLogger(Retriever.class);
     private static final double BM25_K1 = 1.2;
     private static final double BM25_B = 0.75;
+    /**
+     * 命中超过这个比例片段的查询词不参与关键词召回。这类词（"一个""我们"）idf 很低，对排序几乎没有贡献，
+     * 却会让 tf 统计展开大量片段的词表：5 万片段的库里，"租房一个月多钱"中的"一个"命中 2.1 万个片段，关键词召回因此要 2 秒以上。
+     */
+    private static final double MAX_DF_RATIO = 0.1;
+    /** 片段少的库不跳过常见词：命中数低于这个值时展开的代价可以忽略，按比例跳过反而会丢掉小库里的有效词 */
+    private static final int MIN_SKIPPED_DF = 1000;
+    /**
+     * 范围内片段不超过这个数时精确计算距离，否则走 HNSW。精确计算要把每个向量（4KB，存在 TOAST 表里）都读一遍，
+     * 5000 个约 100ms；而范围占全库比例很小时，HNSW 边扫描边过滤可能凑不够数量。
+     */
+    private static final int EXACT_SEARCH_MAX_CHUNKS = 5000;
+    /**
+     * 关键词召回的前几名一定进入精排候选。关键词一路在 RRF 中权重低（0.25），只被它召回的片段（关键词第 1 名得 0.25/11）
+     * 排在所有向量结果（第 30 名得 1/40）之后，进不了精排：如"简历里的求职目标"，简历片段关键词排第 2，
+     * 向量相似度却排不进全库前 30。精排候选总数不变，由它们挤掉 RRF 排名最靠后的几个。
+     */
+    private static final int KEYWORD_RERANK_GUARANTEE = 3;
 
     private final JdbcClient jdbc;
     private final EmbeddingModel embeddingModel;
@@ -74,8 +92,8 @@ public class Retriever {
     }
 
     /** 问答用：混合检索后去掉不相关的片段，取前 top-k 个。 */
-    public List<RetrievedChunk> retrieve(long kbId, String query) {
-        return rank(kbId, query, Mode.HYBRID, candidates, rerankEnabled).stream()
+    public List<RetrievedChunk> retrieve(long kbId, String query, SearchScope scope) {
+        return rank(kbId, query, scope, Mode.HYBRID, candidates, rerankEnabled).stream()
                 .filter(RetrievedChunk::relevant)
                 .limit(defaultTopK)
                 .toList();
@@ -86,23 +104,40 @@ public class Retriever {
      *
      * @param rerank 是否精排，null 时按配置；只在 hybrid 模式下生效，单路模式用于对比召回效果
      */
-    public List<RetrievedChunk> search(long kbId, String query, int topK, Mode mode, Boolean rerank) {
+    public List<RetrievedChunk> search(long kbId, String query, SearchScope scope, int topK, Mode mode, Boolean rerank) {
         boolean useRerank = mode == Mode.HYBRID && (rerank == null ? rerankEnabled : rerank);
-        return rank(kbId, query, mode, Math.max(candidates, topK), useRerank).stream().limit(topK).toList();
+        return rank(kbId, query, scope, mode, Math.max(candidates, topK), useRerank).stream().limit(topK).toList();
     }
 
-    private List<RetrievedChunk> rank(long kbId, String query, Mode mode, int poolSize, boolean rerank) {
-        List<RetrievedChunk> fused = fuse(kbId, query, mode, poolSize);
+    private List<RetrievedChunk> rank(long kbId, String query, SearchScope scope, Mode mode, int poolSize,
+                                      boolean rerank) {
+        long start = System.nanoTime();
+        List<RetrievedChunk> fused = fuse(kbId, query, scope, mode, poolSize);
+        long fusedAt = System.nanoTime();
         // 精排是一次 HTTP 调用，放在数据库事务之外，避免长时间占用连接
-        return rerank && !fused.isEmpty() ? rerank(query, fused) : fused;
+        List<RetrievedChunk> result = rerank && !fused.isEmpty() ? rerank(query, fused) : fused;
+        long end = System.nanoTime();
+        log.info("检索耗时 {} ms：召回 {} ms，精排 {} ms，{} 个片段", (end - start) / 1_000_000,
+                (fusedAt - start) / 1_000_000, (end - fusedAt) / 1_000_000, result.size());
+        return result;
     }
 
-    private List<RetrievedChunk> fuse(long kbId, String query, Mode mode, int poolSize) {
+    private List<RetrievedChunk> fuse(long kbId, String query, SearchScope scope, Mode mode, int poolSize) {
         String vector = PgVectors.toLiteral(embeddingModel.embed(query));
         List<String> terms = KeywordAnalyzer.queryTerms(query);
         return readOnlyTx.execute(status -> {
-            List<Hit> vectorHits = mode == Mode.KEYWORD ? List.of() : vectorSearch(kbId, vector, poolSize);
-            List<Hit> keywordHits = mode == Mode.VECTOR || terms.isEmpty() ? List.of() : keywordSearch(kbId, terms, poolSize);
+            // JDBC 同一条语句执行 5 次后改用服务端预编译，PG 随后可能换成不看参数值的通用计划：
+            // 向量参数 CAST(? AS vector) 无法提前算好，变成对每一行重新解析 1024 个数字再整表排序（5 万片段要 8 秒）。
+            // 检索语句都很快，每次按实际参数重新规划的开销可以忽略
+            jdbc.sql("SET LOCAL plan_cache_mode = force_custom_plan").update();
+            // null 表示不限范围
+            List<Long> documentIds = scope.isAll() ? null : scopeDocuments(kbId, scope);
+            if (documentIds != null && documentIds.isEmpty()) {
+                return List.of();
+            }
+            List<Hit> vectorHits = mode == Mode.KEYWORD ? List.of() : vectorSearch(kbId, documentIds, vector, poolSize);
+            List<Hit> keywordHits = mode == Mode.VECTOR || terms.isEmpty()
+                    ? List.of() : keywordSearch(kbId, documentIds, terms, poolSize);
 
             Map<Long, Integer> vectorRanks = ranks(vectorHits);
             Map<Long, Integer> keywordRanks = ranks(keywordHits);
@@ -136,7 +171,7 @@ public class Retriever {
      * 服务不可用时退回 RRF 排序和余弦阈值，问答不受影响。
      */
     private List<RetrievedChunk> rerank(String query, List<RetrievedChunk> fused) {
-        List<RetrievedChunk> head = fused.subList(0, Math.min(rerankCandidates, fused.size()));
+        List<RetrievedChunk> head = rerankPool(fused, rerankCandidates, KEYWORD_RERANK_GUARANTEE);
         double[] scores;
         try {
             scores = rerankClient.score(query, head.stream().map(Retriever::rerankText).toList());
@@ -151,10 +186,28 @@ public class Retriever {
         }
         reranked.sort(Comparator.comparing(RetrievedChunk::exactMatch).reversed()
                 .thenComparing(Comparator.comparingDouble(RetrievedChunk::rerankScore).reversed()));
-        for (RetrievedChunk c : fused.subList(head.size(), fused.size())) {
-            reranked.add(withRerank(c, null, c.exactMatch()));
+        for (RetrievedChunk c : fused) {
+            if (!head.contains(c)) {
+                reranked.add(withRerank(c, null, c.exactMatch()));
+            }
         }
         return reranked;
+    }
+
+    /** 精排候选：关键词召回前 keywordTop 名，再按 RRF 顺序补足 size 个 */
+    static List<RetrievedChunk> rerankPool(List<RetrievedChunk> fused, int size, int keywordTop) {
+        List<RetrievedChunk> pool = new ArrayList<>(fused.stream()
+                .filter(c -> c.keywordRank() != null && c.keywordRank() <= keywordTop)
+                .toList());
+        for (RetrievedChunk c : fused) {
+            if (pool.size() >= size) {
+                break;
+            }
+            if (!pool.contains(c)) {
+                pool.add(c);
+            }
+        }
+        return pool;
     }
 
     /** 章节路径也交给精排模型，"考勤处罚""试用期终止"这类标题本身就是重要的判断依据。 */
@@ -168,24 +221,66 @@ public class Retriever {
                 c.exactMatch(), relevant);
     }
 
-    private List<Hit> vectorSearch(long kbId, String vector, int limit) {
+    /** 范围内的文档：source_path 以所选文件夹开头，或单独选中的文档；用 starts_with 而不是 LIKE，文件夹名里的 _ % 不会被当成通配符 */
+    private List<Long> scopeDocuments(long kbId, SearchScope scope) {
+        return jdbc.sql("""
+                        SELECT id FROM document
+                        WHERE kb_id = :kbId
+                          AND (id = ANY (:documentIds)
+                               OR EXISTS (SELECT 1 FROM unnest(CAST(:folders AS text[])) AS f(folder)
+                                          WHERE starts_with(source_path, f.folder || '/')))
+                        """)
+                .param("kbId", kbId)
+                .param("documentIds", scope.documentIds().toArray(Long[]::new))
+                .param("folders", scope.folders().toArray(String[]::new))
+                .query(Long.class)
+                .list();
+    }
+
+    /** 范围条件；documentIds 为 null 时不限范围 */
+    private static String scopeCondition(List<Long> documentIds) {
+        return documentIds == null ? "" : "AND c.document_id IN (:documentIds)";
+    }
+
+    private static JdbcClient.StatementSpec withScope(JdbcClient.StatementSpec spec, List<Long> documentIds) {
+        return documentIds == null ? spec : spec.param("documentIds", documentIds);
+    }
+
+    /**
+     * 执行方式不交给 PG 的代价估算：m = 32 的索引被估得偏贵，5 万片段时 PG 会改成全表精确计算，
+     * 要读 22 万个数据页（约 1.8GB），内存紧张时要 1 秒以上；同样的查询走 HNSW 只读 5 千个页，约 40ms。
+     * 所以范围内片段多时禁止排序，迫使 PG 走 HNSW；片段少时禁止索引扫描，精确计算。
+     */
+    private List<Hit> vectorSearch(long kbId, List<Long> documentIds, String vector, int limit) {
+        int chunks = withScope(jdbc.sql("""
+                        SELECT coalesce(sum(chunk_count), 0) FROM document d
+                        WHERE d.kb_id = :kbId %s
+                        """.formatted(documentIds == null ? "" : "AND d.id IN (:documentIds)")), documentIds)
+                .param("kbId", kbId)
+                .query(Integer.class)
+                .single();
+        jdbc.sql(chunks > EXACT_SEARCH_MAX_CHUNKS ? "SET LOCAL enable_sort = off" : "SET LOCAL enable_indexscan = off")
+                .update();
         // 带 kb_id 过滤时让 HNSW 继续扫描，避免存在多个知识库时召回数量不足
         jdbc.sql("SET LOCAL hnsw.iterative_scan = relaxed_order").update();
         // 默认搜索范围 40 太小：库大了以后，HNSW 会困在一团相似的片段（如大量近似的乱码、目录）里，漏掉真正最近的片段。
         // SET 不支持参数绑定，efSearch 是配置里的整数，直接拼接
         jdbc.sql("SET LOCAL hnsw.ef_search = " + efSearch).update();
-        List<Hit> hits = jdbc.sql("""
+        List<Hit> hits = withScope(jdbc.sql("""
                         SELECT c.id AS chunk_id, 1 - (c.embedding <=> CAST(:vector AS vector)) AS score
                         FROM chunk c
-                        WHERE c.kb_id = :kbId
+                        WHERE c.kb_id = :kbId %s
                         ORDER BY c.embedding <=> CAST(:vector AS vector)
                         LIMIT :limit
-                        """)
+                        """.formatted(scopeCondition(documentIds))), documentIds)
                 .param("vector", vector)
                 .param("kbId", kbId)
                 .param("limit", limit)
                 .query(Hit.class)
                 .list();
+        // 只针对向量查询，恢复后再执行关键词召回和取片段详情
+        jdbc.sql("SET LOCAL enable_sort = on").update();
+        jdbc.sql("SET LOCAL enable_indexscan = on").update();
         // relaxed_order 下结果可能略微乱序
         return hits.stream().sorted(Comparator.comparingDouble(Hit::score).reversed()).toList();
     }
@@ -193,10 +288,11 @@ public class Retriever {
     /**
      * BM25：idf = ln(1 + (N - df + 0.5) / (df + 0.5))，
      * 得分 = Σ idf · tf · (k1 + 1) / (tf + k1 · (1 - b + b · 文档长度 / 平均文档长度))。
-     * N、df、平均长度都按当前知识库实时统计；tf 取 tsvector 中该词项的位置个数。
+     * N、df、平均长度都按当前知识库实时统计（限定范围时也按整个知识库统计，词的稀有程度不随范围变化）；
+     * tf 取 tsvector 中该词项的位置个数。df 超过 {@link #MAX_DF_RATIO} 的常见词先剔除，再用剩下的词匹配片段。
      */
-    private List<Hit> keywordSearch(long kbId, List<String> terms, int limit) {
-        return jdbc.sql("""
+    private List<Hit> keywordSearch(long kbId, List<Long> documentIds, List<String> terms, int limit) {
+        return withScope(jdbc.sql("""
                         WITH stats AS (
                             SELECT count(*) AS n, greatest(avg(keyword_token_count), 1) AS avgdl
                             FROM chunk WHERE kb_id = :kbId
@@ -208,12 +304,13 @@ public class Retriever {
                                 SELECT count(*) AS df FROM chunk c
                                 WHERE c.kb_id = :kbId AND c.keyword_tsv @@ CAST(quote_literal(q.term) AS tsquery)
                             ) d
-                            WHERE d.df > 0
+                            WHERE d.df > 0 AND d.df <= greatest(s.n * :maxDfRatio, :minSkippedDf)
                         ), tf AS (
                             SELECT c.id, c.keyword_token_count AS dl, u.lexeme, coalesce(cardinality(u.positions), 1) AS tf
                             FROM chunk c CROSS JOIN LATERAL unnest(c.keyword_tsv) AS u
-                            WHERE c.kb_id = :kbId AND c.keyword_tsv @@ CAST(:tsquery AS tsquery)
-                              AND u.lexeme = ANY (string_to_array(:terms, ' '))
+                            WHERE c.kb_id = :kbId %s
+                              AND c.keyword_tsv @@ (SELECT CAST(string_agg(quote_literal(term), ' | ') AS tsquery) FROM idf)
+                              AND u.lexeme IN (SELECT term FROM idf)
                         )
                         SELECT tf.id AS chunk_id,
                                sum(i.idf * tf.tf * (:k1 + 1) / (tf.tf + :k1 * (1 - :b + :b * tf.dl / s.avgdl))) AS score
@@ -221,10 +318,11 @@ public class Retriever {
                         GROUP BY tf.id
                         ORDER BY score DESC
                         LIMIT :limit
-                        """)
+                        """.formatted(scopeCondition(documentIds))), documentIds)
                 .param("kbId", kbId)
                 .param("terms", String.join(" ", terms))
-                .param("tsquery", KeywordAnalyzer.toTsquery(terms))
+                .param("maxDfRatio", MAX_DF_RATIO)
+                .param("minSkippedDf", MIN_SKIPPED_DF)
                 .param("k1", BM25_K1)
                 .param("b", BM25_B)
                 .param("limit", limit)

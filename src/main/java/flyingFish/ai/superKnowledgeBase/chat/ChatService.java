@@ -6,6 +6,7 @@ import flyingFish.ai.superKnowledgeBase.kb.KnowledgeBaseService;
 import flyingFish.ai.superKnowledgeBase.retrieval.QueryRewriter;
 import flyingFish.ai.superKnowledgeBase.retrieval.RetrievedChunk;
 import flyingFish.ai.superKnowledgeBase.retrieval.Retriever;
+import flyingFish.ai.superKnowledgeBase.retrieval.SearchScope;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.client.ChatClient;
@@ -26,6 +27,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * RAG 问答：查询改写（{@link QueryRewriter}） → 检索 → 组装带编号的参考资料 → LLM 流式生成（要求标注 [n] 引用）。
@@ -39,6 +41,8 @@ public class ChatService {
 
     private static final String NOT_FOUND_ANSWER =
             "知识库中没有找到与这个问题相关的内容。可以换个问法试试，或者确认相关文件已经上传并处理完成。";
+    private static final String NOT_FOUND_IN_SCOPE_ANSWER =
+            "在当前选择的检索范围内没有找到与这个问题相关的内容。可以换个问法，或者在输入框上方扩大检索范围后再试。";
     /** 与 application.yaml 中的占位默认值一致：未配置 Key 时应用仍能启动，只是问答不可用 */
     private static final String NO_API_KEY = "not-configured";
     private static final String DEFAULT_TITLE = "新对话";
@@ -52,9 +56,13 @@ public class ChatService {
             3. 用中文回答，先给出结论，再展开说明；内容较多时使用 Markdown 列表或表格。
             """;
 
-    /** @param hits 检索命中的片段及分数，写入 retrieval_trace 便于排查 bad case */
+    /**
+     * @param hits    检索命中的片段及分数，写入 retrieval_trace 便于排查 bad case
+     * @param timings 各环节耗时（毫秒），同样写入 retrieval_trace，用于排查"回答慢"
+     */
     private record PreparedChat(Conversation conversation, List<ChatMessage> history, String question,
-                                String searchQuery, List<Citation> citations, List<Map<String, Object>> hits) {
+                                String searchQuery, List<Citation> citations, List<Map<String, Object>> hits,
+                                Map<String, Long> timings) {
     }
 
     private final ConversationRepository conversations;
@@ -89,9 +97,9 @@ public class ChatService {
         return conversations.findByKb(kbId);
     }
 
-    public Conversation create(long kbId, String title) {
+    public Conversation create(long kbId, String title, SearchScope scope) {
         knowledgeBaseService.get(kbId);
-        return get(conversations.insert(kbId, StringUtils.hasText(title) ? title.trim() : DEFAULT_TITLE));
+        return get(conversations.insert(kbId, StringUtils.hasText(title) ? title.trim() : DEFAULT_TITLE, scope));
     }
 
     public Conversation get(long id) {
@@ -104,6 +112,13 @@ public class ChatService {
             throw new IllegalArgumentException("标题不能为空");
         }
         conversations.updateTitle(id, title.trim());
+        return get(id);
+    }
+
+    /** 修改检索范围，之后的提问按新范围检索；已有的回答不受影响 */
+    public Conversation updateScope(long id, SearchScope scope) {
+        get(id);
+        conversations.updateScope(id, scope);
         return get(id);
     }
 
@@ -146,29 +161,49 @@ public class ChatService {
         List<QueryRewriter.Turn> turns = history.stream()
                 .map(m -> new QueryRewriter.Turn(ChatMessage.USER.equals(m.role()), m.content()))
                 .toList();
+        long start = System.nanoTime();
         String searchQuery = queryRewriter.searchQuery(turns, question);
-        List<RetrievedChunk> chunks = retriever.retrieve(conversation.kbId(), searchQuery);
-        return new PreparedChat(conversation, history, question, searchQuery, toCitations(chunks), trace(chunks));
+        long rewrittenAt = System.nanoTime();
+        List<RetrievedChunk> chunks = retriever.retrieve(conversation.kbId(), searchQuery, conversation.scope());
+        Map<String, Long> timings = new LinkedHashMap<>();
+        timings.put("rewriteMs", (rewrittenAt - start) / 1_000_000);
+        timings.put("retrieveMs", (System.nanoTime() - rewrittenAt) / 1_000_000);
+        log.info("问答准备完成：查询改写 {} ms，检索 {} ms", timings.get("rewriteMs"), timings.get("retrieveMs"));
+        return new PreparedChat(conversation, history, question, searchQuery, toCitations(chunks), trace(chunks),
+                timings);
     }
 
     private Flux<ServerSentEvent<String>> answer(PreparedChat chat) {
         Flux<ServerSentEvent<String>> head = Flux.just(event("citations", chat.citations()));
         if (chat.citations().isEmpty()) {
+            String notFound = chat.conversation().scope().isAll() ? NOT_FOUND_ANSWER : NOT_FOUND_IN_SCOPE_ANSWER;
             return Flux.concat(head,
-                    Flux.just(event("delta", Map.of("text", NOT_FOUND_ANSWER))),
-                    saveAnswer(chat, NOT_FOUND_ANSWER));
+                    Flux.just(event("delta", Map.of("text", notFound))),
+                    saveAnswer(chat, notFound));
         }
 
         StringBuilder answer = new StringBuilder();
         AtomicBoolean completed = new AtomicBoolean();
+        long start = System.nanoTime();
+        AtomicLong firstToken = new AtomicLong();
         Flux<ServerSentEvent<String>> body = chatClient.prompt()
                 .system(ANSWER_SYSTEM_PROMPT)
                 .messages(historyMessages(chat.history()))
                 .user(userPrompt(chat))
                 .stream()
                 .content()
-                .doOnNext(answer::append)
-                .doOnComplete(() -> completed.set(true))
+                .doOnNext(text -> {
+                    if (firstToken.compareAndSet(0, System.nanoTime())) {
+                        chat.timings().put("firstTokenMs", (firstToken.get() - start) / 1_000_000);
+                    }
+                    answer.append(text);
+                })
+                .doOnComplete(() -> {
+                    completed.set(true);
+                    chat.timings().put("answerMs", (System.nanoTime() - start) / 1_000_000);
+                    log.info("回答生成完成：首字 {} ms，共 {} ms，{} 字", chat.timings().get("firstTokenMs"),
+                            chat.timings().get("answerMs"), answer.length());
+                })
                 .doOnCancel(() -> {
                     // 用户中途停止生成：保留已生成的部分
                     if (!completed.get() && !answer.isEmpty()) {
@@ -187,7 +222,13 @@ public class ChatService {
     }
 
     private long saveAssistantMessage(PreparedChat chat, String answer) {
-        Map<String, Object> trace = Map.of("searchQuery", chat.searchQuery(), "hits", chat.hits());
+        Map<String, Object> trace = new LinkedHashMap<>();
+        trace.put("searchQuery", chat.searchQuery());
+        if (!chat.conversation().scope().isAll()) {
+            trace.put("scope", chat.conversation().scope());
+        }
+        trace.put("hits", chat.hits());
+        trace.put("timings", chat.timings());
         return conversations.insertMessage(chat.conversation().id(), ChatMessage.ASSISTANT, answer,
                 chat.citations(), trace);
     }

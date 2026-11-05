@@ -1,5 +1,5 @@
 import type {
-  ChatMessage, ChunkView, Citation, Conversation, KbDocument, KnowledgeBase, RetrievedChunk, UploadResult,
+  ChatMessage, ChunkView, Citation, Conversation, KbDocument, KnowledgeBase, RetrievedChunk, SearchScope, UploadResult,
 } from './types'
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
@@ -45,8 +45,10 @@ export const api = {
     request<RetrievedChunk[]>(`/api/knowledge-bases/${kbId}/search`, { method: 'POST', body: json({ query, topK }) }),
 
   listConversations: (kbId: number) => request<Conversation[]>(`/api/knowledge-bases/${kbId}/conversations`),
-  createConversation: (kbId: number) =>
-    request<Conversation>(`/api/knowledge-bases/${kbId}/conversations`, { method: 'POST', body: json({}) }),
+  createConversation: (kbId: number, scope?: SearchScope) =>
+    request<Conversation>(`/api/knowledge-bases/${kbId}/conversations`, { method: 'POST', body: json({ scope }) }),
+  updateConversationScope: (id: number, scope: SearchScope) =>
+    request<Conversation>(`/api/conversations/${id}/scope`, { method: 'PUT', body: json(scope) }),
   renameConversation: (id: number, title: string) =>
     request<Conversation>(`/api/conversations/${id}`, { method: 'PUT', body: json({ title }) }),
   deleteConversation: (id: number) => request<void>(`/api/conversations/${id}`, { method: 'DELETE' }),

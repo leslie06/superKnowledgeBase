@@ -830,3 +830,71 @@ a:hover {
     width: 140px;
   }
 }
+
+.composer-bar {
+  margin: 0 max(24px, calc((100% - 820px) / 2)) 6px;
+}
+
+.scope-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  padding: 3px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.scope-trigger span {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.scope-trigger:hover,
+.scope-trigger.active {
+  color: var(--primary);
+  border-color: var(--primary);
+  background: var(--primary-soft);
+}
+
+.scope-tree {
+  max-height: 360px;
+  overflow: auto;
+  margin: 8px 0;
+}
+
+.scope-node {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  font-size: 13px;
+}
+
+.scope-label {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.scope-empty,
+.scope-hint {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.scope-empty {
+  padding: 16px;
+  text-align: center;
+}
+
+.scope-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 8px;
+}
