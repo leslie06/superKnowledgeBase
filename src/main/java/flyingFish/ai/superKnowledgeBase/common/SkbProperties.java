@@ -37,7 +37,12 @@ public record SkbProperties(String storageDir, Ingestion ingestion, Chunk chunk,
     public record Rerank(boolean enabled, String baseUrl, int candidates, double minScore, Duration timeout) {
     }
 
-    public record Chat(int historyMessages, int maxContextChars) {
+    /**
+     * @param historyMessages 携带的历史消息条数
+     * @param maxContextChars 参考资料的总字数预算
+     * @param expandChars     每条参考资料扩展到的最大字数：把命中片段在同一章节里的前后片段一起交给模型，0 表示不扩展
+     */
+    public record Chat(int historyMessages, int maxContextChars, int expandChars) {
     }
 
     /**

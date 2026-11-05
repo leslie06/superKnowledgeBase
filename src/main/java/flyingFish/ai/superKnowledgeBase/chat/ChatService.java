@@ -30,7 +30,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * RAG 问答：查询改写（{@link QueryRewriter}） → 检索 → 组装带编号的参考资料 → LLM 流式生成（要求标注 [n] 引用）。
+ * RAG 问答：查询改写（{@link QueryRewriter}） → 检索 → 扩展相邻片段（{@link Retriever#expand}）→ 组装带编号的参考资料
+ * → LLM 流式生成（要求标注 [n] 引用）。
  * <p>
  * SSE 事件：citations（检索到的引用）→ delta（增量文本）* → done（消息 id）；出错时发送 error。
  */
@@ -73,6 +74,7 @@ public class ChatService {
     private final JsonMapper jsonMapper;
     private final int historyMessages;
     private final int maxContextChars;
+    private final int expandChars;
     private final boolean apiKeyConfigured;
 
     public ChatService(ConversationRepository conversations, KnowledgeBaseService knowledgeBaseService,
@@ -87,6 +89,7 @@ public class ChatService {
         this.jsonMapper = jsonMapper;
         this.historyMessages = properties.chat().historyMessages();
         this.maxContextChars = properties.chat().maxContextChars();
+        this.expandChars = properties.chat().expandChars();
         this.apiKeyConfigured = StringUtils.hasText(apiKey) && !NO_API_KEY.equals(apiKey) && !"sk-xxxx".equals(apiKey);
     }
 
@@ -165,11 +168,13 @@ public class ChatService {
         String searchQuery = queryRewriter.searchQuery(turns, question);
         long rewrittenAt = System.nanoTime();
         List<RetrievedChunk> chunks = retriever.retrieve(conversation.kbId(), searchQuery, conversation.scope());
+        // 扩展后相邻的命中片段会并成一条，trace 仍按原始命中记录
+        List<RetrievedChunk> context = retriever.expand(chunks, expandChars);
         Map<String, Long> timings = new LinkedHashMap<>();
         timings.put("rewriteMs", (rewrittenAt - start) / 1_000_000);
         timings.put("retrieveMs", (System.nanoTime() - rewrittenAt) / 1_000_000);
         log.info("问答准备完成：查询改写 {} ms，检索 {} ms", timings.get("rewriteMs"), timings.get("retrieveMs"));
-        return new PreparedChat(conversation, history, question, searchQuery, toCitations(chunks), trace(chunks),
+        return new PreparedChat(conversation, history, question, searchQuery, toCitations(context), trace(chunks),
                 timings);
     }
 

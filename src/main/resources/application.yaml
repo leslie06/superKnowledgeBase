@@ -87,3 +87,5 @@ skb:
   chat:
     history-messages: 6
     max-context-chars: 12000
+    # 命中片段在同一章节里的前后片段一起交给模型，每条参考资料最多这么多字；答案常常跨片段（列举项、跨页段落），0 表示不扩展
+    expand-chars: 1500

@@ -9,14 +9,19 @@ import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.Deque;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Function;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
@@ -31,6 +36,10 @@ public class Retriever {
     public enum Mode {HYBRID, VECTOR, KEYWORD}
 
     private record Hit(long chunkId, double score) {
+    }
+
+    /** 命中片段所在章节里的相邻片段（含命中片段本身） */
+    private record Neighbor(Long hitId, Long chunkId, int chunkIndex, String location, String content) {
     }
 
     private record ChunkRow(Long chunkId, Long documentId, String filename, String headingPath, String location,
@@ -58,6 +67,13 @@ public class Retriever {
      * 向量相似度却排不进全库前 30。精排候选总数不变，由它们挤掉 RRF 排名最靠后的几个。
      */
     private static final int KEYWORD_RERANK_GUARANTEE = 3;
+    /**
+     * 与排名更靠前的结果相似度达到这个值的片段视为重复，不再返回。同一本书的多个副本、同一译本的不同扫描版
+     * 会让同一段话占掉好几个参考资料名额（"林黛玉进贾府"的前 6 个结果里有 3 对完全相同）；
+     * 同一页的相邻片段、格式相近的表格行相似度在 0.5～0.7，不受影响。
+     */
+    private static final double DUPLICATE_SIMILARITY = 0.85;
+    private static final Pattern PAGE_LOCATION = Pattern.compile("^第(\\d+)(?:-(\\d+))?页$");
 
     private final JdbcClient jdbc;
     private final EmbeddingModel embeddingModel;
@@ -115,7 +131,7 @@ public class Retriever {
         List<RetrievedChunk> fused = fuse(kbId, query, scope, mode, poolSize);
         long fusedAt = System.nanoTime();
         // 精排是一次 HTTP 调用，放在数据库事务之外，避免长时间占用连接
-        List<RetrievedChunk> result = rerank && !fused.isEmpty() ? rerank(query, fused) : fused;
+        List<RetrievedChunk> result = dropDuplicates(rerank && !fused.isEmpty() ? rerank(query, fused) : fused);
         long end = System.nanoTime();
         log.info("检索耗时 {} ms：召回 {} ms，精排 {} ms，{} 个片段", (end - start) / 1_000_000,
                 (fusedAt - start) / 1_000_000, (end - fusedAt) / 1_000_000, result.size());
@@ -192,6 +208,111 @@ public class Retriever {
             }
         }
         return reranked;
+    }
+
+    /** 按排名依次保留，与已保留片段内容几乎相同的跳过 */
+    static List<RetrievedChunk> dropDuplicates(List<RetrievedChunk> ranked) {
+        List<RetrievedChunk> kept = new ArrayList<>();
+        List<Set<String>> keptGrams = new ArrayList<>();
+        for (RetrievedChunk c : ranked) {
+            Set<String> grams = trigrams(c.content());
+            if (keptGrams.stream().noneMatch(g -> similarity(g, grams) >= DUPLICATE_SIMILARITY)) {
+                kept.add(c);
+                keptGrams.add(grams);
+            }
+        }
+        return kept;
+    }
+
+    /** 字符三元组的交集占较短一方的比例；用较短一方，部分副本（只截取了原书一部分）切出的片段也能识别 */
+    static double similarity(Set<String> a, Set<String> b) {
+        if (a.isEmpty() || b.isEmpty()) {
+            return 0;
+        }
+        Set<String> smaller = a.size() <= b.size() ? a : b;
+        Set<String> larger = smaller == a ? b : a;
+        long common = smaller.stream().filter(larger::contains).count();
+        return (double) common / smaller.size();
+    }
+
+    static Set<String> trigrams(String text) {
+        String compact = text.replaceAll("\\s+", "");
+        Set<String> grams = new HashSet<>();
+        for (int i = 0; i + 3 <= compact.length(); i++) {
+            grams.add(compact.substring(i, i + 3));
+        }
+        return grams;
+    }
+
+    /**
+     * 上下文扩展：把命中片段在同一文档、同一章节里的前后片段接上，每条最多 maxChars 字（先接后一个，再接前一个）。
+     * 片段按 600 字左右切分，答案常常跨片段：列举项的后半段、跨页的段落、"有下列情形之一的"之后的条目。
+     * 相邻片段本身也是命中结果时并成一条，不重复占用参考资料名额。返回的片段保留命中片段的 id 和分数，内容换成扩展后的文本。
+     */
+    public List<RetrievedChunk> expand(List<RetrievedChunk> hits, int maxChars) {
+        if (maxChars <= 0 || hits.isEmpty()) {
+            return hits;
+        }
+        Map<Long, Map<Integer, Neighbor>> around = jdbc.sql("""
+                        SELECT h.id AS hit_id, n.id AS chunk_id, n.chunk_index, n.location, n.content
+                        FROM chunk h
+                        JOIN chunk n ON n.document_id = h.document_id
+                                    AND n.chunk_index BETWEEN h.chunk_index - 1 AND h.chunk_index + 1
+                                    AND n.heading_path IS NOT DISTINCT FROM h.heading_path
+                        WHERE h.id IN (:ids)
+                        """)
+                .param("ids", hits.stream().map(RetrievedChunk::chunkId).toList())
+                .query(Neighbor.class)
+                .list().stream()
+                .collect(Collectors.groupingBy(Neighbor::hitId,
+                        Collectors.toMap(Neighbor::chunkIndex, Function.identity())));
+        Set<Long> covered = new HashSet<>();
+        List<RetrievedChunk> expanded = new ArrayList<>();
+        for (RetrievedChunk hit : hits) {
+            if (!covered.add(hit.chunkId())) {
+                continue;
+            }
+            Map<Integer, Neighbor> section = around.getOrDefault(hit.chunkId(), Map.of());
+            Neighbor self = section.values().stream().filter(n -> n.chunkId().equals(hit.chunkId())).findFirst().orElse(null);
+            if (self == null) {
+                expanded.add(hit);
+                continue;
+            }
+            Deque<Neighbor> parts = new ArrayDeque<>(List.of(self));
+            int used = self.content().length();
+            Neighbor next = section.get(self.chunkIndex() + 1);
+            if (next != null && !covered.contains(next.chunkId()) && used + next.content().length() <= maxChars) {
+                parts.addLast(next);
+                used += next.content().length();
+            }
+            Neighbor previous = section.get(self.chunkIndex() - 1);
+            if (previous != null && !covered.contains(previous.chunkId())
+                    && used + previous.content().length() <= maxChars) {
+                parts.addFirst(previous);
+            }
+            parts.forEach(n -> covered.add(n.chunkId()));
+            String content = parts.stream().map(Neighbor::content).collect(Collectors.joining("\n"));
+            String location = mergeLocations(parts.getFirst().location(), parts.getLast().location());
+            expanded.add(new RetrievedChunk(hit.chunkId(), hit.documentId(), hit.filename(), hit.headingPath(),
+                    location, content, hit.score(), hit.keywordScore(), hit.vectorRank(), hit.keywordRank(),
+                    hit.rerankScore(), hit.exactMatch(), hit.relevant()));
+        }
+        return expanded;
+    }
+
+    /** "第3页" + "第4-5页" → "第3-5页"；不是页码时用第一段的位置 */
+    static String mergeLocations(String first, String last) {
+        if (first == null || last == null || first.equals(last)) {
+            return first != null ? first : last;
+        }
+        Matcher a = PAGE_LOCATION.matcher(first);
+        Matcher b = PAGE_LOCATION.matcher(last);
+        if (!a.matches() || !b.matches()) {
+            return first;
+        }
+        int start = Integer.parseInt(a.group(1));
+        int end = Integer.parseInt(b.group(2) != null ? b.group(2) : b.group(1));
+        return end > start ? "第" + start + "-" + end + "页" : "第" + start + "页";
     }
 
     /** 精排候选：关键词召回前 keywordTop 名，再按 RRF 顺序补足 size 个 */
