@@ -22,6 +22,7 @@
 
 import argparse
 import csv
+import http.client
 import json
 import os
 import re
@@ -150,7 +151,7 @@ def ask(base_url: str, kb_id: int, case: Case, keep: bool) -> Outcome:
     try:
         conversation = http_json("POST", f"{api}/knowledge-bases/{kb_id}/conversations",
                                  {"title": f"[评测] {case.question}"[:30]})
-    except (RuntimeError, urllib.error.URLError, TimeoutError) as e:
+    except (RuntimeError, OSError, http.client.HTTPException) as e:
         outcome.error = f"创建会话失败：{e}"
         return outcome
     try:
@@ -182,7 +183,7 @@ def ask(base_url: str, kb_id: int, case: Case, keep: bool) -> Outcome:
         outcome.answer = "".join(parts)
         if not outcome.error and not outcome.answer:
             outcome.error = "没有收到回答"
-    except (urllib.error.URLError, TimeoutError, ValueError) as e:
+    except (OSError, http.client.HTTPException, ValueError) as e:
         outcome.error = f"问答失败：{e}"
     finally:
         if not keep:
@@ -229,7 +230,9 @@ def judge(outcome: Outcome, api_key: str, model: str):
     if model == "deepseek-chat":
         payload["response_format"] = {"type": "json_object"}
     last_error = None
-    for _ in range(3):
+    for attempt in range(3):
+        if attempt:
+            time.sleep(5 * attempt)  # DeepSeek 过载时会直接断开连接，稍等再试
         try:
             response = http_json("POST", DEEPSEEK_URL, payload, {"Authorization": f"Bearer {api_key}"}, timeout=180)
             result = parse_json(response["choices"][0]["message"]["content"])
@@ -241,7 +244,8 @@ def judge(outcome: Outcome, api_key: str, model: str):
             outcome.missing_citations = [str(s) for s in result.get("missing_citations") or []]
             outcome.refused = bool(result.get("refused"))
             return
-        except (RuntimeError, urllib.error.URLError, TimeoutError, ValueError, KeyError, TypeError) as e:
+        # OSError 含 URLError、超时和连接被断开；HTTPException 含响应读到一半中断（IncompleteRead）
+        except (RuntimeError, OSError, http.client.HTTPException, ValueError, KeyError, TypeError) as e:
             last_error = e
     outcome.error = f"裁判失败：{last_error}"
 
