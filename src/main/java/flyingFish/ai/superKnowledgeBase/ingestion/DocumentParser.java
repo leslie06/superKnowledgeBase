@@ -15,11 +15,14 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
 /**
  * 用 Tika 解析 doc/docx/xls/xlsx/ppt/pptx/pdf，并按格式特点整理成带章节路径和位置信息的文本单元。
@@ -60,8 +63,18 @@ public class DocumentParser {
     private static final int MIN_PDF_SETTINGS = 3;
 
     private final AutoDetectParser parser = new AutoDetectParser();
+    private final OcrService ocr;
 
-    public List<TextUnit> parse(Path file, String filename) throws IOException {
+    public DocumentParser(OcrService ocr) {
+        this.ocr = ocr;
+    }
+
+    /**
+     * @param sha256      文件内容的 SHA-256，作为文字识别结果的缓存键
+     * @param ocrProgress 扫描版 PDF 文字识别的进度回调；不需要识别时不会调用
+     */
+    public List<TextUnit> parse(Path file, String filename, String sha256, OcrService.Progress ocrProgress)
+            throws IOException {
         DocType type = DocType.fromFilename(filename);
         TikaBlockHandler handler = new TikaBlockHandler();
         Metadata metadata = new Metadata();
@@ -71,7 +84,9 @@ public class DocumentParser {
         } catch (Exception e) {
             throw new IOException("文件解析失败：" + e.getMessage(), e);
         }
-        List<Block> blocks = type == DocType.PDF ? PdfTextCleaner.clean(handler.blocks()) : handler.blocks();
+        List<Block> blocks = type == DocType.PDF
+                ? PdfTextCleaner.clean(withOcr(handler.blocks(), handler.units(), file, sha256, ocrProgress))
+                : handler.blocks();
         List<TextUnit> units = switch (type) {
             case EXCEL -> excelUnits(blocks);
             case PPT -> pptUnits(blocks);
@@ -105,6 +120,49 @@ public class DocumentParser {
         }
         m.appendTail(kept);
         return removed * 2 > text.length() ? "" : kept.toString().strip();
+    }
+
+    /**
+     * 文字层太少的页（扫描页）交给 OCR。识别结果是一行一行的，每行作为一个段落和其他页的文字一起按页码排序，
+     * 之后由 PdfTextCleaner 去掉页眉页脚、把被换行截断的句子接回去，和普通 PDF 的处理方式相同。
+     */
+    private List<Block> withOcr(List<Block> blocks, int pageCount, Path file, String sha256,
+                                OcrService.Progress progress) throws IOException {
+        if (!ocr.available() || pageCount == 0) {
+            return blocks;
+        }
+        int[] chars = new int[pageCount + 1];
+        for (Block block : blocks) {
+            if (block.unit() > 0 && block.unit() <= pageCount) {
+                chars[block.unit()] += textLength(block);
+            }
+        }
+        List<Integer> scanned = IntStream.rangeClosed(1, pageCount)
+                .filter(p -> chars[p] < ocr.minPageChars())
+                .boxed()
+                .toList();
+        if (scanned.isEmpty()) {
+            return blocks;
+        }
+        Map<Integer, String> texts = ocr.recognize(sha256, file, scanned, progress);
+        List<Block> merged = new ArrayList<>(blocks);
+        for (int page : scanned) {
+            String text = texts.get(page);
+            if (text != null) {
+                text.lines().map(TikaBlockHandler::normalize).filter(line -> !line.isEmpty())
+                        .forEach(line -> merged.add(new Block(Kind.PARAGRAPH, 0, line, null, page)));
+            }
+        }
+        // 稳定排序，同一页内保持原有顺序；不属于任何页的内容（如 PDF 书签）放在最后
+        merged.sort(Comparator.comparingInt(b -> b.unit() > 0 ? b.unit() : Integer.MAX_VALUE));
+        return merged;
+    }
+
+    private static int textLength(Block block) {
+        String text = block.kind() == Kind.TABLE
+                ? block.rows().stream().flatMap(List::stream).collect(Collectors.joining())
+                : block.text();
+        return (int) text.codePoints().filter(c -> !Character.isWhitespace(c)).count();
     }
 
     private static ParseContext parseContext() {

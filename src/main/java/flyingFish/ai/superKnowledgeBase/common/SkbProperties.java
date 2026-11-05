@@ -6,7 +6,7 @@ import java.time.Duration;
 
 @ConfigurationProperties("skb")
 public record SkbProperties(String storageDir, Ingestion ingestion, Chunk chunk, Retrieval retrieval, Rerank rerank,
-                            Chat chat) {
+                            Chat chat, Ocr ocr) {
 
     public record Ingestion(int concurrency, int embeddingBatchSize) {
     }
@@ -38,5 +38,14 @@ public record SkbProperties(String storageDir, Ingestion ingestion, Chunk chunk,
     }
 
     public record Chat(int historyMessages, int maxContextChars) {
+    }
+
+    /**
+     * @param enabled      是否对扫描页做文字识别
+     * @param command      识别命令（scripts/ocr/vision_ocr.swift 编译后的可执行文件），参数与输出格式见该文件头部注释；不存在时跳过识别
+     * @param dpi          把页面渲染成图片的分辨率，越高越慢
+     * @param minPageChars 文字层少于这么多个字（不含空白）的页视为扫描页
+     */
+    public record Ocr(boolean enabled, String command, int dpi, int minPageChars) {
     }
 }

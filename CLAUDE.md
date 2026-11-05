@@ -18,6 +18,7 @@ export JAVA_HOME=$(/usr/libexec/java_home -v 21)
 python3 scripts/eval_retrieval.py --kb-id 5 --csv scripts/eval/laws.csv   # 检索评测（需后端运行），题集格式见脚本头注释；基线在 scripts/eval/baseline/
 python3 scripts/eval_retrieval.py --kb-id 5 --csv scripts/eval/laws.csv --rerank off   # 对比不精排的效果
 python3 scripts/eval_answer.py --kb-id 5 --csv scripts/eval/answers/laws.csv    # 答案级评测：真实问答 + DeepSeek 裁判（要点、编造、引用、拒答），基线在 scripts/eval/baseline/answers/
+swiftc -O scripts/ocr/vision_ocr.swift -o scripts/ocr/vision-ocr   # 编译扫描版 PDF 的文字识别工具（苹果 Vision，仅 macOS，产物已 gitignore）
 python3 scripts/import_dir.py --kb-id 7 --dir ~/资料 --out import.csv   # 目录批量导入（需后端运行），等处理完输出报告；--dry-run 只扫描，可重复运行
 HF_HUB_OFFLINE=1 python3 scripts/rerank_server.py                # Rerank 服务 http://localhost:8081（bge-reranker-v2-m3，需 sentence-transformers；不在 docker 里，安装与启动见 README）
 
@@ -47,10 +48,11 @@ npm run typecheck    # vue-tsc 类型检查
 
 ### 摄入管线（`ingestion/IngestionService`）
 
-上传（`DocumentService`）→ 按 SHA-256 在同一知识库内去重 → 文件存到 `skb.storage-dir/{kbId}/{sha256}.{ext}` → `IngestionService.submit` 异步处理。处理在固定大小的虚拟线程池中进行（`skb.ingestion.concurrency`，避免压垮本地 Ollama），文档状态依次为 `PENDING → PARSING → EMBEDDING → READY / FAILED`。旧 chunk 删除与新 chunk 写入在同一事务中完成，所以 reindex 是原子替换。应用启动时（`ApplicationReadyEvent`）会自动重新提交所有未完成状态的文档。
+上传（`DocumentService`）→ 按 SHA-256 在同一知识库内去重 → 文件存到 `skb.storage-dir/{kbId}/{sha256}.{ext}` → `IngestionService.submit` 异步处理。处理在固定大小的虚拟线程池中进行（`skb.ingestion.concurrency`，避免压垮本地 Ollama），文档状态依次为 `PENDING → PARSING → (OCR) → EMBEDDING → READY / FAILED`。应用关闭时中断的处理不标记失败，下次启动继续。旧 chunk 删除与新 chunk 写入在同一事务中完成，所以 reindex 是原子替换。应用启动时（`ApplicationReadyEvent`）会自动重新提交所有未完成状态的文档。
 
 - `DocumentParser` + `TikaBlockHandler`：Tika 输出 → `TextUnit`（文本 + 章节路径 + 位置）。Word 优先用标题样式，没有样式时用中文编号正则（"第X章"、"一、"、"2.1" 等）推断标题；PDF 记录页码，并先经 `PdfTextCleaner` 去掉页眉页脚和目录、接回被换行截断的句子；PPT 每张幻灯片首行作为标题；Excel 每行转成"列名: 值"。
 - `Chunker`：不跨章节、不跨幻灯片/工作表（PDF 跨页允许合并，位置记为"第1-2页"）。先把不可分的段落归组（法律条文及其款项、冒号结尾的引导句与其后的列举项、连续列举项），只在组之间按 `skb.chunk.*` 的目标/上限字数切分，组间不重叠；超长组在组内切分，后续片段重复最近的引导句，没有引导句时用句子级重叠。改切块规则后要对已有文档 reindex 才生效。
+- 扫描版 PDF：`DocumentParser.withOcr` 把文字层少于 `skb.ocr.min-page-chars` 的页交给 `OcrService`，它调用 `skb.ocr.command`（`scripts/ocr/vision-ocr`，Swift + 苹果 Vision，每识别一页输出一行 JSON），结果按文件 SHA-256 + 页码缓存在 `ocr_page` 表（reindex 不重复识别），进度写入 `document.ocr_done/ocr_pages`。识别出的行作为该页的段落，再统一经过 `PdfTextCleaner`。命令不存在时跳过识别。
 - `DocumentParser.stripEncoded` 去掉 PDF 里嵌入的编码内容（含字母的长串十六进制、Adobe 设置字典），这类乱码片段向量几乎相同，会把 HNSW 检索引偏。
 - 标题识别：编号规则的层级为 编 1 > 分编 2 > 章 3 > 节/"一、" 4 > "（一）" 5 > 小数编号（段数 + 3）；样式标题开头的小数编号（Tika 常算错）会被去掉。
 - 向量化时把"文件名 + 章节 + 位置"拼在片段前面（`IngestionService.embeddingText`），但数据库中 `chunk.content` 只存原文。文件夹导入（页面「选择文件夹」或 `scripts/import_dir.py`）时上传接口会带 `paths` 字段，记录到 `document.source_path`（相对路径，含所选文件夹名），向量文本中用它代替文件名；该字段只影响之后处理的文档。

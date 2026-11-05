@@ -49,6 +49,17 @@ public class DocumentRepository {
                 .params(status.name(), errorMsg, id).update();
     }
 
+    /** 开始解析：清零上次的文字识别进度 */
+    public void markParsing(long id) {
+        jdbc.sql("UPDATE document SET status = ?, error_msg = NULL, ocr_pages = 0, ocr_done = 0, updated_at = now() WHERE id = ?")
+                .params(DocumentStatus.PARSING.name(), id).update();
+    }
+
+    public void updateOcrProgress(long id, int done, int total) {
+        jdbc.sql("UPDATE document SET status = ?, ocr_done = ?, ocr_pages = ?, updated_at = now() WHERE id = ?")
+                .params(DocumentStatus.OCR.name(), done, total, id).update();
+    }
+
     public void markReady(long id, int chunkCount) {
         jdbc.sql("UPDATE document SET status = ?, error_msg = NULL, chunk_count = ?, updated_at = now() WHERE id = ?")
                 .params(DocumentStatus.READY.name(), chunkCount, id).update();

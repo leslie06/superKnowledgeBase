@@ -40,12 +40,15 @@ public class IngestionService {
     private final EmbeddingModel embeddingModel;
     private final TransactionTemplate transactionTemplate;
     private final int embeddingBatchSize;
+    private final OcrService ocr;
     private final ExecutorService executor;
     private final Set<Long> inFlight = ConcurrentHashMap.newKeySet();
+    /** 应用正在关闭：此时处理中断不算失败，保持原状态，下次启动后继续 */
+    private volatile boolean stopping;
 
     public IngestionService(DocumentRepository documents, ChunkRepository chunks, FileStorage fileStorage,
                             DocumentParser parser, Chunker chunker, EmbeddingModel embeddingModel,
-                            TransactionTemplate transactionTemplate, SkbProperties properties) {
+                            TransactionTemplate transactionTemplate, OcrService ocr, SkbProperties properties) {
         this.documents = documents;
         this.chunks = chunks;
         this.fileStorage = fileStorage;
@@ -53,6 +56,7 @@ public class IngestionService {
         this.chunker = chunker;
         this.embeddingModel = embeddingModel;
         this.transactionTemplate = transactionTemplate;
+        this.ocr = ocr;
         this.embeddingBatchSize = properties.ingestion().embeddingBatchSize();
         this.executor = Executors.newFixedThreadPool(properties.ingestion().concurrency(),
                 Thread.ofVirtual().name("ingest-", 0).factory());
@@ -79,7 +83,8 @@ public class IngestionService {
     @EventListener(ApplicationReadyEvent.class)
     public void resumeUnfinished() {
         List<Long> ids = documents.findIdsByStatus(List.of(
-                DocumentStatus.PENDING.name(), DocumentStatus.PARSING.name(), DocumentStatus.EMBEDDING.name()));
+                DocumentStatus.PENDING.name(), DocumentStatus.PARSING.name(), DocumentStatus.OCR.name(),
+                DocumentStatus.EMBEDDING.name()));
         if (!ids.isEmpty()) {
             log.info("恢复 {} 个未完成的文档处理任务", ids.size());
             ids.forEach(this::submit);
@@ -88,6 +93,7 @@ public class IngestionService {
 
     @PreDestroy
     public void shutdown() {
+        stopping = true;
         executor.shutdownNow();
     }
 
@@ -98,11 +104,14 @@ public class IngestionService {
         }
         long start = System.currentTimeMillis();
         try {
-            documents.updateStatus(documentId, DocumentStatus.PARSING, null);
-            List<TextUnit> units = parser.parse(fileStorage.resolve(doc.filePath()), doc.filename());
+            documents.markParsing(documentId);
+            List<TextUnit> units = parser.parse(fileStorage.resolve(doc.filePath()), doc.filename(), doc.sha256(),
+                    (done, total) -> documents.updateOcrProgress(documentId, done, total));
             List<ChunkDraft> drafts = chunker.chunk(units, DocType.fromFilename(doc.filename()));
             if (drafts.isEmpty()) {
-                throw new IllegalStateException("未从文件中提取到文字内容（扫描件或纯图片需要 OCR，当前版本暂不支持）");
+                throw new IllegalStateException(ocr.available()
+                        ? "未从文件中提取到文字内容，文字识别也没有识别出文字"
+                        : "未从文件中提取到文字内容（扫描件需要文字识别，请先编译 scripts/ocr/vision_ocr.swift，见 README）");
             }
 
             documents.updateStatus(documentId, DocumentStatus.EMBEDDING, null);
@@ -116,6 +125,10 @@ public class IngestionService {
             log.info("文档处理完成：{}（{} 个片段，耗时 {} ms）", doc.filename(), drafts.size(),
                     System.currentTimeMillis() - start);
         } catch (Exception e) {
+            if (stopping) {
+                log.info("应用关闭，文档下次启动后继续处理：{}", doc.filename());
+                return;
+            }
             log.warn("文档处理失败：{}", doc.filename(), e);
             String message = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
             try {

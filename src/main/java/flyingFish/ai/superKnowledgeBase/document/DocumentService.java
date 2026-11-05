@@ -5,6 +5,7 @@ import flyingFish.ai.superKnowledgeBase.ingestion.ChunkRepository;
 import flyingFish.ai.superKnowledgeBase.ingestion.ChunkRepository.ChunkView;
 import flyingFish.ai.superKnowledgeBase.ingestion.DocType;
 import flyingFish.ai.superKnowledgeBase.ingestion.IngestionService;
+import flyingFish.ai.superKnowledgeBase.ingestion.OcrPageRepository;
 import flyingFish.ai.superKnowledgeBase.kb.KnowledgeBaseService;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.http.MediaType;
@@ -31,14 +32,17 @@ public class DocumentService {
     private final FileStorage fileStorage;
     private final IngestionService ingestionService;
     private final KnowledgeBaseService knowledgeBaseService;
+    private final OcrPageRepository ocrPages;
 
     public DocumentService(DocumentRepository documents, ChunkRepository chunks, FileStorage fileStorage,
-                           IngestionService ingestionService, KnowledgeBaseService knowledgeBaseService) {
+                           IngestionService ingestionService, KnowledgeBaseService knowledgeBaseService,
+                           OcrPageRepository ocrPages) {
         this.documents = documents;
         this.chunks = chunks;
         this.fileStorage = fileStorage;
         this.ingestionService = ingestionService;
         this.knowledgeBaseService = knowledgeBaseService;
+        this.ocrPages = ocrPages;
     }
 
     public List<Document> list(long kbId) {
@@ -124,6 +128,7 @@ public class DocumentService {
         Document doc = get(id);
         documents.delete(id);
         fileStorage.delete(doc.filePath());
+        ocrPages.deleteOrphans();
     }
 
     public Path file(Document doc) {

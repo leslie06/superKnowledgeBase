@@ -34,10 +34,13 @@ docker compose up -d
 # 3. Rerank 服务（另开一个终端；首次运行会下载约 2.2GB 模型，详见下方「Rerank 服务（Python）」）
 python3 scripts/rerank_server.py
 
-# 4. 构建前端（产物输出到 src/main/resources/static，随 jar 一起打包）
+# 4. 编译扫描版 PDF 的文字识别工具（苹果 Vision，仅 macOS，需要 Xcode 命令行工具；不编译时扫描页取不到文字）
+swiftc -O scripts/ocr/vision_ocr.swift -o scripts/ocr/vision-ocr
+
+# 5. 构建前端（产物输出到 src/main/resources/static，随 jar 一起打包）
 cd frontend && npm install && npm run build && cd ..
 
-# 5. 启动后端（需在项目根目录启动，才能读到 config/application.yaml）
+# 6. 启动后端（需在项目根目录启动，才能读到 config/application.yaml）
 JAVA_HOME=$(/usr/libexec/java_home -v 21) ./mvnw spring-boot:run
 ```
 
@@ -103,6 +106,22 @@ pkill -f rerank_server.py           # 停止
 - 设备自动选择：Apple 芯片用 MPS（fp16），有 NVIDIA 显卡用 CUDA，否则用 CPU。日志里的 `device` 显示实际使用的设备，CPU 推理会慢很多。
 - 接口与 HuggingFace text-embeddings-inference（TEI）的 `/rerank` 相同。部署到有 NVIDIA 显卡的 Linux 服务器时，可以直接用 TEI 镜像替代这个脚本，只需修改 `skb.rerank.base-url`。
 
+### 扫描版 PDF 的文字识别（OCR）
+
+扫描版 PDF 的页面是图片，没有文字层。解析时文字少于 20 个字的页会交给 `scripts/ocr/vision-ocr` 识别，它用 macOS 自带的 Vision 框架，不需要另外启动服务，也几乎不占内存。首次使用先编译（编译产物已 gitignore）：
+
+```bash
+swiftc -O scripts/ocr/vision_ocr.swift -o scripts/ocr/vision-ocr
+scripts/ocr/vision-ocr data/files/<知识库ID>/<文件>.pdf 200 1 2    # 试识别第 1、2 页，每页输出一行 JSON
+```
+
+- 速度约 0.5～1 秒一页（M2 Pro），一本 400 页的书 3～7 分钟。处理时文件列表显示「文字识别 120/400 页」。
+- 识别结果按文件内容缓存在 `ocr_page` 表：中途重启后从缓存接着识别；以后修改切块规则「重新处理」时直接用缓存，不会重新识别。删除文档或知识库后，没有文档引用的缓存会一并删除。
+- 没有编译或命令不存在时，后端启动会打一条 WARN，扫描页跳过识别，和接入 OCR 之前一样。
+- 接入前已导入的扫描版 PDF 要点「重新处理」才会识别。
+- 换其他识别引擎（如 Linux 上的 RapidOCR）时，提供参数和输出格式相同的命令（见 `vision_ocr.swift` 头部注释），修改 `skb.ocr.command` 即可。
+- 数学公式基本识别不出来；代码里偶有 `0/O`、`l/1` 混淆，对检索影响不大。
+
 ### 批量导入目录
 
 **页面上**：「文档管理」页点「选择文件夹」，或把文件夹直接拖进上传区，会包含所有子文件夹。
@@ -126,7 +145,7 @@ python3 scripts/import_dir.py --kb-id 7 --dir ~/资料 --out import.csv    # 上
 
 ## 处理逻辑要点
 
-- **解析**（`ingestion/DocumentParser`）：Word 按标题样式建立章节路径，没有样式时按"第X章 / 一、/ 2.1"等编号识别；PDF 记录页码；PPT 按幻灯片切分，首行作为标题；Excel 每行转成"列名: 值"，保证切块后每行仍带表头语义。扫描版 PDF 暂不支持（需要 OCR）。
+- **解析**（`ingestion/DocumentParser`）：Word 按标题样式建立章节路径，没有样式时按"第X章 / 一、/ 2.1"等编号识别；PDF 记录页码；PPT 按幻灯片切分，首行作为标题；Excel 每行转成"列名: 值"，保证切块后每行仍带表头语义。扫描版 PDF 中没有文字层的页用苹果 Vision 识别（见上文）。
 - **切块**（`ingestion/Chunker`）：不跨章节、不跨幻灯片或工作表；法律条文及其款项、「有下列情形之一的：」与其后的列举项不会被切开；目标 600 字、上限 1000 字；超长条文在内部切分时，后续片段重复引导句或保留约 100 字的句子级重叠。
 - **向量文本**：把"文件名（文件夹导入时为相对路径）+ 章节路径 + 位置"拼在片段前面再做向量化，提升"XX 手册里的 YY""XX 部门的 YY"这类问题的命中率。
 - **混合检索**（`retrieval/Retriever`）：向量召回负责语义相近的问法，BM25 负责条款号、编号、型号这类字面信息（中文按二字组切词，不依赖数据库分词扩展）。精确命中问题中编号的片段排最前，其余按加权 RRF 融合。
@@ -155,5 +174,5 @@ python3 scripts/import_dir.py --kb-id 7 --dir ~/资料 --out import.csv    # 上
 ## 后续路线
 
 - **P2 效果**：~~BM25 关键词检索 + 向量的混合召回（RRF 融合）~~、~~评估测试集~~、~~Reranker 精排~~、~~答案级评测~~、~~按组切分（条文、列举项不切开）~~、~~口语化查询改写~~（已完成）。
-- **P3 规模**：MinerU / Docling 处理复杂 PDF 与扫描件 OCR、目录监听自动同步、标签过滤。
+- **P3 规模**：~~扫描件 OCR~~（已完成，苹果 Vision）、复杂版面与公式（MinerU / Docling）、目录监听自动同步、标签过滤。
 - **P4 进阶**：Agentic RAG、跨文档关系问答、图表理解。

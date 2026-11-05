@@ -53,17 +53,19 @@ Files.move(temp, resolve(relative), StandardCopyOption.REPLACE_EXISTING);
 
 - 线程池是固定大小的虚拟线程池，大小取 `skb.ingestion.concurrency`（默认 2）。限制并发是为了不压垮本地 Ollama：批量上传几十个文件时，其余的在队列里等。
 - `inFlight` 集合记录正在处理的文档 ID，同一篇文档不会被重复提交；处理中点「重新处理」会得到 409。
-- 状态依次变为 `PENDING → PARSING → EMBEDDING → READY`，任一步抛异常则为 `FAILED`，错误信息截取前 500 字存进 `error_msg`，前端直接展示。
-- **断点恢复**：应用启动完成时（`ApplicationReadyEvent`），把状态仍是 `PENDING` / `PARSING` / `EMBEDDING` 的文档重新提交。服务中途重启不会留下「永远在处理中」的文档。
+- 状态依次变为 `PENDING → PARSING → EMBEDDING → READY`，有扫描页的 PDF 在解析中途进入 `OCR`（文字识别，见下文）。任一步抛异常则为 `FAILED`，错误信息截取前 500 字存进 `error_msg`，前端直接展示。应用关闭导致的中断不算失败，状态保持不变，下次启动继续。
+- **断点恢复**：应用启动完成时（`ApplicationReadyEvent`），把状态仍是 `PENDING` / `PARSING` / `OCR` / `EMBEDDING` 的文档重新提交。服务中途重启不会留下「永远在处理中」的文档。
 - **重新处理**：`POST /api/documents/{id}/reindex` 把状态置回 `PENDING` 再提交，原始文件从磁盘重新读取。调整切分参数或换解析逻辑后用它刷新。
 
 ```java
 // IngestionService.process：一篇文档的完整摄入过程
-documents.updateStatus(documentId, DocumentStatus.PARSING, null);
-List<TextUnit> units = parser.parse(fileStorage.resolve(doc.filePath()), doc.filename());
+documents.markParsing(documentId);
+// 扫描页的文字识别在 parse 内完成，进度回调把状态置为 OCR 并记录已识别页数
+List<TextUnit> units = parser.parse(fileStorage.resolve(doc.filePath()), doc.filename(), doc.sha256(),
+        (done, total) -> documents.updateOcrProgress(documentId, done, total));
 List<ChunkDraft> drafts = chunker.chunk(units, DocType.fromFilename(doc.filename()));
 if (drafts.isEmpty()) {
-    throw new IllegalStateException("未从文件中提取到文字内容（扫描件或纯图片需要 OCR，当前版本暂不支持）");
+    throw new IllegalStateException("未从文件中提取到文字内容……");   // 区分是否没有编译识别工具
 }
 documents.updateStatus(documentId, DocumentStatus.EMBEDDING, null);
 List<float[]> embeddings = embed(doc.filename(), drafts);
@@ -97,7 +99,7 @@ record TextUnit(String text,        // 段落或一行表格
 | 格式 | 章节路径怎么来 | 位置信息 | 特殊处理 |
 | --- | --- | --- | --- |
 | Word / txt / md | 优先用标题样式；整篇没有标题样式时用编号规则推断 | 无 | Markdown `#` 标题按 `#` 的个数定级 |
-| PDF | 同上（PDF 通常没有样式，靠编号规则） | `第N页` | 按内容流顺序抽取；去页眉页脚和目录、接回被换行截断的句子（见下文）；不做 OCR，不抽取图片 |
+| PDF | 同上（PDF 通常没有样式，靠编号规则） | `第N页` | 按内容流顺序抽取；没有文字层的扫描页做文字识别（见下文）；去页眉页脚和目录、接回被换行截断的句子；不抽取图片 |
 | PPT | 每张幻灯片的第一段文字当作标题 | `第N张幻灯片` | 幻灯片之外的内容记为「演讲备注」 |
 | Excel | 无 | `工作表：{名称}` | 每行转成「列名: 值」 |
 
@@ -140,7 +142,18 @@ record TextUnit(String text,        // 段落或一行表格
 
 表格开头只有一个非空单元格的行（合并单元格写的表名）单独保留为一行；不足两行或不足两列的表格退化为用 ` | ` 连接单元格。
 
-解析失败（文件损坏、加密等）会抛出 `IOException("文件解析失败：...")`；解析成功但提不出任何文字（扫描版 PDF、纯图片）会在切分后被拦下，两种情况文档都会变为 `FAILED`。
+解析失败（文件损坏、加密等）会抛出 `IOException("文件解析失败：...")`；解析成功但提不出任何文字（识别工具不可用时的扫描版 PDF、纯图片）会在切分后被拦下，两种情况文档都会变为 `FAILED`。
+
+**扫描版 PDF 的文字识别**（`DocumentParser.withOcr`、`OcrService`）。扫描书的页面是图片，PDFBox 取不到文字。导入的 109 份真实资料里，23 本 PDF 是扫描版：5 本直接失败，另外 18 本只取到了 PDF 自带的书签目录，状态显示「已就绪」，正文却完全搜不到（如《高性能 MySQL》72MB，只有 1 个片段）。处理方式：
+
+1. **找扫描页**：Tika 对每一页都会输出 `div.page`，没有文字的页也一样，所以单元序号就是页码。统计每页文字层的字数（不含空白），少于 `skb.ocr.min-page-chars`（20）的页需要识别。按页判断，一本书里只有部分页是扫描的也能处理。
+2. **识别**：`OcrService` 调用 `skb.ocr.command`（`scripts/ocr/vision-ocr`，Swift 编写，用 PDFKit 把页面按 200 DPI 渲染成图片，再用苹果 Vision 识别中英文），每识别完一页输出一行 JSON，后端随即写入缓存、更新进度。用命令行而不是常驻服务，不需要额外启动任何东西；换引擎只需提供参数和输出格式相同的命令。
+3. **缓存**：结果按文件 SHA-256 + 页码存进 `ocr_page`。一本书识别要几分钟，中途重启后从缓存接着识别，修改切块规则后重新处理也不用再识别；同一文件在多个知识库里共用。删除文档或知识库后，清理没有文档引用的缓存。
+4. **合并**：识别结果一行一个段落，加到对应页上，与其他页按页码稳定排序，再交给 `PdfTextCleaner` 去页眉页脚、接断行，后面的标题推断和切分与普通 PDF 完全相同。
+
+**引擎选型**：在《高性能 MySQL》《Redis 设计与实现》《算法导论》的 7 页扫描页上对比了苹果 Vision 和 RapidOCR（PaddleOCR 模型的 ONNX 版）。普通正文两者结果 96%～99% 一致，分歧处各对一半左右，错误类型不同：Vision 会把代码里的括号逗号识别成中文全角、偶尔把 `col1` 变成 `COL1`；RapidOCR 常混淆 `0/O`、`l/1`，还会把英文单词连在一起（`OPTIMIZETABLE`），影响英文关键词检索。两者都认不出数学公式。速度和内存差距明显：Vision 每页 0.5～0.9 秒、内存约 200MB；RapidOCR 每页 2～5 秒、约 900MB。23 本书共 11229 页，Vision 约 2 小时，RapidOCR 约 10 小时，所以选 Vision。它的全角标点问题在识别工具里处理：以英文为主的行把全角标点换回半角。
+
+端到端实测《深入学习 MongoDB》（139 页，135 页需要识别）：识别 61 秒，切出 187 个片段（识别前 2 个），章节结构也能推断出来（「第 3 章 > 3.1 选择片键」）；第二次处理全部命中缓存，0.1 秒。
 
 ## 摄入三：切分
 
@@ -874,6 +887,9 @@ private static final String ANSWER_SYSTEM_PROMPT = """
 | `retrieval.rrf-k` | 10 | 融合排序 | RRF 常数，越小名次之间的分差越大 |
 | `retrieval.keyword-weight` | 0.25 | 融合排序 | 关键词一路在 RRF 中的权重（向量为 1） |
 | `retrieval.rewrite-timeout` | 10s | 查询改写 | 改写的最长等待时间，超时后用原问题检索 |
+| `ocr.enabled` / `ocr.command` | true / `scripts/ocr/vision-ocr` | 解析 | 扫描页文字识别；命令不存在时跳过 |
+| `ocr.dpi` | 200 | 解析 | 页面渲染分辨率，越高越慢 |
+| `ocr.min-page-chars` | 20 | 解析 | 文字层少于这么多字的页视为扫描页 |
 | `retrieval.ef-search` | 200 | 向量召回 | HNSW 搜索范围，越大越接近精确结果；要明显大于 `candidates` |
 | `rerank.enabled` | true | 精排 | 是否精排；服务不可用时自动降级，无需改配置 |
 | `rerank.base-url` | `http://localhost:8081` | 精排 | Rerank 服务地址 |
@@ -885,7 +901,7 @@ private static final String ANSWER_SYSTEM_PROMPT = """
 
 **已知限制**：
 
-- **不支持扫描件**：PDF 解析关闭了 OCR，扫描版 PDF 和纯图片内容会以 `FAILED` 结束。图表里的信息也不会被提取。
+- **文字识别的局限**：扫描页靠苹果 Vision 识别，只能在 macOS 上运行；数学公式基本识别不出来，代码偶有 `0/O`、`l/1` 混淆，「入」「人」这类形近字偶尔认错。图片、图表里的信息不会被提取（文字型 PDF 里的插图也不做识别）。
 - **精排依赖本地服务和算力**：Rerank 服务要单独启动，模型约 2.2GB；精排 20 个片段中位约 1.7 秒。没启动时自动降级为 RRF + 余弦阈值，拒答能力回到精排前的水平。
 - **仍有拒答不了的难负例**：「公司班车几点发车」「迟到一次扣多少钱」「加班费按工资的几倍算」这类问题，库里有高度相关的章节但没有答案，精排分数仍高于阈值，要靠 LLM 按提示词说明「资料中没有」。答案级评测中这几道题 LLM 都正确拒答了，但这依赖模型遵守提示词，没有硬性保证。
 - **模型会用自身知识补充**：答案级评测中 116 个回答有 3 个含有参考资料之外的内容（两个是法律常识，一个是对编号前缀的猜测）。提示词要求只依据资料作答，但约束不是绝对的。
@@ -896,4 +912,4 @@ private static final String ANSWER_SYSTEM_PROMPT = """
 - **向量维度写死**：`vector(1024)` 和 bge-m3 绑定，更换 embedding 模型要改表结构并重新处理全部文档。
 - **引用由模型自觉标注**：`[n]` 是否准确依赖提示词约束，线上没有校验模型引用的编号是否真的支持对应的句子；目前只在答案级评测中离线检查，116 个回答没有发现引用错误。
 
-**后续演进**（摘自 README）：P2 已完成混合召回、Reranker 精排、检索评测、答案级评测、按组切分（条文、列举项不切开）和口语化查询改写；P3 引入 MinerU / Docling 处理复杂 PDF 和 OCR，改动集中在 `DocumentParser`。
+**后续演进**（摘自 README）：P2 已完成混合召回、Reranker 精排、检索评测、答案级评测、按组切分（条文、列举项不切开）和口语化查询改写；P3 已完成扫描件 OCR（苹果 Vision），复杂版面与公式（MinerU / Docling）留待以后，改动集中在 `DocumentParser`。

@@ -7,7 +7,7 @@ export interface KnowledgeBase {
   documentCount: number
 }
 
-export type DocumentStatus = 'PENDING' | 'PARSING' | 'EMBEDDING' | 'READY' | 'FAILED'
+export type DocumentStatus = 'PENDING' | 'PARSING' | 'OCR' | 'EMBEDDING' | 'READY' | 'FAILED'
 
 export interface KbDocument {
   id: number
@@ -20,6 +20,10 @@ export interface KbDocument {
   status: DocumentStatus
   errorMsg: string | null
   chunkCount: number
+  /** 最近一次处理时需要文字识别的页数（扫描页），0 表示不需要 */
+  ocrPages: number
+  /** 已完成文字识别的页数 */
+  ocrDone: number
   createdAt: string
   updatedAt: string
 }

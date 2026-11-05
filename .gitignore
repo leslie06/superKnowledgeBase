@@ -36,6 +36,8 @@ frontend/node_modules/
 frontend/dist/
 src/main/resources/static/
 config/
+# 由 scripts/ocr/vision_ocr.swift 编译生成
+scripts/ocr/vision-ocr
 
 ### macOS ###
 .DS_Store

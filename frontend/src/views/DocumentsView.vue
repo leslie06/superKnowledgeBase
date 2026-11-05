@@ -16,6 +16,7 @@ const POLL_INTERVAL = 2000
 const STATUS: Record<DocumentStatus, { label: string; type: 'info' | 'warning' | 'primary' | 'success' | 'danger' }> = {
   PENDING: { label: '排队中', type: 'info' },
   PARSING: { label: '解析中', type: 'warning' },
+  OCR: { label: '文字识别中', type: 'warning' },
   EMBEDDING: { label: '向量化中', type: 'primary' },
   READY: { label: '已就绪', type: 'success' },
   FAILED: { label: '失败', type: 'danger' },
@@ -165,10 +166,17 @@ function extension(filename: string) {
             </div>
           </template>
         </el-table-column>
-        <el-table-column label="状态" width="120">
+        <el-table-column label="状态" width="150">
           <template #default="{ row }">
             <el-tooltip v-if="row.status === 'FAILED'" :content="row.errorMsg || '未知错误'" placement="top">
               <el-tag :type="STATUS[row.status as DocumentStatus].type" effect="light">失败 ⓘ</el-tag>
+            </el-tooltip>
+            <el-tag v-else-if="row.status === 'OCR'" :type="STATUS.OCR.type" effect="light">
+              文字识别 {{ row.ocrDone }}/{{ row.ocrPages }} 页
+            </el-tag>
+            <el-tooltip v-else-if="row.status === 'READY' && row.ocrPages > 0"
+                        :content="`其中 ${row.ocrPages} 页是扫描页，文字由文字识别得到`" placement="top">
+              <el-tag :type="STATUS.READY.type" effect="light">已就绪 · 识别 ⓘ</el-tag>
             </el-tooltip>
             <el-tag v-else :type="STATUS[row.status as DocumentStatus].type" effect="light">
               {{ STATUS[row.status as DocumentStatus].label }}

@@ -2,6 +2,7 @@ package flyingFish.ai.superKnowledgeBase.kb;
 
 import flyingFish.ai.superKnowledgeBase.common.NotFoundException;
 import flyingFish.ai.superKnowledgeBase.document.FileStorage;
+import flyingFish.ai.superKnowledgeBase.ingestion.OcrPageRepository;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
@@ -13,12 +14,14 @@ public class KnowledgeBaseService {
 
     private final KnowledgeBaseRepository repository;
     private final FileStorage fileStorage;
+    private final OcrPageRepository ocrPages;
     private final String embeddingModel;
 
-    public KnowledgeBaseService(KnowledgeBaseRepository repository, FileStorage fileStorage,
+    public KnowledgeBaseService(KnowledgeBaseRepository repository, FileStorage fileStorage, OcrPageRepository ocrPages,
                                 @Value("${spring.ai.ollama.embedding.options.model}") String embeddingModel) {
         this.repository = repository;
         this.fileStorage = fileStorage;
+        this.ocrPages = ocrPages;
         this.embeddingModel = embeddingModel;
     }
 
@@ -44,6 +47,7 @@ public class KnowledgeBaseService {
         get(id);
         repository.delete(id);
         fileStorage.deleteKnowledgeBase(id);
+        ocrPages.deleteOrphans();
     }
 
     private static String requireName(String name) {

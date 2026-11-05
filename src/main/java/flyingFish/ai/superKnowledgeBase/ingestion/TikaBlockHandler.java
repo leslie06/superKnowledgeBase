@@ -48,6 +48,11 @@ class TikaBlockHandler extends DefaultHandler {
         return blocks;
     }
 
+    /** 物理单元数。PDF 没有文字的扫描页也会输出 div.page，所以这就是总页数，单元序号即页码 */
+    int units() {
+        return unitCounter;
+    }
+
     @Override
     public void startElement(String uri, String localName, String qName, Attributes atts) {
         String name = name(localName, qName);

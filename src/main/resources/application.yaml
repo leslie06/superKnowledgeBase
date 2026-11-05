@@ -49,6 +49,15 @@ skb:
     target-chars: 600
     max-chars: 1000
     overlap-chars: 100
+  ocr:
+    # 扫描版 PDF 的文字识别（苹果 Vision，仅 macOS）。需先编译：swiftc -O scripts/ocr/vision_ocr.swift -o scripts/ocr/vision-ocr
+    # 命令不存在时跳过识别，扫描页取不到文字。识别结果按文件内容缓存在 ocr_page 表，重新处理时不会重复识别
+    enabled: true
+    command: scripts/ocr/vision-ocr
+    # 渲染成图片的分辨率，扫描书 200 已足够；实测约 0.6~0.9 秒一页
+    dpi: 200
+    # 文字层少于这么多个字（不含空白）的页视为扫描页
+    min-page-chars: 20
   retrieval:
     top-k: 6
     # 余弦相似度低于此值、且没有精确命中问题中编号的片段视为不相关（按 scripts/eval 评测结果调整）
