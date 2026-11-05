@@ -6,10 +6,15 @@
 
     python3 scripts/import_dir.py --kb-id 7 --dir ~/资料 --dry-run         # 只扫描，统计文件类型，不上传
     python3 scripts/import_dir.py --kb-id 7 --dir ~/资料 --out report.csv  # 上传、等待处理完成、输出报告
+    python3 scripts/import_dir.py --kb-id 7 --dir ~/资料 --delete-missing  # 同步：另外删除目录里已经不存在的文档
 
 上传走 /api/knowledge-bases/{kbId}/documents，并带上文件的相对路径（以所选目录名开头，与页面上选择文件夹一致）。后端按 SHA-256 去重，所以重复运行是安全的：已导入的文件记为"已存在"，
 不会重复处理，这时脚本相当于重新生成一次报告。中途按 Ctrl-C 退出不影响后端继续处理，之后重新运行同一命令即可看到结果。
 --retry-failed 会对之前处理失败的文件重新处理（例如改进解析之后）。
+
+同步：路径相同但内容有变化的文件，后端会替换旧版本并重新处理（结果为"已更新"），所以修改过的文件重新运行即可更新。
+知识库里路径以本目录名开头、但目录里已经没有的文档会列出来；加 --delete-missing 时删除它们。
+本次上传中内容已存在的文档（文件只是移动或改名）不算已不存在。定时运行带 --delete-missing 的命令即可让知识库跟随目录自动同步。
 
 报告内容：按文件类型统计成功 / 失败 / 片段数；失败原因归类；文字疑似过少的文件（扫描件、以图片为主的 PDF/PPT）；
 处理吞吐（文档/分钟、片段/分钟）。--out 写出逐个文件的明细 CSV。
@@ -43,7 +48,7 @@ class Item:
     rel: str
     kind: str
     size: int
-    result: str = ""        # 新增 / 已存在 / 已跳过 / 上传失败
+    result: str = ""        # 新增 / 已更新 / 已存在 / 已跳过 / 上传失败
     message: str = ""
     doc_id: int | None = None
     status: str = ""
@@ -104,7 +109,7 @@ def upload(api: str, kb_id: int, item: Item, root_name: str):
         item.result, item.message = "上传失败", str(e)
         return
     item.doc_id, item.message = result.get("documentId"), result.get("message") or ""
-    item.result = {"ACCEPTED": "新增", "DUPLICATE": "已存在"}.get(result["status"], "上传失败")
+    item.result = {"ACCEPTED": "新增", "UPDATED": "已更新", "DUPLICATE": "已存在"}.get(result["status"], "上传失败")
 
 
 def fetch_documents(api: str, kb_id: int) -> dict[int, dict]:
@@ -177,7 +182,7 @@ def print_report(items: list[Item], elapsed: float, new_chunks: int):
     print()
     print("=" * 72)
     print(f"导入报告：{len(items)} 个文件对应 {len(imported)} 个文档；新增 {sum(i.result == '新增' for i in items)}，"
-          f"已存在 {sum(i.result == '已存在' for i in items)}，上传失败 {sum(i.result == '上传失败' for i in items)}")
+          f"已更新 {sum(i.result == '已更新' for i in items)}，已存在 {sum(i.result == '已存在' for i in items)}，上传失败 {sum(i.result == '上传失败' for i in items)}")
     print("=" * 72)
     print(f"  {'类型':<6} {'文件':>5} {'成功':>5} {'失败':>5} {'片段':>7} {'平均片段':>8}")
     by_kind = defaultdict(list)
@@ -244,6 +249,36 @@ def write_details(path: Path, items: list[Item]):
     print(f"\n逐个文件的明细已写入 {path}")
 
 
+def find_missing(docs: dict[int, dict], root_name: str, present: set[str], keep: set[int]) -> list[dict]:
+    """知识库中路径属于本目录、但目录里已经没有的文档；keep 是本次上传中内容已存在的文档（移动或改名），不算已不存在。"""
+    prefix = root_name + "/"
+    return sorted((d for d in docs.values()
+                   if (d.get("sourcePath") or "").startswith(prefix)
+                   and d["sourcePath"] not in present and d["id"] not in keep),
+                  key=lambda d: d["sourcePath"])
+
+
+def sync_missing(api: str, kb_id: int, missing: list[dict], delete: bool):
+    if not missing:
+        return
+    print(f"\n知识库中有 {len(missing)} 个文档已不在目录里：")
+    for d in missing[:20]:
+        print(f"  {d['sourcePath']}")
+    if len(missing) > 20:
+        print(f"  等 {len(missing)} 个")
+    if not delete:
+        print("  加 --delete-missing 可删除它们（实际导入时，内容在目录里仍然存在的会视为移动或改名，不删除）")
+        return
+    deleted = 0
+    for d in missing:
+        try:
+            http_json("DELETE", f"{api}/documents/{d['id']}")
+            deleted += 1
+        except (RuntimeError, OSError) as e:
+            print(f"  删除失败：{d['sourcePath']}：{e}")
+    print(f"  已删除 {deleted} 个")
+
+
 def main():
     parser = argparse.ArgumentParser(description="目录批量导入知识库")
     parser.add_argument("--kb-id", type=int, required=True, help="知识库 ID")
@@ -252,6 +287,8 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="只扫描统计，不上传")
     parser.add_argument("--no-wait", action="store_true", help="上传后不等待处理完成")
     parser.add_argument("--retry-failed", action="store_true", help="对之前处理失败的已存在文件重新处理")
+    parser.add_argument("--delete-missing", action="store_true",
+                        help="删除知识库中路径属于本目录、但目录里已经没有的文档（不加时只列出）")
     parser.add_argument("--interval", type=float, default=5, help="轮询处理状态的间隔秒数，默认 %(default)s")
     parser.add_argument("--out", type=Path, help="把逐个文件的明细写入 CSV")
     args = parser.parse_args()
@@ -261,10 +298,16 @@ def main():
         parser.error(f"目录不存在：{root}")
     todo, skipped = scan(root)
     print_scan(todo, skipped)
-    if args.dry_run or not todo:
+    api = args.base_url.rstrip("/") + "/api"
+    # 目录里现有的全部文件（含跳过的），路径格式与上传时一致
+    present = {f"{root.name}/{Path(i.rel).as_posix()}" for i in todo + skipped}
+    if args.dry_run:
+        try:
+            sync_missing(api, args.kb_id, find_missing(fetch_documents(api, args.kb_id), root.name, present, set()), False)
+        except (RuntimeError, OSError):
+            pass  # 只扫描时后端可以不运行
         return
 
-    api = args.base_url.rstrip("/") + "/api"
     http_json("GET", f"{api}/knowledge-bases/{args.kb_id}")  # 知识库不存在时尽早报错
     print(f"\n上传到知识库 {args.kb_id}：")
     for n, item in enumerate(todo, 1):
@@ -278,6 +321,10 @@ def main():
         for item in retry:
             http_json("POST", f"{api}/documents/{item.doc_id}/reindex")
         print(f"  重新处理之前失败的文件 {len(retry)} 个")
+
+    keep = {i.doc_id for i in todo if i.result == "已存在" and i.doc_id}
+    sync_missing(api, args.kb_id, find_missing(fetch_documents(api, args.kb_id), root.name, present, keep),
+                 args.delete_missing)
 
     ids = {i.doc_id for i in todo if i.doc_id}
     elapsed, new_chunks = 0.0, 0

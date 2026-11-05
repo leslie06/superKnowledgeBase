@@ -7,8 +7,9 @@ import { formatDuration, formatSize } from '../format'
 import type { KbDocument } from '../types'
 
 /**
- * 上传区：选择或拖入文件 / 文件夹。文件夹先弹出预览（按格式统计、将跳过的文件），确认后分批上传，
- * 进度面板实时显示上传和后台处理（解析、向量化）的进度。处理状态来自父组件轮询的文档列表。
+ * 上传区：选择或拖入文件 / 文件夹。文件夹先弹出预览（按格式统计、将跳过的文件、知识库中已不在文件夹里的文档），
+ * 确认后分批上传，进度面板实时显示上传和后台处理（解析、向量化）的进度。处理状态来自父组件轮询的文档列表。
+ * 路径相同但内容有变化的文件由后端替换旧版本；勾选同步删除时，上传完成后删除文件夹里已经不存在的文档。
  */
 const props = defineProps<{ kbId: number; documents: KbDocument[] }>()
 const emit = defineEmits<{ uploaded: []; showFailed: [] }>()
@@ -44,6 +45,8 @@ interface Plan {
   formats: { label: string; count: number; bytes: number; exts: string }[]
   skipped: { reason: string; count: number; examples: string }[]
   skippedCount: number
+  /** 知识库中属于这个文件夹、但文件夹里已经没有的文档（只选了一个文件夹时才判断） */
+  missing: KbDocument[]
 }
 
 interface Job {
@@ -51,7 +54,10 @@ interface Job {
   total: number
   uploaded: number
   accepted: number
+  updated: number
   duplicates: number
+  /** 同步删除的文档数 */
+  deleted: number
   skipped: number
   /** 未加入的文件及原因（已存在、被拒绝、上传失败） */
   problems: string[]
@@ -66,6 +72,8 @@ const folderInput = ref<HTMLInputElement>()
 const dragging = ref(false)
 const reading = ref(false)
 const plan = ref<Plan | null>(null)
+/** 预览中是否勾选"删除文件夹里已不存在的文档"，默认不勾选，避免误删 */
+const deleteMissing = ref(false)
 const job = ref<Job | null>(null)
 const now = ref(Date.now())
 let clock: number | undefined
@@ -127,19 +135,27 @@ function makePlan(picked: Picked[]): Plan {
     count: paths.length,
     examples: paths.slice(0, SKIP_EXAMPLES).map(strip).join('、') + (paths.length > SKIP_EXAMPLES ? ' 等' : ''),
   })).sort((a, b) => b.count - a.count)
+  // 文件夹里现有的全部文件（含将跳过的），被跳过的文件不算"已不存在"
+  const present = new Set(picked.map((p) => p.path))
+  const root = roots.size === 1 ? [...roots][0] : null
+  const missing = root
+    ? props.documents.filter((d) => d.sourcePath?.startsWith(root + '/') && !present.has(d.sourcePath))
+    : []
   return {
-    name: roots.size === 1 ? [...roots][0] : '所选文件',
+    name: root ?? '所选文件',
     files,
     bytes: files.reduce((sum, { file }) => sum + file.size, 0),
     formats,
     skipped: skippedRows,
     skippedCount: skippedRows.reduce((sum, r) => sum + r.count, 0),
+    missing,
   }
 }
 
 /** 文件夹先预览再导入；单独选的几个文件直接导入 */
 function receive(picked: Picked[]) {
   if (!picked.length) return
+  deleteMissing.value = false
   const p = makePlan(picked)
   if (picked.some((x) => x.path.includes('/'))) plan.value = p
   else start(p)
@@ -208,27 +224,35 @@ function batches(files: Picked[]): Picked[][] {
 
 async function start(p: Plan) {
   plan.value = null
-  if (!p.files.length) {
+  const toDelete = deleteMissing.value ? p.missing : []
+  if (!p.files.length && !toDelete.length) {
     ElMessage.warning('没有可导入的文件')
     return
   }
   job.value = {
-    name: p.name, total: p.files.length, uploaded: 0, accepted: 0, duplicates: 0, skipped: p.skippedCount,
+    name: p.name, total: p.files.length, uploaded: 0, accepted: 0, updated: 0, duplicates: 0, deleted: 0,
+    skipped: p.skippedCount,
     problems: [], docIds: new Set(), uploading: true, startedAt: Date.now(), finishedAt: null,
   }
   const current = job.value
   window.clearInterval(clock)
   clock = window.setInterval(() => (now.value = Date.now()), 1000)
+  /** 本次上传中内容已存在的文档：可能只是移动或改名了，不能当作"已不存在"删掉 */
+  const stillPresent = new Set<number>()
   for (const batch of batches(p.files)) {
     try {
       // 相对路径随文件一起上传，后端记录下来并拼进向量文本；单独选的文件路径就是文件名，后端会忽略
       const results = await api.uploadDocuments(props.kbId, batch.map((p) => p.file), batch.map((p) => p.path))
       for (const r of results) {
-        if (r.status === 'ACCEPTED' && r.documentId != null) {
-          current.accepted++
+        if ((r.status === 'ACCEPTED' || r.status === 'UPDATED') && r.documentId != null) {
+          if (r.status === 'ACCEPTED') current.accepted++
+          else current.updated++
           current.docIds.add(r.documentId)
         } else {
-          if (r.status === 'DUPLICATE') current.duplicates++
+          if (r.status === 'DUPLICATE') {
+            current.duplicates++
+            if (r.documentId != null) stillPresent.add(r.documentId)
+          }
           current.problems.push(`${r.filename}：${r.message}`)
         }
       }
@@ -239,6 +263,16 @@ async function start(p: Plan) {
     current.uploaded += batch.length
     emit('uploaded')
   }
+  for (const doc of toDelete) {
+    if (stillPresent.has(doc.id)) continue
+    try {
+      await api.deleteDocument(doc.id)
+      current.deleted++
+    } catch (e) {
+      current.problems.push(`${doc.sourcePath}：删除失败，${(e as Error).message}`)
+    }
+  }
+  if (toDelete.length) emit('uploaded')
   current.uploading = false
 }
 
@@ -256,7 +290,7 @@ const progress = computed(() => {
   }
   // 刚上传、文档列表还没刷新到的也算处理中
   const done = ready + failed
-  return { ready, failed, chunks, done, processing: j.accepted - done }
+  return { ready, failed, chunks, done, processing: j.accepted + j.updated - done }
 })
 
 const finished = computed(() => !!job.value && !job.value.uploading && progress.value!.processing === 0)
@@ -335,14 +369,15 @@ function close() {
     <div class="import-row">
       <span class="import-label">解析与向量化</span>
       <el-progress
-        :percentage="percent(progress.done, job.accepted)"
+        :percentage="percent(progress.done, job.accepted + job.updated)"
         :show-text="false"
         :status="finished ? (progress.failed ? 'warning' : 'success') : undefined"
       />
-      <span class="import-count">{{ progress.done }} / {{ job.accepted }} · {{ percent(progress.done, job.accepted) }}%</span>
+      <span class="import-count">{{ progress.done }} / {{ job.accepted + job.updated }} · {{ percent(progress.done, job.accepted + job.updated) }}%</span>
     </div>
     <div class="import-summary">
       <span>新增 <b>{{ job.accepted }}</b></span>
+      <span v-if="job.updated">更新 <b>{{ job.updated }}</b></span>
       <span>已就绪 <b>{{ progress.ready }}</b></span>
       <span>处理中 <b>{{ progress.processing }}</b></span>
       <span>
@@ -351,6 +386,7 @@ function close() {
       </span>
       <span>已存在 <b>{{ job.duplicates }}</b></span>
       <span v-if="job.skipped">跳过 <b>{{ job.skipped }}</b></span>
+      <span v-if="job.deleted">删除 <b>{{ job.deleted }}</b></span>
       <span>知识片段 <b>{{ progress.chunks }}</b></span>
     </div>
     <el-collapse v-if="job.problems.length" class="import-problems">
@@ -381,14 +417,23 @@ function close() {
           <el-table-column label="示例" prop="examples" show-overflow-tooltip />
         </el-table>
       </template>
+      <template v-if="plan.missing.length">
+        <div class="plan-subtitle">知识库中有 {{ plan.missing.length }} 个文档已不在这个文件夹里</div>
+        <div class="plan-missing">
+          <div v-for="d in plan.missing.slice(0, 5)" :key="d.id">{{ d.sourcePath }}</div>
+          <div v-if="plan.missing.length > 5">等 {{ plan.missing.length }} 个</div>
+        </div>
+        <el-checkbox v-model="deleteMissing">导入完成后从知识库删除它们（内容在本次导入中仍然存在的，视为移动或改名，不删除）</el-checkbox>
+      </template>
       <p class="plan-hint">
-        与知识库中已有文件内容相同的会在上传时自动跳过。上传完成后在后台解析和向量化，几百个文件可能需要几十分钟，期间可以离开此页面。
+        与知识库中已有文件内容相同的会在上传时自动跳过；路径相同但内容有变化的会替换旧版本并重新处理。上传完成后在后台解析和向量化，几百个文件可能需要几十分钟，期间可以离开此页面。
       </p>
     </template>
     <template #footer>
       <el-button @click="plan = null">取消</el-button>
-      <el-button type="primary" :disabled="!plan?.files.length" @click="plan && start(plan)">
-        开始导入 {{ plan?.files.length }} 个文件
+      <el-button type="primary" :disabled="!plan?.files.length && !(deleteMissing && plan?.missing.length)"
+                 @click="plan && start(plan)">
+        开始导入 {{ plan?.files.length }} 个文件<template v-if="deleteMissing && plan?.missing.length">，删除 {{ plan.missing.length }} 个</template>
       </el-button>
     </template>
   </el-dialog>

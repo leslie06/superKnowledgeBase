@@ -898,3 +898,12 @@ a:hover {
   justify-content: flex-end;
   margin-top: 8px;
 }
+
+.plan-missing {
+  max-height: 120px;
+  overflow: auto;
+  margin-bottom: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  word-break: break-all;
+}

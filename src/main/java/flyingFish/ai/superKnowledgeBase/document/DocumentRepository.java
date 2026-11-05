@@ -29,6 +29,30 @@ public class DocumentRepository {
                 .params(kbId, sha256).query(Document.class).optional();
     }
 
+    /**
+     * 同一来源的文档：文件夹导入的按相对路径，单独上传的（没有路径）按文件名。
+     * 早期没有替换旧版本时可能留下多个，取最新的一个。
+     */
+    public Optional<Document> findBySource(long kbId, String sourcePath, String filename) {
+        return (sourcePath != null
+                ? jdbc.sql("SELECT * FROM document WHERE kb_id = ? AND source_path = ? ORDER BY id DESC LIMIT 1")
+                .params(kbId, sourcePath)
+                : jdbc.sql("SELECT * FROM document WHERE kb_id = ? AND source_path IS NULL AND filename = ? ORDER BY id DESC LIMIT 1")
+                .params(kbId, filename))
+                .query(Document.class).optional();
+    }
+
+    /** 换成新版本的文件并重新排队处理；旧的片段保留到新版本处理完成时一并替换 */
+    public void replaceFile(long id, String filename, String filePath, String sha256, String mimeType, long size) {
+        jdbc.sql("""
+                        UPDATE document SET filename = ?, file_path = ?, sha256 = ?, mime_type = ?, size_bytes = ?,
+                                            status = ?, error_msg = NULL, updated_at = now()
+                        WHERE id = ?
+                        """)
+                .params(filename, filePath, sha256, mimeType, size, DocumentStatus.PENDING.name(), id)
+                .update();
+    }
+
     public List<Long> findIdsByStatus(List<String> statuses) {
         return jdbc.sql("SELECT id FROM document WHERE status IN (:statuses) ORDER BY id")
                 .param("statuses", statuses).query(Long.class).list();

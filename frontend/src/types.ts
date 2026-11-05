@@ -30,7 +30,8 @@ export interface KbDocument {
 
 export interface UploadResult {
   filename: string
-  status: 'ACCEPTED' | 'DUPLICATE' | 'REJECTED'
+  /** UPDATED：路径（单独上传时为文件名）相同但内容有变化，替换了旧版本 */
+  status: 'ACCEPTED' | 'UPDATED' | 'DUPLICATE' | 'REJECTED'
   documentId: number | null
   message: string
 }
