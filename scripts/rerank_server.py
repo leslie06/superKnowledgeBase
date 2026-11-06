@@ -52,12 +52,24 @@ class Reranker:
         # GPU / MPS 上并发推理没有收益，还可能出错，串行处理
         self.lock = threading.Lock()
 
+    def release_cache(self):
+        """
+        归还推理时缓存的显存。PyTorch 用过的显存不还给系统，留着下次复用；每批片段长度不同，缓存越积越大，
+        连续运行一天后 MPS 缓存涨到 14GB，16GB 内存的 Mac 上只能换出到磁盘，闲置后第一次精排要 10~25 秒。
+        释放后每次推理多花几毫秒重新分配。
+        """
+        if self.device == "mps":
+            torch.mps.empty_cache()
+        elif self.device == "cuda":
+            torch.cuda.empty_cache()
+
     def rerank(self, query: str, texts: list[str]) -> list[dict]:
         if not texts:
             return []
         with self.lock:
             scores = self.model.predict([(query, t) for t in texts], batch_size=self.batch_size,
                                         activation_fn=torch.nn.Sigmoid(), show_progress_bar=False)
+            self.release_cache()
         ranked = sorted(range(len(texts)), key=lambda i: scores[i], reverse=True)
         return [{"index": i, "score": float(scores[i])} for i in ranked]
 
