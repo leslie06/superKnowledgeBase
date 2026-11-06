@@ -1,5 +1,6 @@
 package flyingFish.ai.superKnowledgeBase.chat;
 
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import flyingFish.ai.superKnowledgeBase.retrieval.SearchScope;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Repository;
@@ -10,6 +11,7 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.time.OffsetDateTime;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 @Repository
@@ -17,6 +19,11 @@ public class ConversationRepository {
 
     private static final TypeReference<List<Citation>> CITATIONS = new TypeReference<>() {
     };
+
+    /** retrieval_trace 中只取耗时 */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    private record TraceTimings(Map<String, Long> timings) {
+    }
 
     private final JdbcClient jdbc;
     private final JsonMapper jsonMapper;
@@ -124,11 +131,19 @@ public class ConversationRepository {
                 rs.getString("content"), parseCitations(rs.getString("citations")),
                 verification == null ? null : jsonMapper.readValue(verification, Verification.class),
                 rating == null ? null : new Feedback(rating, rs.getString("feedback_reason"), rs.getString("feedback_note")),
-                rs.getObject("created_at", OffsetDateTime.class));
+                parseTimings(rs.getString("retrieval_trace")), rs.getObject("created_at", OffsetDateTime.class));
     }
 
     private String toJson(Object value) {
         return value == null ? null : jsonMapper.writeValueAsString(value);
+    }
+
+    private Map<String, Long> parseTimings(String trace) {
+        if (trace == null) {
+            return Map.of();
+        }
+        Map<String, Long> timings = jsonMapper.readValue(trace, TraceTimings.class).timings();
+        return timings == null ? Map.of() : timings;
     }
 
     private List<Citation> parseCitations(String json) {

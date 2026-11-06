@@ -129,8 +129,9 @@ async function send(text = question.value) {
         answer.content += t
         scrollToBottom()
       },
-      onDone: (messageId) => {
+      onDone: (messageId, timings) => {
         answer.id = messageId
+        answer.timings = timings
         // 回答已保存，之后的核对在后台进行，不妨碍继续提问
         answer.streaming = false
         answer.verifying = true
@@ -176,6 +177,27 @@ function scrollToBottom(force = false) {
     const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120
     if (force || nearBottom) el.scrollTop = el.scrollHeight
   })
+}
+
+/** 检索（改写 + 召回与精排）超过这个时长时标出来，通常是精排服务被换出到磁盘 */
+const SLOW_RETRIEVAL_MS = 15000
+
+function sec(ms: number | undefined) {
+  return ms == null ? '-' : (ms / 1000).toFixed(1)
+}
+
+function retrievalMs(m: ChatMessage) {
+  const t = m.timings
+  return t && (t.rewriteMs != null || t.retrieveMs != null) ? (t.rewriteMs ?? 0) + (t.retrieveMs ?? 0) : null
+}
+
+/** 例如"检索 5.5 秒（改写 1.0 · 召回与精排 4.5）· 首字 1.1 秒 · 生成完成 6.2 秒" */
+function timingText(m: ChatMessage) {
+  const t = m.timings!
+  const parts = [`检索 ${sec(retrievalMs(m)!)} 秒（改写 ${sec(t.rewriteMs)} · 召回与精排 ${sec(t.retrieveMs)}）`]
+  if (t.firstTokenMs != null) parts.push(`首字 ${sec(t.firstTokenMs)} 秒`)
+  if (t.answerMs != null) parts.push(`生成完成 ${sec(t.answerMs)} 秒`)
+  return parts.join(' · ')
 }
 
 /** 再点一次同一个按钮取消评价；"没用"先选原因 */
@@ -318,6 +340,10 @@ async function onConversationCommand(command: string, conv: Conversation) {
               <button :class="{ active: m.feedback?.rating === 'DOWN' }" @click="rate(m, 'DOWN')">
                 👎 没用<template v-if="m.feedback?.rating === 'DOWN' && m.feedback.reason">：{{ FEEDBACK_REASONS[m.feedback.reason] }}</template>
               </button>
+              <span v-if="retrievalMs(m) != null" class="answer-timing" :class="{ slow: retrievalMs(m)! > SLOW_RETRIEVAL_MS }"
+                    title="检索 = 查询改写 + 召回与精排；首字和生成完成从开始生成算起">
+                {{ timingText(m) }}
+              </span>
             </div>
           </div>
         </div>

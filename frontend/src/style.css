@@ -1047,3 +1047,15 @@ a:hover {
 .full {
   width: 100%;
 }
+
+.answer-timing {
+  margin-left: auto;
+  align-self: center;
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.answer-timing.slow {
+  color: #c27c0e;
+}

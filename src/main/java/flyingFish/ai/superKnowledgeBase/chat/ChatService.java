@@ -34,7 +34,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * RAG 问答：查询改写（{@link QueryRewriter}） → 检索 → 扩展相邻片段（{@link Retriever#expand}）→ 组装带编号的参考资料
  * → LLM 流式生成（要求标注 [n] 引用）。
  * <p>
- * SSE 事件：citations（检索到的引用）→ delta（增量文本）* → done（消息 id）→ verification（回答核对结果，
+ * SSE 事件：citations（检索到的引用）→ delta（增量文本）* → done（消息 id 和各环节耗时）→ verification（回答核对结果，
  * 开启 skb.chat.verify-answers 且核对成功时才有）；出错时发送 error。
  */
 @Service
@@ -256,7 +256,7 @@ public class ChatService {
             Mono<Long> saved = Mono.fromCallable(() -> saveAssistantMessage(chat, answer.toString()))
                     .subscribeOn(Schedulers.boundedElastic())
                     .cache();
-            Flux<ServerSentEvent<String>> done = saved.map(id -> event("done", Map.of("messageId", id))).flux();
+            Flux<ServerSentEvent<String>> done = saved.map(id -> doneEvent(id, chat)).flux();
             return verifyAnswers ? Flux.concat(done, verify(chat, answer.toString(), saved)) : done;
         }));
     }
@@ -282,8 +282,13 @@ public class ChatService {
     private Flux<ServerSentEvent<String>> saveAnswer(PreparedChat chat, String answer) {
         return Mono.fromCallable(() -> saveAssistantMessage(chat, answer))
                 .subscribeOn(Schedulers.boundedElastic())
-                .map(id -> event("done", Map.of("messageId", id)))
+                .map(id -> doneEvent(id, chat))
                 .flux();
+    }
+
+    /** done 事件带上各环节耗时，前端显示在回答下方 */
+    private ServerSentEvent<String> doneEvent(long messageId, PreparedChat chat) {
+        return event("done", Map.of("messageId", messageId, "timings", chat.timings()));
     }
 
     private long saveAssistantMessage(PreparedChat chat, String answer) {

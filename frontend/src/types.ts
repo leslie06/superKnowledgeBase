@@ -126,6 +126,8 @@ export interface ChatMessage {
   /** 没有核对时为 null（未开启、无命中直接拒答、停止生成或核对失败） */
   verification?: AnswerVerification | null
   feedback?: Feedback | null
+  /** 各环节耗时（毫秒）：rewriteMs 查询改写、retrieveMs 召回与精排、firstTokenMs 首字、answerMs 生成完成 */
+  timings?: Record<string, number>
   streaming?: boolean
   /** 回答已生成，正在核对 */
   verifying?: boolean
