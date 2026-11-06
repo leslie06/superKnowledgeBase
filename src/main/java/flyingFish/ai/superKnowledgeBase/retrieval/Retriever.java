@@ -19,6 +19,9 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -87,6 +90,9 @@ public class Retriever {
     private final int efSearch;
     private final boolean rerankEnabled;
     private final int rerankCandidates;
+    private final int aggregateTopK;
+    private final int subQueryRerankCandidates;
+    private final ExecutorService aggregateExecutor = Executors.newVirtualThreadPerTaskExecutor();
     private final double rerankMinScore;
 
     public Retriever(JdbcClient jdbc, EmbeddingModel embeddingModel, RerankClient rerankClient,
@@ -104,15 +110,54 @@ public class Retriever {
         this.efSearch = properties.retrieval().efSearch();
         this.rerankEnabled = properties.rerank().enabled();
         this.rerankCandidates = properties.rerank().candidates();
+        this.aggregateTopK = properties.retrieval().aggregateTopK();
+        this.subQueryRerankCandidates = properties.retrieval().subQueryRerankCandidates();
         this.rerankMinScore = properties.rerank().minScore();
     }
 
     /** 问答用：混合检索后去掉不相关的片段，取前 top-k 个。 */
     public List<RetrievedChunk> retrieve(long kbId, String query, SearchScope scope) {
-        return rank(kbId, query, scope, Mode.HYBRID, candidates, rerankEnabled).stream()
+        return rank(kbId, query, scope, Mode.HYBRID, candidates, rerankEnabled, rerankCandidates).stream()
                 .filter(RetrievedChunk::relevant)
                 .limit(defaultTopK)
                 .toList();
+    }
+
+    /**
+     * 汇总类问题（见 {@link QueryPlanner}）：原问题和每个子问题各检索一次，只留相关片段，轮流从各路取片段合并，
+     * 去重后最多 aggregateTopK 个。轮流取而不是统一按分数排，是为了每个子问题（每个人物、每类情形）都有资料入选：
+     * 按分数排时，分数普遍偏高的一路会占满名额。子问题只精排 subQueryRerankCandidates 个，控制总耗时。
+     */
+    public List<RetrievedChunk> retrieveAggregate(long kbId, String query, List<String> subQueries, SearchScope scope) {
+        // 各路并行：精排服务一次只处理一个请求，但向量化和数据库查询可以和其他路的精排重叠
+        List<CompletableFuture<List<RetrievedChunk>>> futures = new ArrayList<>();
+        futures.add(CompletableFuture.supplyAsync(
+                () -> relevant(rank(kbId, query, scope, Mode.HYBRID, candidates, rerankEnabled, rerankCandidates)),
+                aggregateExecutor));
+        for (String subQuery : subQueries) {
+            futures.add(CompletableFuture.supplyAsync(() -> relevant(rank(kbId, subQuery, scope, Mode.HYBRID, candidates,
+                    rerankEnabled, subQueryRerankCandidates)), aggregateExecutor));
+        }
+        List<List<RetrievedChunk>> routes = futures.stream().map(CompletableFuture::join).toList();
+        return dropDuplicates(interleave(routes)).stream().limit(aggregateTopK).toList();
+    }
+
+    private static List<RetrievedChunk> relevant(List<RetrievedChunk> ranked) {
+        return ranked.stream().filter(RetrievedChunk::relevant).toList();
+    }
+
+    /** 依次取每一路的第 1 个、再依次取第 2 个……，同一片段只保留第一次出现 */
+    static List<RetrievedChunk> interleave(List<List<RetrievedChunk>> routes) {
+        Map<Long, RetrievedChunk> merged = new LinkedHashMap<>();
+        int depth = routes.stream().mapToInt(List::size).max().orElse(0);
+        for (int i = 0; i < depth; i++) {
+            for (List<RetrievedChunk> route : routes) {
+                if (i < route.size()) {
+                    merged.putIfAbsent(route.get(i).chunkId(), route.get(i));
+                }
+            }
+        }
+        return new ArrayList<>(merged.values());
     }
 
     /**
@@ -122,16 +167,19 @@ public class Retriever {
      */
     public List<RetrievedChunk> search(long kbId, String query, SearchScope scope, int topK, Mode mode, Boolean rerank) {
         boolean useRerank = mode == Mode.HYBRID && (rerank == null ? rerankEnabled : rerank);
-        return rank(kbId, query, scope, mode, Math.max(candidates, topK), useRerank).stream().limit(topK).toList();
+        return rank(kbId, query, scope, mode, Math.max(candidates, topK), useRerank, rerankCandidates).stream()
+                .limit(topK).toList();
     }
 
+    /** @param rerankLimit 送去精排的片段数 */
     private List<RetrievedChunk> rank(long kbId, String query, SearchScope scope, Mode mode, int poolSize,
-                                      boolean rerank) {
+                                      boolean rerank, int rerankLimit) {
         long start = System.nanoTime();
         List<RetrievedChunk> fused = fuse(kbId, query, scope, mode, poolSize);
         long fusedAt = System.nanoTime();
         // 精排是一次 HTTP 调用，放在数据库事务之外，避免长时间占用连接
-        List<RetrievedChunk> result = dropDuplicates(rerank && !fused.isEmpty() ? rerank(query, fused) : fused);
+        List<RetrievedChunk> result = dropDuplicates(
+                rerank && !fused.isEmpty() ? rerank(query, fused, rerankLimit) : fused);
         long end = System.nanoTime();
         log.info("检索耗时 {} ms：召回 {} ms，精排 {} ms，{} 个片段", (end - start) / 1_000_000,
                 (fusedAt - start) / 1_000_000, (end - fusedAt) / 1_000_000, result.size());
@@ -186,8 +234,8 @@ public class Retriever {
      * 也能识别"有相关章节但没有答案"的片段。精排范围之外的片段保持 RRF 顺序，只有精确命中的仍视为相关。
      * 服务不可用时退回 RRF 排序和余弦阈值，问答不受影响。
      */
-    private List<RetrievedChunk> rerank(String query, List<RetrievedChunk> fused) {
-        List<RetrievedChunk> head = rerankPool(fused, rerankCandidates, KEYWORD_RERANK_GUARANTEE);
+    private List<RetrievedChunk> rerank(String query, List<RetrievedChunk> fused, int rerankLimit) {
+        List<RetrievedChunk> head = rerankPool(fused, rerankLimit, KEYWORD_RERANK_GUARANTEE);
         double[] scores;
         try {
             scores = rerankClient.score(query, head.stream().map(Retriever::rerankText).toList());

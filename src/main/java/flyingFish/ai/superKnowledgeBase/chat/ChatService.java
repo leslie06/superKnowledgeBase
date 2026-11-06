@@ -3,6 +3,7 @@ package flyingFish.ai.superKnowledgeBase.chat;
 import flyingFish.ai.superKnowledgeBase.common.NotFoundException;
 import flyingFish.ai.superKnowledgeBase.common.SkbProperties;
 import flyingFish.ai.superKnowledgeBase.kb.KnowledgeBaseService;
+import flyingFish.ai.superKnowledgeBase.retrieval.QueryPlanner;
 import flyingFish.ai.superKnowledgeBase.retrieval.QueryRewriter;
 import flyingFish.ai.superKnowledgeBase.retrieval.RetrievedChunk;
 import flyingFish.ai.superKnowledgeBase.retrieval.Retriever;
@@ -27,11 +28,15 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * RAG 问答：查询改写（{@link QueryRewriter}） → 检索 → 扩展相邻片段（{@link Retriever#expand}）→ 组装带编号的参考资料
+ * RAG 问答：查询改写（{@link QueryRewriter}）与问题规划（{@link QueryPlanner}）并行 → 检索（汇总类问题拆成子问题多路检索）
+ * → 扩展相邻片段（{@link Retriever#expand}）→ 组装带编号的参考资料
  * → LLM 流式生成（要求标注 [n] 引用）。
  * <p>
  * SSE 事件：citations（检索到的引用）→ delta（增量文本）* → done（消息 id 和各环节耗时）→ verification（回答核对结果，
@@ -61,30 +66,41 @@ public class ChatService {
             4. 用中文回答，先给出结论，再展开说明；内容较多时使用 Markdown 列表或表格。
             """;
 
+    /** 汇总类问题附在参考资料后面的说明：资料是多路检索合起来的，可能只覆盖一部分 */
+    private static final String AGGREGATE_HINT = """
+            【说明】这个问题需要汇总多处资料，以上参考资料来自几次检索。请逐项整理资料中涉及的内容，分别标注来源；
+            资料只覆盖了一部分时，在回答中说明"以下根据检索到的资料整理，可能不完整"，资料中没有的项不要自行补充。
+
+            """;
+
     /**
      * @param hits    检索命中的片段及分数，写入 retrieval_trace 便于排查 bad case
      * @param timings 各环节耗时（毫秒），同样写入 retrieval_trace，用于排查"回答慢"
      */
     private record PreparedChat(Conversation conversation, List<ChatMessage> history, String question,
-                                String searchQuery, List<Citation> citations, List<Map<String, Object>> hits,
-                                Map<String, Long> timings) {
+                                String searchQuery, QueryPlanner.Plan plan, List<Citation> citations,
+                                List<Map<String, Object>> hits, Map<String, Long> timings) {
     }
 
     private final ConversationRepository conversations;
     private final KnowledgeBaseService knowledgeBaseService;
     private final Retriever retriever;
     private final QueryRewriter queryRewriter;
+    private final QueryPlanner queryPlanner;
+    private final ExecutorService planExecutor = Executors.newVirtualThreadPerTaskExecutor();
     private final AnswerVerifier answerVerifier;
     private final ChatClient chatClient;
     private final JsonMapper jsonMapper;
     private final int historyMessages;
     private final int maxContextChars;
+    private final int aggregateContextChars;
     private final int expandChars;
     private final boolean verifyAnswers;
     private final boolean apiKeyConfigured;
 
     public ChatService(ConversationRepository conversations, KnowledgeBaseService knowledgeBaseService,
-                       Retriever retriever, QueryRewriter queryRewriter, AnswerVerifier answerVerifier,
+                       Retriever retriever, QueryRewriter queryRewriter, QueryPlanner queryPlanner,
+                       AnswerVerifier answerVerifier,
                        ChatClient.Builder chatClientBuilder,
                        JsonMapper jsonMapper,
                        SkbProperties properties, @Value("${spring.ai.deepseek.api-key:}") String apiKey) {
@@ -92,11 +108,13 @@ public class ChatService {
         this.knowledgeBaseService = knowledgeBaseService;
         this.retriever = retriever;
         this.queryRewriter = queryRewriter;
+        this.queryPlanner = queryPlanner;
         this.answerVerifier = answerVerifier;
         this.chatClient = chatClientBuilder.build();
         this.jsonMapper = jsonMapper;
         this.historyMessages = properties.chat().historyMessages();
         this.maxContextChars = properties.chat().maxContextChars();
+        this.aggregateContextChars = properties.chat().aggregateContextChars();
         this.expandChars = properties.chat().expandChars();
         this.verifyAnswers = properties.chat().verifyAnswers();
         this.apiKeyConfigured = StringUtils.hasText(apiKey) && !NO_API_KEY.equals(apiKey) && !"sk-xxxx".equals(apiKey);
@@ -201,17 +219,24 @@ public class ChatService {
                 .map(m -> new QueryRewriter.Turn(ChatMessage.USER.equals(m.role()), m.content()))
                 .toList();
         long start = System.nanoTime();
+        // 问题规划和查询改写各是一次 LLM 调用，并行进行，普通问题的耗时不变
+        CompletableFuture<QueryPlanner.Plan> planning =
+                CompletableFuture.supplyAsync(() -> queryPlanner.plan(turns, question), planExecutor);
         String searchQuery = queryRewriter.searchQuery(turns, question);
+        QueryPlanner.Plan plan = planning.join();
         long rewrittenAt = System.nanoTime();
-        List<RetrievedChunk> chunks = retriever.retrieve(conversation.kbId(), searchQuery, conversation.scope());
+        List<RetrievedChunk> chunks = plan.aggregate()
+                ? retriever.retrieveAggregate(conversation.kbId(), searchQuery, plan.subQueries(), conversation.scope())
+                : retriever.retrieve(conversation.kbId(), searchQuery, conversation.scope());
         // 扩展后相邻的命中片段会并成一条，trace 仍按原始命中记录
         List<RetrievedChunk> context = retriever.expand(chunks, expandChars);
         Map<String, Long> timings = new LinkedHashMap<>();
         timings.put("rewriteMs", (rewrittenAt - start) / 1_000_000);
         timings.put("retrieveMs", (System.nanoTime() - rewrittenAt) / 1_000_000);
-        log.info("问答准备完成：查询改写 {} ms，检索 {} ms", timings.get("rewriteMs"), timings.get("retrieveMs"));
-        return new PreparedChat(conversation, history, question, searchQuery, toCitations(context), trace(chunks),
-                timings);
+        log.info("问答准备完成：查询改写 {} ms，检索 {} ms{}", timings.get("rewriteMs"), timings.get("retrieveMs"),
+                plan.aggregate() ? "（汇总类问题，" + plan.subQueries().size() + " 个子问题）" : "");
+        return new PreparedChat(conversation, history, question, searchQuery, plan,
+                toCitations(context, plan.aggregate() ? aggregateContextChars : maxContextChars), trace(chunks), timings);
     }
 
     private Flux<ServerSentEvent<String>> answer(PreparedChat chat) {
@@ -288,7 +313,8 @@ public class ChatService {
 
     /** done 事件带上各环节耗时，前端显示在回答下方 */
     private ServerSentEvent<String> doneEvent(long messageId, PreparedChat chat) {
-        return event("done", Map.of("messageId", messageId, "timings", chat.timings()));
+        return event("done", Map.of("messageId", messageId, "timings", chat.timings(),
+                "subQueries", chat.plan().subQueries()));
     }
 
     private long saveAssistantMessage(PreparedChat chat, String answer) {
@@ -296,6 +322,9 @@ public class ChatService {
         trace.put("searchQuery", chat.searchQuery());
         if (!chat.conversation().scope().isAll()) {
             trace.put("scope", chat.conversation().scope());
+        }
+        if (chat.plan().aggregate()) {
+            trace.put("subQueries", chat.plan().subQueries());
         }
         trace.put("hits", chat.hits());
         trace.put("timings", chat.timings());
@@ -316,7 +345,7 @@ public class ChatService {
     }
 
     /** 按相关度从高到低放入上下文，超过字符预算即停止。 */
-    private List<Citation> toCitations(List<RetrievedChunk> chunks) {
+    private static List<Citation> toCitations(List<RetrievedChunk> chunks, int maxContextChars) {
         List<Citation> citations = new ArrayList<>();
         int used = 0;
         for (RetrievedChunk c : chunks) {
@@ -349,6 +378,9 @@ public class ChatService {
                 sb.append(" ｜ ").append(c.location());
             }
             sb.append('\n').append(c.content()).append("\n\n");
+        }
+        if (chat.plan().aggregate()) {
+            sb.append(AGGREGATE_HINT);
         }
         sb.append("【问题】\n").append(chat.question());
         return sb.toString();

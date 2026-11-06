@@ -66,8 +66,9 @@ public class InsightService {
                       String snippet, Double score, Double rerankScore) {
     }
 
+    /** @param subQueries 汇总类问题拆出的子问题，普通问题为空 */
     public record Case(Long messageId, Long conversationId, OffsetDateTime createdAt, String question, String answer,
-                       String searchQuery, SearchScope scope, List<Hit> hits, Map<String, Long> timings,
+                       String searchQuery, List<String> subQueries, SearchScope scope, List<Hit> hits, Map<String, Long> timings,
                        Verification verification, Feedback feedback, Set<Flag> flags) {
     }
 
@@ -75,7 +76,7 @@ public class InsightService {
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)
-    record Trace(String searchQuery, List<TraceHit> hits, Map<String, Long> timings) {
+    record Trace(String searchQuery, List<String> subQueries, List<TraceHit> hits, Map<String, Long> timings) {
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)
@@ -109,7 +110,7 @@ public class InsightService {
 
     private Case toCase(AnswerRow row) {
         List<Citation> citations = row.citations() == null ? List.of() : jsonMapper.readValue(row.citations(), CITATIONS);
-        Trace trace = row.trace() == null ? new Trace(null, List.of(), Map.of())
+        Trace trace = row.trace() == null ? new Trace(null, List.of(), List.of(), Map.of())
                 : jsonMapper.readValue(row.trace(), Trace.class);
         List<TraceHit> traceHits = Objects.requireNonNullElse(trace.hits(), List.of());
         Map<String, Long> timings = Objects.requireNonNullElse(trace.timings(), Map.of());
@@ -127,7 +128,8 @@ public class InsightService {
                 : new Feedback(row.feedback(), row.feedbackReason(), row.feedbackNote());
         SearchScope scope = row.scope() == null ? SearchScope.ALL : jsonMapper.readValue(row.scope(), SearchScope.class);
         return new Case(row.messageId(), row.conversationId(), row.createdAt(), row.question(),
-                truncate(row.answer(), MAX_ANSWER_CHARS), trace.searchQuery(), scope, hits, timings, verification,
+                truncate(row.answer(), MAX_ANSWER_CHARS), trace.searchQuery(),
+                Objects.requireNonNullElse(trace.subQueries(), List.of()), scope, hits, timings, verification,
                 feedback, flags(row.answer(), citations, traceHits, timings, verification, feedback));
     }
 

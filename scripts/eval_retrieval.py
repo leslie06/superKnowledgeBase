@@ -10,11 +10,14 @@
     python3 scripts/eval_retrieval.py --kb-id 5 --csv scripts/eval/laws.csv --mode vector   # 只看向量召回
     python3 scripts/eval_retrieval.py --kb-id 5 --csv scripts/eval/laws.csv --rerank off    # 对比不精排的效果
     python3 scripts/eval_retrieval.py --kb-id 5 --csv scripts/eval/laws.csv --rewrite off   # 对比不做查询改写的效果
+    python3 scripts/eval_retrieval.py --kb-id 4 --csv scripts/eval/aggregate_handbook.csv --plan off # 对比汇总类问题不拆分的效果
     python3 scripts/eval_retrieval.py --kb-id 12 --csv scripts/eval/library.csv --scope off # 忽略 scope 列，在整个知识库里检索
     python3 scripts/eval_retrieval.py --kb-id 12 --csv http://localhost:8080/api/knowledge-bases/12/eval-cases.csv
                                                     # 直接读取在"问答分析"页从真实问答中整理出的评测题
 
-默认与问答一致：先由后端调用 LLM 做查询改写（原问题 + 术语改写）再检索，每题多一次 DeepSeek 调用。
+默认与问答一致：先由后端调用 LLM 做查询改写（原问题 + 术语改写）和问题规划再检索，每题多两次 DeepSeek 调用。
+后端判为汇总类问题（列举、对比、全书分析）时，结果是原问题和各子问题多路检索合并后的相关片段，"问答可用"按
+application.yaml 的 aggregate-top-k 计算（普通问题按 top-k），未通过时打印拆出的子问题。
 
 题集 CSV 列（第一行为表头）：
     question         必填，用户问题
@@ -73,6 +76,8 @@ class Outcome:
     case: Case
     results: list[dict]
     search_query: str | None = None  # 后端改写后的检索文本
+    plan: str = "SINGLE"  # 后端判断的问题类型：SINGLE 普通问题 / AGGREGATE 汇总类问题
+    sub_queries: list[str] = field(default_factory=list)
     rank: int | None = None  # 第一个正确片段的排名，从 1 开始
     score: float | None = None  # 第一个正确片段的分数
     error: str | None = None
@@ -103,20 +108,22 @@ def split_alternatives(value: str | None) -> list[str]:
     return [normalize(v) for v in (value or "").split("|") if normalize(v)]
 
 
-def read_retrieval_defaults() -> tuple[int, float]:
-    """从 application.yaml 读取 skb.retrieval.top-k 和 min-score，读不到时用默认值。"""
-    top_k, min_score = 6, 0.5
+def read_retrieval_defaults() -> tuple[int, float, int]:
+    """从 application.yaml 读取 skb.retrieval.top-k、min-score 和 aggregate-top-k，读不到时用默认值。"""
+    top_k, min_score, aggregate_top_k = 6, 0.5, 12
     try:
         text = APPLICATION_YAML.read_text(encoding="utf-8")
         block = re.search(r"^\s+retrieval:\s*\n((?:\s+.*\n?)*)", text, re.MULTILINE)
         if block:
-            if m := re.search(r"top-k:\s*(\d+)", block.group(1)):
+            if m := re.search(r"^\s+top-k:\s*(\d+)", block.group(1), re.MULTILINE):
                 top_k = int(m.group(1))
+            if m := re.search(r"aggregate-top-k:\s*(\d+)", block.group(1)):
+                aggregate_top_k = int(m.group(1))
             if m := re.search(r"min-score:\s*([\d.]+)", block.group(1)):
                 min_score = float(m.group(1))
     except OSError:
         pass
-    return top_k, min_score
+    return top_k, min_score, aggregate_top_k
 
 
 def load_cases(path: Path) -> list[Case]:
@@ -154,14 +161,16 @@ def is_relevant(chunk: dict, min_score: float) -> bool:
 
 
 def search(base_url: str, kb_id: int, query: str, top_k: int, mode: str | None, rerank: str | None,
-           rewrite: str | None, folders: list[str], history: list[list[str]]) -> tuple[list[dict], str | None]:
-    """返回 (检索结果, 改写后的检索文本)"""
+           rewrite: str | None, folders: list[str], history: list[list[str]], plan: str | None) -> tuple[list[dict], dict]:
+    """返回 (检索结果, 响应头中的检索信息：search_query 改写后的检索文本、plan 问题类型、sub_queries 子问题)"""
     url = f"{base_url.rstrip('/')}/api/knowledge-bases/{kb_id}/search"
     payload = {"query": query, "topK": top_k}
     if folders:
         payload["folders"] = folders
     if history:
         payload["history"] = [{"question": q, "answer": a} for q, a in history]
+    if plan:
+        payload["plan"] = plan == "on"
     if mode:
         payload["mode"] = mode
     if rerank:
@@ -171,10 +180,15 @@ def search(base_url: str, kb_id: int, query: str, top_k: int, mode: str | None, 
     body = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(request, timeout=60) as response:
-            search_query = response.headers.get("X-Search-Query")
-            return (json.loads(response.read().decode("utf-8")),
-                    urllib.parse.unquote_plus(search_query) if search_query else None)
+        # 汇总类问题要检索多次，比普通问题慢
+        with urllib.request.urlopen(request, timeout=180) as response:
+            headers = response.headers
+            info = {
+                "search_query": urllib.parse.unquote_plus(headers["X-Search-Query"]) if headers.get("X-Search-Query") else None,
+                "plan": headers.get("X-Plan") or "SINGLE",
+                "sub_queries": [q for q in urllib.parse.unquote_plus(headers.get("X-Sub-Queries") or "").split("\n") if q],
+            }
+            return json.loads(response.read().decode("utf-8")), info
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="replace")
         try:
@@ -194,13 +208,13 @@ def matches(case: Case, chunk: dict) -> bool:
 
 
 def evaluate(case: Case, base_url: str, kb_id: int, top_k: int, mode: str | None, rerank: str | None,
-             rewrite: str | None, scope: bool) -> Outcome:
+             rewrite: str | None, scope: bool, plan: str | None) -> Outcome:
     try:
-        results, search_query = search(base_url, kb_id, case.question, top_k, mode, rerank, rewrite,
-                                       case.scope if scope else [], case.history)
+        results, info = search(base_url, kb_id, case.question, top_k, mode, rerank, rewrite,
+                               case.scope if scope else [], case.history, plan)
     except (RuntimeError, OSError) as e:  # OSError 含 URLError、超时和连接被断开
         return Outcome(case, [], error=str(e))
-    outcome = Outcome(case, results, search_query=search_query)
+    outcome = Outcome(case, results, search_query=info["search_query"], plan=info["plan"], sub_queries=info["sub_queries"])
     if case.answerable:
         for rank, chunk in enumerate(results, start=1):
             if matches(case, chunk):
@@ -232,8 +246,10 @@ def pct(n: int, d: int) -> str:
     return f"{n / d:6.1%}" if d else "   -  "
 
 
-def print_report(outcomes: list[Outcome], top_k: int, retrieval_top_k: int, min_score: float, show: int,
-                 mode: str | None, rerank: str | None, rewrite: str | None, scope: bool):
+def print_report(outcomes: list[Outcome], top_k: int, retrieval_top_k: int, aggregate_top_k: int, min_score: float,
+                 show: int, mode: str | None, rerank: str | None, rewrite: str | None, scope: bool):
+    # 汇总类问题问答时最多用 aggregate_top_k 个片段
+    allowed = lambda o: aggregate_top_k if o.plan == "AGGREGATE" else retrieval_top_k
     answerable = [o for o in outcomes if o.case.answerable and not o.error]
     no_answer = [o for o in outcomes if not o.case.answerable and not o.error]
     errors = [o for o in outcomes if o.error]
@@ -243,6 +259,9 @@ def print_report(outcomes: list[Outcome], top_k: int, retrieval_top_k: int, min_
     reranked = any(c.get("rerankScore") is not None for o in outcomes for c in o.results)
     print(f"参数：mode={mode or 'hybrid（后端默认）'}，rerank={rerank or '后端默认'}（{'已精排' if reranked else '未精排'}），"
           f"rewrite={rewrite or 'on（后端默认）'}，search topK={top_k}，问答 top-k={retrieval_top_k}")
+    aggregated = sum(1 for o in outcomes if o.plan == "AGGREGATE")
+    if aggregated:
+        print(f"问题规划：{aggregated} 题判为汇总类问题，拆成子问题多路检索，问答可用按前 {aggregate_top_k} 个计算")
     scoped = sum(1 for o in outcomes if o.case.scope)
     if scoped:
         print(f"检索范围：{scoped} 题限定了范围，" + ("按 scope 列检索" if scope else "已忽略（--scope off），全部在整个知识库检索"))
@@ -253,7 +272,7 @@ def print_report(outcomes: list[Outcome], top_k: int, retrieval_top_k: int, min_
         hit = lambda k: sum(1 for o in answerable if o.rank and o.rank <= k)
         mrr = sum(1 / o.rank for o in answerable if o.rank) / n
         usable = sum(1 for o in answerable
-                     if (r := o.usable_rank(min_score)) and r <= retrieval_top_k)
+                     if (r := o.usable_rank(min_score)) and r <= allowed(o))
         print("\n【有答案题】")
         for k in sorted({1, 3, retrieval_top_k, top_k}):
             if k <= top_k:
@@ -283,7 +302,7 @@ def print_report(outcomes: list[Outcome], top_k: int, retrieval_top_k: int, min_
             else:
                 print("  两者有重叠，单靠阈值无法完全区分")
 
-    failures = [o for o in answerable if not (r := o.usable_rank(min_score)) or r > retrieval_top_k]
+    failures = [o for o in answerable if not (r := o.usable_rank(min_score)) or r > allowed(o)]
     failures += [o for o in no_answer if not o.rejected(min_score)]
     if failures:
         print(f"\n【未通过的题】（{len(failures)} 道，每题列出前 {show} 条结果）")
@@ -299,6 +318,8 @@ def print_report(outcomes: list[Outcome], top_k: int, retrieval_top_k: int, min_
                 print(f"    对话历史：{' → '.join(q for q, _ in c.history)}")
             if o.search_query and o.search_query != c.question:
                 print(f"    检索文本：{o.search_query.replace(chr(10), ' / ')}")
+            if o.sub_queries:
+                print(f"    子问题：{' | '.join(o.sub_queries)}")
             for i, chunk in enumerate(o.results[:show], start=1):
                 mark = "✓" if c.answerable and matches(c, chunk) else " "
                 flag = "" if is_relevant(chunk, min_score) else "（不相关）"
@@ -342,7 +363,7 @@ def fetch_csv(url: str) -> Path:
 
 
 def main():
-    default_top_k, default_min_score = read_retrieval_defaults()
+    default_top_k, default_min_score, default_aggregate_top_k = read_retrieval_defaults()
     parser = argparse.ArgumentParser(description="知识库检索评测")
     parser.add_argument("--kb-id", type=int, required=True, help="知识库 ID")
     parser.add_argument("--csv", required=True, help="题集 CSV 路径，也可以是后端导出评测题的地址（http 开头）")
@@ -356,6 +377,8 @@ def main():
                         help="召回方式，默认用后端默认的 hybrid；对比单路效果时使用")
     parser.add_argument("--rerank", choices=["on", "off"], help="是否精排，默认按后端配置；只在 hybrid 模式下生效")
     parser.add_argument("--rewrite", choices=["on", "off"], help="是否先做查询改写，默认 on（与问答一致）")
+    parser.add_argument("--plan", choices=["on", "off"],
+                        help="是否做问题规划（汇总类问题拆成子问题多路检索），默认 on（与问答一致）；off 用于对比不拆分的效果")
     parser.add_argument("--scope", choices=["on", "off"], default="on",
                         help="是否按题集的 scope 列限定检索范围，默认 %(default)s；off 用于对比不限定范围的效果")
     parser.add_argument("--show", type=int, default=3, help="未通过的题展示前几条结果，默认 %(default)s")
@@ -369,7 +392,7 @@ def main():
     outcomes = []
     for i, case in enumerate(cases, start=1):
         outcome = evaluate(case, args.base_url, args.kb_id, args.top_k, args.mode, args.rerank, args.rewrite,
-                           args.scope == "on")
+                           args.scope == "on", args.plan)
         outcomes.append(outcome)
         if outcome.error:
             flag = "错误"
@@ -377,10 +400,11 @@ def main():
             flag = f"第{outcome.rank}名" if outcome.rank else "未召回"
         else:
             flag = f"最高分 {outcome.top1_score:.3f}" if outcome.top1_score is not None else "无结果"
-        print(f"[{i}/{len(cases)}] {flag:<12} {case.question}", flush=True)
+        mark = "（汇总）" if outcome.plan == "AGGREGATE" else ""
+        print(f"[{i}/{len(cases)}] {flag:<12} {case.question}{mark}", flush=True)
 
-    print_report(outcomes, args.top_k, args.retrieval_top_k, args.min_score, args.show, args.mode, args.rerank,
-                 args.rewrite, args.scope == "on")
+    print_report(outcomes, args.top_k, args.retrieval_top_k, default_aggregate_top_k, args.min_score, args.show,
+                 args.mode, args.rerank, args.rewrite, args.scope == "on")
     if args.out:
         write_details(args.out, outcomes)
         print(f"逐题明细已写入 {args.out}")

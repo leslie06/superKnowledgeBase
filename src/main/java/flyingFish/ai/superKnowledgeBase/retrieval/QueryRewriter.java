@@ -89,7 +89,8 @@ public class QueryRewriter {
      * @param history 最近的对话历史，按时间顺序；单轮提问时为空
      * @return 用于检索的文本
      */
-    public String searchQuery(List<Turn> history, String question) {
+    /** 交给 LLM 的"对话历史 + 最新问题"，历史中每条消息最多 HISTORY_CHARS 字；查询改写和问题规划共用 */
+    static String dialogue(List<Turn> history, String question) {
         StringBuilder sb = new StringBuilder();
         if (!history.isEmpty()) {
             sb.append("对话历史：\n");
@@ -100,11 +101,15 @@ public class QueryRewriter {
             }
             sb.append('\n');
         }
-        sb.append("最新问题：").append(question);
+        return sb.append("最新问题：").append(question).toString();
+    }
+
+    public String searchQuery(List<Turn> history, String question) {
+        String prompt = dialogue(history, question);
         boolean multiTurn = !history.isEmpty();
         Future<String> call = executor.submit(() -> chatClient.prompt()
                 .system(multiTurn ? MULTI_TURN_PROMPT : SYSTEM_PROMPT)
-                .user(sb.toString())
+                .user(prompt)
                 .options(ChatOptions.builder().temperature(0.0))
                 .call().content());
         try {

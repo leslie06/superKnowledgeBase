@@ -130,6 +130,8 @@ export interface ChatMessage {
   feedback?: Feedback | null
   /** 各环节耗时（毫秒）：rewriteMs 查询改写、retrieveMs 召回与精排、firstTokenMs 首字、answerMs 生成完成 */
   timings?: Record<string, number>
+  /** 汇总类问题拆出的子问题（多步检索），普通问题为空 */
+  subQueries?: string[]
   /** 前端记录：按下发送的时间（毫秒时间戳），用于显示实时耗时 */
   startedAt?: number
   streaming?: boolean
@@ -187,6 +189,8 @@ export interface InsightCase {
   question: string | null
   answer: string
   searchQuery: string | null
+  /** 汇总类问题拆出的子问题，普通问题为空 */
+  subQueries: string[]
   scope: SearchScope
   hits: InsightHit[]
   timings: Record<string, number>

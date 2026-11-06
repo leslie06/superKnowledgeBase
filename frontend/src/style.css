@@ -1048,6 +1048,21 @@ a:hover {
   width: 100%;
 }
 
+.answer-plan {
+  margin-left: auto;
+  align-self: center;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--primary-soft);
+  color: var(--primary);
+  font-size: 12px;
+  cursor: help;
+}
+
+.answer-plan + .answer-timing {
+  margin-left: 8px;
+}
+
 .answer-timing {
   margin-left: auto;
   align-self: center;

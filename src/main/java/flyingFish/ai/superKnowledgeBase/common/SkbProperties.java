@@ -22,9 +22,13 @@ public record SkbProperties(String storageDir, Ingestion ingestion, Chunk chunk,
      * @param keywordWeight 关键词一路在 RRF 中的权重；二字组 BM25 对改写、口语化的问题噪声较大，所以低于向量
      * @param rewriteTimeout 查询改写（同步调用 LLM）的最长等待时间，超时后用原问题检索
      * @param efSearch      向量召回时 HNSW 索引的搜索范围（hnsw.ef_search），越大越接近精确结果；必须明显大于 candidates
+     * @param planQueries   是否先判断问题是否需要汇总多处资料，需要时拆成子问题分别检索（多一次与改写并行的 LLM 调用）
+     * @param aggregateTopK 汇总类问题合并多路检索结果后最多保留的片段数（普通问题是 topK）
+     * @param subQueryRerankCandidates 每个子问题送去精排的片段数，少于 rerank.candidates 以控制多路检索的总耗时
      */
     public record Retrieval(int topK, double minScore, int candidates, int rrfK, double keywordWeight,
-                            Duration rewriteTimeout, int efSearch) {
+                            Duration rewriteTimeout, int efSearch, boolean planQueries, int aggregateTopK,
+                            int subQueryRerankCandidates) {
     }
 
     /**
@@ -42,8 +46,10 @@ public record SkbProperties(String storageDir, Ingestion ingestion, Chunk chunk,
      * @param maxContextChars 参考资料的总字数预算
      * @param expandChars     每条参考资料扩展到的最大字数：把命中片段在同一章节里的前后片段一起交给模型，0 表示不扩展
      * @param verifyAnswers   生成回答后是否再请 LLM 对照参考资料核对（找出无依据内容和引用错误），每个问题多一次调用
+     * @param aggregateContextChars 汇总类问题的参考资料字数预算（普通问题是 maxContextChars）
      */
-    public record Chat(int historyMessages, int maxContextChars, int expandChars, boolean verifyAnswers) {
+    public record Chat(int historyMessages, int maxContextChars, int expandChars, boolean verifyAnswers,
+                       int aggregateContextChars) {
     }
 
     /**

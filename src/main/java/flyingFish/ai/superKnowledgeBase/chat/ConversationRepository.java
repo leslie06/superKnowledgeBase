@@ -20,9 +20,9 @@ public class ConversationRepository {
     private static final TypeReference<List<Citation>> CITATIONS = new TypeReference<>() {
     };
 
-    /** retrieval_trace 中只取耗时 */
+    /** retrieval_trace 中只取耗时和子问题 */
     @JsonIgnoreProperties(ignoreUnknown = true)
-    private record TraceTimings(Map<String, Long> timings) {
+    private record TraceSummary(Map<String, Long> timings, List<String> subQueries) {
     }
 
     private final JdbcClient jdbc;
@@ -127,23 +127,20 @@ public class ConversationRepository {
     private ChatMessage mapMessage(ResultSet rs, int rowNum) throws SQLException {
         String verification = rs.getString("verification");
         String rating = rs.getString("feedback");
+        String traceJson = rs.getString("retrieval_trace");
+        TraceSummary trace = traceJson == null ? new TraceSummary(null, null)
+                : jsonMapper.readValue(traceJson, TraceSummary.class);
         return new ChatMessage(rs.getLong("id"), rs.getLong("conversation_id"), rs.getString("role"),
                 rs.getString("content"), parseCitations(rs.getString("citations")),
                 verification == null ? null : jsonMapper.readValue(verification, Verification.class),
                 rating == null ? null : new Feedback(rating, rs.getString("feedback_reason"), rs.getString("feedback_note")),
-                parseTimings(rs.getString("retrieval_trace")), rs.getObject("created_at", OffsetDateTime.class));
+                trace.timings() == null ? Map.of() : trace.timings(),
+                trace.subQueries() == null ? List.of() : trace.subQueries(),
+                rs.getObject("created_at", OffsetDateTime.class));
     }
 
     private String toJson(Object value) {
         return value == null ? null : jsonMapper.writeValueAsString(value);
-    }
-
-    private Map<String, Long> parseTimings(String trace) {
-        if (trace == null) {
-            return Map.of();
-        }
-        Map<String, Long> timings = jsonMapper.readValue(trace, TraceTimings.class).timings();
-        return timings == null ? Map.of() : timings;
     }
 
     private List<Citation> parseCitations(String json) {

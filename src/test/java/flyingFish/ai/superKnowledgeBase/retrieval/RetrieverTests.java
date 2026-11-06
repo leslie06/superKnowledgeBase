@@ -30,6 +30,16 @@ class RetrieverTests {
     }
 
     @Test
+    void interleaveTakesEachRouteInTurnAndSkipsRepeats() {
+        List<RetrievedChunk> main = List.of(chunk(1, 1, null), chunk(2, 2, null), chunk(3, 3, null));
+        List<RetrievedChunk> first = List.of(chunk(10, 1, null), chunk(1, 2, null));
+        List<RetrievedChunk> second = List.of(chunk(20, 1, null));
+
+        assertThat(Retriever.interleave(List.of(main, first, second))).extracting(RetrievedChunk::chunkId)
+                .containsExactly(1L, 10L, 20L, 2L, 3L);
+    }
+
+    @Test
     void rerankPoolFallsBackToRrfOrderWithoutKeywordHits() {
         List<RetrievedChunk> fused = List.of(chunk(1, 1, null), chunk(2, 2, null), chunk(3, 3, null));
 

@@ -80,6 +80,12 @@ skb:
     # 向量召回时 HNSW 索引的搜索范围（hnsw.ef_search）。pgvector 默认 40，只比 candidates 多一点：
     # 2.6 万个片段的库里，40 时与精确结果的前 30 名可能一个都不重合；200 时完全一致，耗时仍是毫秒级
     ef-search: 200
+    # 汇总类问题（列举、对比、全书分析，如"哪些行为会被直接解除合同""金瓶梅的女性人物形象"）的答案分散在很多片段里，
+    # 一次检索的 top-k 覆盖不全：先判断问题类型（与查询改写并行，不增加普通问题的耗时），需要时拆成 2~6 个子问题并行检索，
+    # 轮流从各路结果中取片段合并，最多 aggregate-top-k 个；每个子问题只精排 sub-query-rerank-candidates 个以控制耗时
+    plan-queries: true
+    aggregate-top-k: 12
+    sub-query-rerank-candidates: 10
   rerank:
     # 交叉编码器精排，需先启动 scripts/rerank_server.py；服务不可用时退回 RRF 排序和上面的 min-score
     enabled: true
@@ -99,3 +105,5 @@ skb:
     # 回答生成后再请 LLM 对照参考资料核对一遍，标出资料中找不到依据的内容和对不上的 [n] 引用；
     # 在回答显示完之后进行（约 3~5 秒），不影响阅读，每个问题多一次 DeepSeek 调用
     verify-answers: true
+    # 汇总类问题的参考资料字数预算，比普通问题大，资料多了回答会慢一些
+    aggregate-context-chars: 24000

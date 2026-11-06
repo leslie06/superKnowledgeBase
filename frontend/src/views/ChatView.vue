@@ -148,9 +148,10 @@ async function send(text = question.value) {
         answer.content += t
         scrollToBottom()
       },
-      onDone: (messageId, timings) => {
+      onDone: (messageId, timings, subQueries) => {
         answer.id = messageId
         answer.timings = timings
+        answer.subQueries = subQueries
         // 回答已保存，之后的核对在后台进行，不妨碍继续提问
         answer.streaming = false
         answer.verifying = true
@@ -368,6 +369,10 @@ async function onConversationCommand(command: string, conv: Conversation) {
               <button :class="{ active: m.feedback?.rating === 'DOWN' }" @click="rate(m, 'DOWN')">
                 👎 没用<template v-if="m.feedback?.rating === 'DOWN' && m.feedback.reason">：{{ FEEDBACK_REASONS[m.feedback.reason] }}</template>
               </button>
+              <span v-if="m.subQueries?.length" class="answer-plan"
+                    :title="`这个问题需要汇总多处资料，拆成以下子问题分别检索：\n${m.subQueries.join('\n')}`">
+                多步检索 · {{ m.subQueries.length }} 个子问题
+              </span>
               <span v-if="retrievalMs(m) != null" class="answer-timing" :class="{ slow: retrievalMs(m)! > SLOW_RETRIEVAL_MS }"
                     title="总计 = 检索 + 生成；检索 = 查询改写 + 召回与精排；首字是从开始生成到出现第一个字，包含在生成里">
                 {{ timingText(m) }}

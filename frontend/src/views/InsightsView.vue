@@ -192,6 +192,10 @@ const evalCommand = computed(() =>
               <dl>
                 <dt>检索查询</dt>
                 <dd class="pre">{{ row.searchQuery || '（没有记录）' }}</dd>
+                <template v-if="row.subQueries.length">
+                  <dt>子问题</dt>
+                  <dd class="pre">{{ row.subQueries.join('\n') }}</dd>
+                </template>
                 <dt v-if="scopeText(row)">检索范围</dt>
                 <dd v-if="scopeText(row)">{{ scopeText(row) }}</dd>
                 <dt>耗时</dt>
