@@ -6,6 +6,7 @@ import flyingFish.ai.superKnowledgeBase.chat.Feedback;
 import flyingFish.ai.superKnowledgeBase.chat.Verification;
 import flyingFish.ai.superKnowledgeBase.insight.InsightRepository.AnswerRow;
 import flyingFish.ai.superKnowledgeBase.kb.KnowledgeBaseService;
+import flyingFish.ai.superKnowledgeBase.retrieval.RetrievalPipeline;
 import flyingFish.ai.superKnowledgeBase.retrieval.SearchScope;
 import org.springframework.stereotype.Service;
 import tools.jackson.core.type.TypeReference;
@@ -46,7 +47,7 @@ public class InsightService {
         VERIFY_ISSUE,
         /** 有命中片段但都没有精排分数：精排服务没启动或超时，退回了 RRF 排序 */
         UNRERANKED,
-        /** 从提问到出第一个字（改写 + 检索 + 首字）超过 SLOW_MS */
+        /** 从提问到出第一个字（改写 + 检索 + 补充检索 + 首字）超过 SLOW_MS */
         SLOW
     }
 
@@ -66,9 +67,13 @@ public class InsightService {
                       String snippet, Double score, Double rerankScore) {
     }
 
-    /** @param subQueries 汇总类问题拆出的子问题，普通问题为空 */
+    /**
+     * @param subQueries 汇总类问题拆出的子问题，普通问题为空
+     * @param followUps  资料不够时的补充检索，没有补查时为空
+     */
     public record Case(Long messageId, Long conversationId, OffsetDateTime createdAt, String question, String answer,
-                       String searchQuery, List<String> subQueries, SearchScope scope, List<Hit> hits, Map<String, Long> timings,
+                       String searchQuery, List<String> subQueries, List<RetrievalPipeline.FollowUp> followUps,
+                       SearchScope scope, List<Hit> hits, Map<String, Long> timings,
                        Verification verification, Feedback feedback, Set<Flag> flags) {
     }
 
@@ -76,7 +81,8 @@ public class InsightService {
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)
-    record Trace(String searchQuery, List<String> subQueries, List<TraceHit> hits, Map<String, Long> timings) {
+    record Trace(String searchQuery, List<String> subQueries, List<RetrievalPipeline.FollowUp> followUps,
+                 List<TraceHit> hits, Map<String, Long> timings) {
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)
@@ -110,7 +116,7 @@ public class InsightService {
 
     private Case toCase(AnswerRow row) {
         List<Citation> citations = row.citations() == null ? List.of() : jsonMapper.readValue(row.citations(), CITATIONS);
-        Trace trace = row.trace() == null ? new Trace(null, List.of(), List.of(), Map.of())
+        Trace trace = row.trace() == null ? new Trace(null, List.of(), List.of(), List.of(), Map.of())
                 : jsonMapper.readValue(row.trace(), Trace.class);
         List<TraceHit> traceHits = Objects.requireNonNullElse(trace.hits(), List.of());
         Map<String, Long> timings = Objects.requireNonNullElse(trace.timings(), Map.of());
@@ -129,7 +135,8 @@ public class InsightService {
         SearchScope scope = row.scope() == null ? SearchScope.ALL : jsonMapper.readValue(row.scope(), SearchScope.class);
         return new Case(row.messageId(), row.conversationId(), row.createdAt(), row.question(),
                 truncate(row.answer(), MAX_ANSWER_CHARS), trace.searchQuery(),
-                Objects.requireNonNullElse(trace.subQueries(), List.of()), scope, hits, timings, verification,
+                Objects.requireNonNullElse(trace.subQueries(), List.of()),
+                Objects.requireNonNullElse(trace.followUps(), List.of()), scope, hits, timings, verification,
                 feedback, flags(row.answer(), citations, traceHits, timings, verification, feedback));
     }
 
@@ -149,7 +156,7 @@ public class InsightService {
             flags.add(Flag.UNRERANKED);
         }
         long waited = timings.getOrDefault("rewriteMs", 0L) + timings.getOrDefault("retrieveMs", 0L)
-                + timings.getOrDefault("firstTokenMs", 0L);
+                + timings.getOrDefault("followUpMs", 0L) + timings.getOrDefault("firstTokenMs", 0L);
         if (waited > SLOW_MS) {
             flags.add(Flag.SLOW);
         }

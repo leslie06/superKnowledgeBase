@@ -120,6 +120,14 @@ export interface Feedback {
   note: string | null
 }
 
+/** 一轮补充检索（迭代检索）：资料不够回答时，缺什么、换了哪些说法去查、补进几个新片段 */
+export interface FollowUp {
+  round: number
+  missing: string | null
+  queries: string[]
+  added: number
+}
+
 export interface ChatMessage {
   id: number | null
   role: 'user' | 'assistant'
@@ -134,6 +142,7 @@ export interface ChatMessage {
   subQueries?: string[]
   /** 整篇交给模型的小文档的文件名 */
   fullTextDocuments?: string[]
+  followUps?: FollowUp[]
   /** 前端记录：按下发送的时间（毫秒时间戳），用于显示实时耗时 */
   startedAt?: number
   streaming?: boolean
@@ -193,6 +202,7 @@ export interface InsightCase {
   searchQuery: string | null
   /** 汇总类问题拆出的子问题，普通问题为空 */
   subQueries: string[]
+  followUps: FollowUp[]
   scope: SearchScope
   hits: InsightHit[]
   timings: Record<string, number>

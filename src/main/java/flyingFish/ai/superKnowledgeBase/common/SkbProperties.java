@@ -25,10 +25,11 @@ public record SkbProperties(String storageDir, Ingestion ingestion, Chunk chunk,
      * @param planQueries   是否先判断问题是否需要汇总多处资料，需要时拆成子问题分别检索（多一次与改写并行的 LLM 调用）
      * @param aggregateTopK 汇总类问题合并多路检索结果后最多保留的片段数（普通问题是 topK）
      * @param subQueryRerankCandidates 每个子问题送去精排的片段数，少于 rerank.candidates 以控制多路检索的总耗时
+     * @param maxFollowUps  迭代检索：资料不够回答时换说法补充检索的最多轮数，0 表示不补查
      */
     public record Retrieval(int topK, double minScore, int candidates, int rrfK, double keywordWeight,
                             Duration rewriteTimeout, int efSearch, boolean planQueries, int aggregateTopK,
-                            int subQueryRerankCandidates) {
+                            int subQueryRerankCandidates, int maxFollowUps) {
     }
 
     /**

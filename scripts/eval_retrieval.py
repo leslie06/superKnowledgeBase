@@ -11,6 +11,7 @@
     python3 scripts/eval_retrieval.py --kb-id 5 --csv scripts/eval/laws.csv --rerank off    # 对比不精排的效果
     python3 scripts/eval_retrieval.py --kb-id 5 --csv scripts/eval/laws.csv --rewrite off   # 对比不做查询改写的效果
     python3 scripts/eval_retrieval.py --kb-id 4 --csv scripts/eval/aggregate_handbook.csv --plan off # 对比汇总类问题不拆分的效果
+    python3 scripts/eval_retrieval.py --kb-id 12 --csv scripts/eval/followup_library.csv --follow-up off # 对比不补充检索的效果
     python3 scripts/eval_retrieval.py --kb-id 12 --csv scripts/eval/library.csv --scope off # 忽略 scope 列，在整个知识库里检索
     python3 scripts/eval_retrieval.py --kb-id 12 --csv http://localhost:8080/api/knowledge-bases/12/eval-cases.csv
                                                     # 直接读取在"问答分析"页从真实问答中整理出的评测题
@@ -77,6 +78,7 @@ class Outcome:
     results: list[dict]
     search_query: str | None = None  # 后端改写后的检索文本
     plan: str = "SINGLE"  # 后端判断的问题类型：SINGLE 普通问题 / AGGREGATE 汇总类问题
+    follow_ups: list[str] = field(default_factory=list)  # 资料不够时补充检索用过的查询
     sub_queries: list[str] = field(default_factory=list)
     rank: int | None = None  # 第一个正确片段的排名，从 1 开始
     score: float | None = None  # 第一个正确片段的分数
@@ -161,7 +163,8 @@ def is_relevant(chunk: dict, min_score: float) -> bool:
 
 
 def search(base_url: str, kb_id: int, query: str, top_k: int, mode: str | None, rerank: str | None,
-           rewrite: str | None, folders: list[str], history: list[list[str]], plan: str | None) -> tuple[list[dict], dict]:
+           rewrite: str | None, folders: list[str], history: list[list[str]], plan: str | None,
+           follow_up: str | None) -> tuple[list[dict], dict]:
     """返回 (检索结果, 响应头中的检索信息：search_query 改写后的检索文本、plan 问题类型、sub_queries 子问题)"""
     url = f"{base_url.rstrip('/')}/api/knowledge-bases/{kb_id}/search"
     payload = {"query": query, "topK": top_k}
@@ -171,6 +174,8 @@ def search(base_url: str, kb_id: int, query: str, top_k: int, mode: str | None, 
         payload["history"] = [{"question": q, "answer": a} for q, a in history]
     if plan:
         payload["plan"] = plan == "on"
+    if follow_up:
+        payload["followUp"] = follow_up == "on"
     if mode:
         payload["mode"] = mode
     if rerank:
@@ -187,6 +192,7 @@ def search(base_url: str, kb_id: int, query: str, top_k: int, mode: str | None, 
                 "search_query": urllib.parse.unquote_plus(headers["X-Search-Query"]) if headers.get("X-Search-Query") else None,
                 "plan": headers.get("X-Plan") or "SINGLE",
                 "sub_queries": [q for q in urllib.parse.unquote_plus(headers.get("X-Sub-Queries") or "").split("\n") if q],
+                "follow_ups": [q for q in urllib.parse.unquote_plus(headers.get("X-Follow-Ups") or "").split("\n") if q],
             }
             return json.loads(response.read().decode("utf-8")), info
     except urllib.error.HTTPError as e:
@@ -208,13 +214,14 @@ def matches(case: Case, chunk: dict) -> bool:
 
 
 def evaluate(case: Case, base_url: str, kb_id: int, top_k: int, mode: str | None, rerank: str | None,
-             rewrite: str | None, scope: bool, plan: str | None) -> Outcome:
+             rewrite: str | None, scope: bool, plan: str | None, follow_up: str | None) -> Outcome:
     try:
         results, info = search(base_url, kb_id, case.question, top_k, mode, rerank, rewrite,
-                               case.scope if scope else [], case.history, plan)
+                               case.scope if scope else [], case.history, plan, follow_up)
     except (RuntimeError, OSError) as e:  # OSError 含 URLError、超时和连接被断开
         return Outcome(case, [], error=str(e))
-    outcome = Outcome(case, results, search_query=info["search_query"], plan=info["plan"], sub_queries=info["sub_queries"])
+    outcome = Outcome(case, results, search_query=info["search_query"], plan=info["plan"], sub_queries=info["sub_queries"],
+                      follow_ups=info["follow_ups"])
     if case.answerable:
         for rank, chunk in enumerate(results, start=1):
             if matches(case, chunk):
@@ -248,8 +255,8 @@ def pct(n: int, d: int) -> str:
 
 def print_report(outcomes: list[Outcome], top_k: int, retrieval_top_k: int, aggregate_top_k: int, min_score: float,
                  show: int, mode: str | None, rerank: str | None, rewrite: str | None, scope: bool):
-    # 汇总类问题问答时最多用 aggregate_top_k 个片段
-    allowed = lambda o: aggregate_top_k if o.plan == "AGGREGATE" else retrieval_top_k
+    # 汇总类问题问答时最多用 aggregate_top_k 个片段；补充检索后返回的都是问答实际使用的相关片段
+    allowed = lambda o: 10 ** 6 if o.follow_ups else aggregate_top_k if o.plan == "AGGREGATE" else retrieval_top_k
     answerable = [o for o in outcomes if o.case.answerable and not o.error]
     no_answer = [o for o in outcomes if not o.case.answerable and not o.error]
     errors = [o for o in outcomes if o.error]
@@ -259,6 +266,9 @@ def print_report(outcomes: list[Outcome], top_k: int, retrieval_top_k: int, aggr
     reranked = any(c.get("rerankScore") is not None for o in outcomes for c in o.results)
     print(f"参数：mode={mode or 'hybrid（后端默认）'}，rerank={rerank or '后端默认'}（{'已精排' if reranked else '未精排'}），"
           f"rewrite={rewrite or 'on（后端默认）'}，search topK={top_k}，问答 top-k={retrieval_top_k}")
+    followed = sum(1 for o in outcomes if o.follow_ups)
+    if followed:
+        print(f"迭代检索：{followed} 题首轮资料不够，补充检索后返回问答实际使用的全部相关片段")
     aggregated = sum(1 for o in outcomes if o.plan == "AGGREGATE")
     if aggregated:
         print(f"问题规划：{aggregated} 题判为汇总类问题，拆成子问题多路检索，问答可用按前 {aggregate_top_k} 个计算")
@@ -320,6 +330,8 @@ def print_report(outcomes: list[Outcome], top_k: int, retrieval_top_k: int, aggr
                 print(f"    检索文本：{o.search_query.replace(chr(10), ' / ')}")
             if o.sub_queries:
                 print(f"    子问题：{' | '.join(o.sub_queries)}")
+            if o.follow_ups:
+                print(f"    补充检索：{' | '.join(o.follow_ups)}")
             for i, chunk in enumerate(o.results[:show], start=1):
                 mark = "✓" if c.answerable and matches(c, chunk) else " "
                 flag = "" if is_relevant(chunk, min_score) else "（不相关）"
@@ -379,6 +391,8 @@ def main():
     parser.add_argument("--rewrite", choices=["on", "off"], help="是否先做查询改写，默认 on（与问答一致）")
     parser.add_argument("--plan", choices=["on", "off"],
                         help="是否做问题规划（汇总类问题拆成子问题多路检索），默认 on（与问答一致）；off 用于对比不拆分的效果")
+    parser.add_argument("--follow-up", choices=["on", "off"],
+                        help="资料不够时是否补充检索，默认 on（与问答一致）；off 用于对比只检索一次的效果")
     parser.add_argument("--scope", choices=["on", "off"], default="on",
                         help="是否按题集的 scope 列限定检索范围，默认 %(default)s；off 用于对比不限定范围的效果")
     parser.add_argument("--show", type=int, default=3, help="未通过的题展示前几条结果，默认 %(default)s")
@@ -392,7 +406,7 @@ def main():
     outcomes = []
     for i, case in enumerate(cases, start=1):
         outcome = evaluate(case, args.base_url, args.kb_id, args.top_k, args.mode, args.rerank, args.rewrite,
-                           args.scope == "on", args.plan)
+                           args.scope == "on", args.plan, args.follow_up)
         outcomes.append(outcome)
         if outcome.error:
             flag = "错误"
@@ -400,7 +414,7 @@ def main():
             flag = f"第{outcome.rank}名" if outcome.rank else "未召回"
         else:
             flag = f"最高分 {outcome.top1_score:.3f}" if outcome.top1_score is not None else "无结果"
-        mark = "（汇总）" if outcome.plan == "AGGREGATE" else ""
+        mark = ("（汇总）" if outcome.plan == "AGGREGATE" else "") + ("（补查）" if outcome.follow_ups else "")
         print(f"[{i}/{len(cases)}] {flag:<12} {case.question}{mark}", flush=True)
 
     print_report(outcomes, args.top_k, args.retrieval_top_k, default_aggregate_top_k, args.min_score, args.show,

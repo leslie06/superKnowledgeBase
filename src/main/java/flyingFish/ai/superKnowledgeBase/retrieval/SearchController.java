@@ -9,9 +9,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.stream.Collectors;
 
 /**
  * 检索调试接口：只看召回结果、各路排名和分数，不做相关性过滤（结果中的 relevant 标出问答时会不会用到），也不调用 LLM。
@@ -27,10 +25,11 @@ public class SearchController {
      * @param folders     检索范围的文件夹，与 documentIds 一起见 {@link SearchScope}；都不传时在整个知识库里检索
      * @param history     之前几轮的问答，按时间顺序；与问答一样交给查询改写，用于评测多轮对话
      * @param plan        是否先做问题规划（与问答一致，汇总类问题拆成子问题多路检索），不传时为 true；rewrite 为 false 时不规划
+     * @param followUp    资料不够时是否补充检索（与问答一致），不传时为 true
      */
     public record SearchRequest(String query, Integer topK, String mode, Boolean rerank, Boolean rewrite,
                                 List<String> folders, List<Long> documentIds, List<HistoryTurn> history,
-                                Boolean plan) {
+                                Boolean plan, Boolean followUp) {
     }
 
     /** 一轮问答 */
@@ -43,16 +42,17 @@ public class SearchController {
     static final String PLAN_HEADER = "X-Plan";
     /** 响应头：汇总类问题拆出的子问题，换行分隔、URL 编码 */
     static final String SUB_QUERIES_HEADER = "X-Sub-Queries";
+    /** 响应头：补充检索用过的查询，换行分隔、URL 编码；没有补查时为空 */
+    static final String FOLLOW_UPS_HEADER = "X-Follow-Ups";
 
     private final Retriever retriever;
     private final QueryRewriter queryRewriter;
-    private final QueryPlanner queryPlanner;
-    private final ExecutorService planExecutor = Executors.newVirtualThreadPerTaskExecutor();
+    private final RetrievalPipeline pipeline;
 
-    public SearchController(Retriever retriever, QueryRewriter queryRewriter, QueryPlanner queryPlanner) {
+    public SearchController(Retriever retriever, QueryRewriter queryRewriter, RetrievalPipeline pipeline) {
         this.retriever = retriever;
         this.queryRewriter = queryRewriter;
-        this.queryPlanner = queryPlanner;
+        this.pipeline = pipeline;
     }
 
     @PostMapping
@@ -62,23 +62,33 @@ public class SearchController {
         }
         int topK = request.topK() == null ? 10 : Math.clamp(request.topK(), 1, 50);
         List<QueryRewriter.Turn> turns = turns(request.history());
-        boolean rewrite = !Boolean.FALSE.equals(request.rewrite());
-        // 与问答一致：问题规划和查询改写并行
-        CompletableFuture<QueryPlanner.Plan> planning = rewrite && !Boolean.FALSE.equals(request.plan())
-                ? CompletableFuture.supplyAsync(() -> queryPlanner.plan(turns, request.query()), planExecutor)
-                : CompletableFuture.completedFuture(QueryPlanner.Plan.SINGLE);
-        String query = rewrite ? queryRewriter.searchQuery(turns, request.query()) : request.query();
-        QueryPlanner.Plan plan = planning.join();
         SearchScope scope = SearchScope.of(request.folders(), request.documentIds());
-        // 汇总类问题返回问答实际使用的多路合并结果（都是相关片段）；单路模式和关闭精排时仍按普通检索对比
-        List<RetrievedChunk> chunks = plan.aggregate() && mode(request.mode()) == Retriever.Mode.HYBRID
-                && !Boolean.FALSE.equals(request.rerank())
-                ? retriever.retrieveAggregate(kbId, query, plan.subQueries(), scope)
-                : retriever.search(kbId, query, scope, topK, mode(request.mode()), request.rerank());
+        boolean rewrite = !Boolean.FALSE.equals(request.rewrite());
+        Retriever.Mode mode = mode(request.mode());
+        // 关闭改写、单路召回或关闭精排时只检索一次，用于对比各环节的效果
+        if (!rewrite || mode != Retriever.Mode.HYBRID || Boolean.FALSE.equals(request.rerank())) {
+            String query = rewrite ? queryRewriter.searchQuery(turns, request.query()) : request.query();
+            return response(query, QueryPlanner.Plan.SINGLE, List.of(),
+                    retriever.search(kbId, query, scope, topK, mode, request.rerank()));
+        }
+        // 与问答一致：改写与规划并行、汇总类问题多路检索、资料不够时补充检索
+        RetrievalPipeline.Result result = pipeline.run(kbId, turns, request.query(), scope, new RetrievalPipeline.Options(
+                !Boolean.FALSE.equals(request.plan()), !Boolean.FALSE.equals(request.followUp()), topK));
+        // 普通问题且没有补查时返回不过滤的原始结果（看得到分数和不相关的片段），否则返回问答实际使用的相关片段
+        return response(result.searchQuery(), result.plan(), result.followUps(),
+                result.plan().aggregate() || !result.followUps().isEmpty() ? result.hits()
+                        : result.raw().stream().limit(topK).toList());
+    }
+
+    private static ResponseEntity<List<RetrievedChunk>> response(String query, QueryPlanner.Plan plan,
+                                                                 List<RetrievalPipeline.FollowUp> followUps,
+                                                                 List<RetrievedChunk> chunks) {
+        String followUpQueries = followUps.stream().flatMap(f -> f.queries().stream()).collect(Collectors.joining("\n"));
         return ResponseEntity.ok()
                 .header(SEARCH_QUERY_HEADER, URLEncoder.encode(query, StandardCharsets.UTF_8))
                 .header(PLAN_HEADER, plan.aggregate() ? "AGGREGATE" : "SINGLE")
                 .header(SUB_QUERIES_HEADER, URLEncoder.encode(String.join("\n", plan.subQueries()), StandardCharsets.UTF_8))
+                .header(FOLLOW_UPS_HEADER, URLEncoder.encode(followUpQueries, StandardCharsets.UTF_8))
                 .body(chunks);
     }
 

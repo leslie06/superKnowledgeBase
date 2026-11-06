@@ -1,5 +1,7 @@
 package flyingFish.ai.superKnowledgeBase.chat;
 
+import flyingFish.ai.superKnowledgeBase.retrieval.RetrievalPipeline;
+
 import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.Map;
@@ -11,10 +13,12 @@ import java.util.Map;
  *                     用户消息和记录耗时之前的回答为空
  * @param subQueries   汇总类问题拆出的子问题（多步检索），普通问题为空
  * @param fullTextDocuments 整篇交给模型的小文档的文件名，没有时为空
+ * @param followUps    资料不够时的补充检索（迭代检索），每轮缺什么、查了什么；没有补查时为空
  */
 public record ChatMessage(Long id, Long conversationId, String role, String content, List<Citation> citations,
                           Verification verification, Feedback feedback, Map<String, Long> timings,
-                          List<String> subQueries, List<String> fullTextDocuments, OffsetDateTime createdAt) {
+                          List<String> subQueries, List<String> fullTextDocuments,
+                          List<RetrievalPipeline.FollowUp> followUps, OffsetDateTime createdAt) {
 
     public static final String USER = "user";
     public static final String ASSISTANT = "assistant";

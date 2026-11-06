@@ -192,6 +192,14 @@ const evalCommand = computed(() =>
               <dl>
                 <dt>检索查询</dt>
                 <dd class="pre">{{ row.searchQuery || '（没有记录）' }}</dd>
+                <template v-if="row.followUps.length">
+                  <dt>补充检索</dt>
+                  <dd>
+                    <div v-for="f in row.followUps" :key="f.round">
+                      第 {{ f.round }} 轮：{{ f.missing }} → 查{{ f.queries.map((q: string) => `「${q}」`).join('') }}，补到 {{ f.added }} 段
+                    </div>
+                  </dd>
+                </template>
                 <template v-if="row.subQueries.length">
                   <dt>子问题</dt>
                   <dd class="pre">{{ row.subQueries.join('\n') }}</dd>

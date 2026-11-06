@@ -148,11 +148,12 @@ async function send(text = question.value) {
         answer.content += t
         scrollToBottom()
       },
-      onDone: (messageId, timings, subQueries, fullTextDocuments) => {
+      onDone: (messageId, timings, subQueries, fullTextDocuments, followUps) => {
         answer.id = messageId
         answer.timings = timings
         answer.subQueries = subQueries
         answer.fullTextDocuments = fullTextDocuments
+        answer.followUps = followUps
         // 回答已保存，之后的核对在后台进行，不妨碍继续提问
         answer.streaming = false
         answer.verifying = true
@@ -200,6 +201,12 @@ function scrollToBottom(force = false) {
   })
 }
 
+/** 例如"第 1 轮：缺少西门庆临终的情节 → 查「西门庆 断气身亡」「第七十九回」，补到 5 段" */
+function followUpTitle(m: ChatMessage) {
+  return ['首轮检索到的资料不够回答，换说法补充检索：', ...m.followUps!.map((f) =>
+    `第 ${f.round} 轮：${f.missing ?? ''} → 查${f.queries.map((q) => `「${q}」`).join('')}，补到 ${f.added} 段`)].join('\n')
+}
+
 /** 检索（改写 + 召回与精排）超过这个时长时标出来，通常是精排服务被换出到磁盘 */
 const SLOW_RETRIEVAL_MS = 15000
 
@@ -209,7 +216,8 @@ function sec(ms: number | undefined) {
 
 function retrievalMs(m: ChatMessage) {
   const t = m.timings
-  return t && (t.rewriteMs != null || t.retrieveMs != null) ? (t.rewriteMs ?? 0) + (t.retrieveMs ?? 0) : null
+  return t && (t.rewriteMs != null || t.retrieveMs != null)
+    ? (t.rewriteMs ?? 0) + (t.retrieveMs ?? 0) + (t.followUpMs ?? 0) : null
 }
 
 /**
@@ -220,7 +228,8 @@ function retrievalMs(m: ChatMessage) {
 function timingText(m: ChatMessage) {
   const t = m.timings!
   const retrieval = retrievalMs(m)!
-  const parts = [`检索 ${sec(retrieval)} 秒（改写 ${sec(t.rewriteMs)} · 召回与精排 ${sec(t.retrieveMs)}）`]
+  const parts = [`检索 ${sec(retrieval)} 秒（改写 ${sec(t.rewriteMs)} · 召回与精排 ${sec(t.retrieveMs)}`
+    + (t.followUpMs != null ? ` · 补充检索 ${sec(t.followUpMs)}` : '') + '）']
   if (t.answerMs != null) {
     parts.push(`生成 ${sec(t.answerMs)} 秒` + (t.firstTokenMs != null ? `（首字 ${sec(t.firstTokenMs)}）` : ''))
   }
@@ -373,6 +382,9 @@ async function onConversationCommand(command: string, conv: Conversation) {
               <span v-if="m.fullTextDocuments?.length" class="answer-plan"
                     :title="`这些文档篇幅不长，整篇交给模型通读后回答：\n${m.fullTextDocuments.join('\n')}`">
                 已读全文 · {{ m.fullTextDocuments.length > 1 ? `${m.fullTextDocuments.length} 个文档` : m.fullTextDocuments[0] }}
+              </span>
+              <span v-if="m.followUps?.length" class="answer-plan" :title="followUpTitle(m)">
+                补充检索 · {{ m.followUps.length }} 轮
               </span>
               <span v-if="m.subQueries?.length" class="answer-plan"
                     :title="`这个问题需要汇总多处资料，拆成以下子问题分别检索：\n${m.subQueries.join('\n')}`">

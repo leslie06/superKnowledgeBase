@@ -89,6 +89,8 @@ public class Retriever {
     private static final int KEYWORD_RERANK_GUARANTEE = 3;
     /** 含问题中编号的片段最多补进这么多个候选；同一编号在别的文档里被引用（"本法第十七条"）时也会命中 */
     private static final int MAX_EXACT_CANDIDATES = 10;
+    /** 每轮补充检索最多补进这么多个新片段 */
+    private static final int FOLLOW_UP_MAX_NEW = 8;
     /**
      * 与排名更靠前的结果相似度达到这个值的片段视为重复，不再返回。同一本书的多个副本、同一译本的不同扫描版
      * 会让同一段话占掉好几个参考资料名额（"林黛玉进贾府"的前 6 个结果里有 3 对完全相同）；
@@ -165,6 +167,29 @@ public class Retriever {
 
     private static List<RetrievedChunk> relevant(List<RetrievedChunk> ranked) {
         return ranked.stream().filter(RetrievedChunk::relevant).toList();
+    }
+
+    /** 问答时取的片段数（skb.retrieval.top-k） */
+    public int topK() {
+        return defaultTopK;
+    }
+
+    /**
+     * 补充检索（迭代检索的一轮）：新查询并行检索，只留相关片段，轮流合并后去掉已有的片段和内容几乎相同的片段，
+     * 最多 FOLLOW_UP_MAX_NEW 个新片段，接在已有资料之后。
+     */
+    public List<RetrievedChunk> retrieveMore(long kbId, List<String> queries, SearchScope scope,
+                                             List<RetrievedChunk> existing) {
+        List<CompletableFuture<List<RetrievedChunk>>> futures = queries.stream()
+                .map(q -> CompletableFuture.supplyAsync(() -> relevant(rank(kbId, q, scope, Mode.HYBRID, candidates,
+                        rerankEnabled, subQueryRerankCandidates)), aggregateExecutor))
+                .toList();
+        List<RetrievedChunk> found = interleave(futures.stream().map(CompletableFuture::join).toList());
+        Set<Long> known = existing.stream().map(RetrievedChunk::chunkId).collect(Collectors.toSet());
+        List<RetrievedChunk> merged = new ArrayList<>(existing);
+        found.stream().filter(c -> !known.contains(c.chunkId())).forEach(merged::add);
+        // 已有片段排在前面，dropDuplicates 保留先出现的，与已有内容重复的新片段会被去掉
+        return dropDuplicates(merged).stream().filter(c -> !known.contains(c.chunkId())).limit(FOLLOW_UP_MAX_NEW).toList();
     }
 
     /** 依次取每一路的第 1 个、再依次取第 2 个……，同一片段只保留第一次出现 */

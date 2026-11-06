@@ -1,6 +1,7 @@
 package flyingFish.ai.superKnowledgeBase.chat;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import flyingFish.ai.superKnowledgeBase.retrieval.RetrievalPipeline;
 import flyingFish.ai.superKnowledgeBase.retrieval.SearchScope;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Repository;
@@ -20,9 +21,10 @@ public class ConversationRepository {
     private static final TypeReference<List<Citation>> CITATIONS = new TypeReference<>() {
     };
 
-    /** retrieval_trace 中只取耗时、子问题和读了全文的文档 */
+    /** retrieval_trace 中只取耗时、子问题、读了全文的文档和补充检索 */
     @JsonIgnoreProperties(ignoreUnknown = true)
-    private record TraceSummary(Map<String, Long> timings, List<String> subQueries, List<String> fullTextDocuments) {
+    private record TraceSummary(Map<String, Long> timings, List<String> subQueries, List<String> fullTextDocuments,
+                                List<RetrievalPipeline.FollowUp> followUps) {
     }
 
     private final JdbcClient jdbc;
@@ -128,7 +130,7 @@ public class ConversationRepository {
         String verification = rs.getString("verification");
         String rating = rs.getString("feedback");
         String traceJson = rs.getString("retrieval_trace");
-        TraceSummary trace = traceJson == null ? new TraceSummary(null, null, null)
+        TraceSummary trace = traceJson == null ? new TraceSummary(null, null, null, null)
                 : jsonMapper.readValue(traceJson, TraceSummary.class);
         return new ChatMessage(rs.getLong("id"), rs.getLong("conversation_id"), rs.getString("role"),
                 rs.getString("content"), parseCitations(rs.getString("citations")),
@@ -137,6 +139,7 @@ public class ConversationRepository {
                 trace.timings() == null ? Map.of() : trace.timings(),
                 trace.subQueries() == null ? List.of() : trace.subQueries(),
                 trace.fullTextDocuments() == null ? List.of() : trace.fullTextDocuments(),
+                trace.followUps() == null ? List.of() : trace.followUps(),
                 rs.getObject("created_at", OffsetDateTime.class));
     }
 
