@@ -67,15 +67,24 @@ public class ChunkRepository {
         jdbc.sql("DELETE FROM chunk WHERE document_id = ? AND kind = 'SUMMARY'").param(documentId).update();
     }
 
-    /** 已处理完成、但还没有摘要片段的文档 */
-    List<Long> findDocumentsWithoutSummary() {
+    /** 已处理完成、正文片段数达到 minChunks、但还没有摘要片段的文档 */
+    List<Long> findDocumentsWithoutSummary(int minChunks) {
         return jdbc.sql("""
                         SELECT d.id FROM document d
-                        WHERE d.status = 'READY'
+                        WHERE d.status = 'READY' AND d.chunk_count >= ?
                           AND NOT EXISTS (SELECT 1 FROM chunk c WHERE c.document_id = d.id AND c.kind = 'SUMMARY')
                         ORDER BY d.id
                         """)
-                .query(Long.class).list();
+                .param(minChunks).query(Long.class).list();
+    }
+
+    /** 删除短文档（正文片段数少于 minChunks）的摘要片段，返回删除数；摘要原文仍留在 document.summary 供查看 */
+    int deleteShortDocumentSummaries(int minChunks) {
+        return jdbc.sql("""
+                        DELETE FROM chunk c USING document d
+                        WHERE c.document_id = d.id AND c.kind = 'SUMMARY' AND d.chunk_count < ?
+                        """)
+                .param(minChunks).update();
     }
 
     /** 正文片段（不含摘要），按顺序 */

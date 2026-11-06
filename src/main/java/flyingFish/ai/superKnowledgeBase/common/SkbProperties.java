@@ -58,7 +58,9 @@ public record SkbProperties(String storageDir, Ingestion ingestion, Chunk chunk,
     /**
      * @param enabled    是否为文档生成摘要（需要配置 DeepSeek Key）；已有文档在启动时后台补生成
      * @param inputChars 交给 LLM 的文档信息字数上限（目录 + 开头 + 均匀抽取的几段正文）
+     * @param minChunks  正文片段数达到这个值的文档才生成摘要片段；短文档的正文就是全部内容，摘要只是换个说法重复一遍，
+     *                   还会和正文、和其他短文档的摘要抢名次（14 个激活码文件的摘要把操作教程挤出前 10）
      */
-    public record Summary(boolean enabled, int inputChars) {
+    public record Summary(boolean enabled, int inputChars, int minChunks) {
     }
 }

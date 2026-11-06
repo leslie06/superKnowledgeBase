@@ -193,8 +193,14 @@ public class IngestionService {
         return doc.sourcePath() != null ? doc.sourcePath() : doc.filename();
     }
 
-    /** 摘要只取决于文件内容，重新处理时复用已有的；文件换成新版本时 replaceFile 已把它清空 */
+    /**
+     * 摘要只取决于文件内容，重新处理时复用已有的；文件换成新版本时 replaceFile 已把它清空。
+     * 短文档不需要摘要片段（见 skb.summary.min-chunks），返回 null。
+     */
     private String summary(Document doc, String source, List<ChunkDraft> drafts) {
+        if (drafts.size() < summarizer.minChunks()) {
+            return null;
+        }
         if (doc.summary() != null) {
             return doc.summary();
         }

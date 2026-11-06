@@ -47,11 +47,13 @@ public class DocumentSummarizer {
     private final ChatClient chatClient;
     private final boolean enabled;
     private final int inputChars;
+    private final int minChunks;
 
     public DocumentSummarizer(ChatClient.Builder chatClientBuilder, SkbProperties properties,
                               @Value("${spring.ai.deepseek.api-key:}") String apiKey) {
         this.chatClient = chatClientBuilder.build();
         this.inputChars = properties.summary().inputChars();
+        this.minChunks = properties.summary().minChunks();
         boolean keyConfigured = StringUtils.hasText(apiKey) && !NO_API_KEY.equals(apiKey) && !"sk-xxxx".equals(apiKey);
         this.enabled = properties.summary().enabled() && keyConfigured;
         if (properties.summary().enabled() && !keyConfigured) {
@@ -61,6 +63,11 @@ public class DocumentSummarizer {
 
     public boolean available() {
         return enabled;
+    }
+
+    /** 正文片段数达到 skb.summary.min-chunks 的文档才需要摘要片段 */
+    public int minChunks() {
+        return minChunks;
     }
 
     /**

@@ -43,7 +43,7 @@ public class Retriever {
     }
 
     private record ChunkRow(Long chunkId, Long documentId, String filename, String headingPath, String location,
-                            String content, double score, boolean exactMatch) {
+                            String content, double score, boolean exactMatch, String kind) {
     }
 
     private static final Logger log = LoggerFactory.getLogger(Retriever.class);
@@ -176,7 +176,7 @@ public class Retriever {
                     .map(r -> new RetrievedChunk(r.chunkId(), r.documentId(), r.filename(), r.headingPath(),
                             r.location(), r.content(), r.score(), keywordScores.get(r.chunkId()),
                             vectorRanks.get(r.chunkId()), keywordRanks.get(r.chunkId()), null, r.exactMatch(),
-                            r.score() >= minScore || r.exactMatch()))
+                            r.score() >= minScore || r.exactMatch(), r.kind()))
                     .toList();
         });
     }
@@ -295,7 +295,7 @@ public class Retriever {
             String location = mergeLocations(parts.getFirst().location(), parts.getLast().location());
             expanded.add(new RetrievedChunk(hit.chunkId(), hit.documentId(), hit.filename(), hit.headingPath(),
                     location, content, hit.score(), hit.keywordScore(), hit.vectorRank(), hit.keywordRank(),
-                    hit.rerankScore(), hit.exactMatch(), hit.relevant()));
+                    hit.rerankScore(), hit.exactMatch(), hit.relevant(), hit.kind()));
         }
         return expanded;
     }
@@ -315,10 +315,16 @@ public class Retriever {
         return end > start ? "第" + start + "-" + end + "页" : "第" + start + "页";
     }
 
-    /** 精排候选：关键词召回前 keywordTop 名，再按 RRF 顺序补足 size 个 */
+    /**
+     * 精排候选：关键词召回中排名最前的 keywordTop 个正文片段，再按 RRF 顺序补足 size 个。
+     * 摘要片段不占这几个名额：它的关键词里有文件名和全书关键词，问"简历里的求职目标"时简历摘要排关键词第 1，
+     * 把真正写着"求职目标"的正文片段挤出了必进名额；摘要仍可以按 RRF 顺序进入候选。
+     */
     static List<RetrievedChunk> rerankPool(List<RetrievedChunk> fused, int size, int keywordTop) {
         List<RetrievedChunk> pool = new ArrayList<>(fused.stream()
-                .filter(c -> c.keywordRank() != null && c.keywordRank() <= keywordTop)
+                .filter(c -> c.keywordRank() != null && !RetrievedChunk.SUMMARY.equals(c.kind()))
+                .sorted(Comparator.comparingInt(RetrievedChunk::keywordRank))
+                .limit(keywordTop)
                 .toList());
         for (RetrievedChunk c : fused) {
             if (pool.size() >= size) {
@@ -339,7 +345,7 @@ public class Retriever {
     private static RetrievedChunk withRerank(RetrievedChunk c, Double rerankScore, boolean relevant) {
         return new RetrievedChunk(c.chunkId(), c.documentId(), c.filename(), c.headingPath(), c.location(),
                 c.content(), c.score(), c.keywordScore(), c.vectorRank(), c.keywordRank(), rerankScore,
-                c.exactMatch(), relevant);
+                c.exactMatch(), relevant, c.kind());
     }
 
     /** 范围内的文档：source_path 以所选文件夹开头，或单独选中的文档；用 starts_with 而不是 LIKE，文件夹名里的 _ % 不会被当成通配符 */
@@ -455,7 +461,7 @@ public class Retriever {
     private Map<Long, ChunkRow> loadChunks(Set<Long> ids, String vector, Set<String> exactTerms) {
         String exactMatch = exactTerms.isEmpty() ? "false" : "c.keyword_tsv @@ CAST(:exact AS tsquery)";
         JdbcClient.StatementSpec spec = jdbc.sql("""
-                        SELECT c.id AS chunk_id, c.document_id, d.filename, c.heading_path, c.location, c.content,
+                        SELECT c.id AS chunk_id, c.document_id, d.filename, c.heading_path, c.location, c.content, c.kind,
                                1 - (c.embedding <=> CAST(:vector AS vector)) AS score,
                                coalesce(%s, false) AS exact_match
                         FROM chunk c JOIN document d ON d.id = c.document_id

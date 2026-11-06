@@ -10,10 +10,23 @@ class RetrieverTests {
 
     @Test
     void rerankPoolKeepsTopKeywordHitsRankedLowByRrf() {
-        List<RetrievedChunk> fused = List.of(
-                chunk(1, 1, null), chunk(2, 2, null), chunk(3, 3, 5), chunk(4, 4, null), chunk(5, null, 2));
+        List<RetrievedChunk> fused = List.of(chunk(1, 1, null), chunk(2, 2, null), chunk(3, 3, 3),
+                chunk(4, 4, null), chunk(5, null, 1), chunk(6, null, 2), chunk(7, null, 4));
 
-        assertThat(Retriever.rerankPool(fused, 3, 3)).extracting(RetrievedChunk::chunkId).containsExactly(5L, 1L, 2L);
+        // 关键词前 3 名（5、6、3）必进，其中 5、6 只被关键词召回，按 RRF 会排在所有向量结果之后；再按 RRF 补足
+        assertThat(Retriever.rerankPool(fused, 4, 3)).extracting(RetrievedChunk::chunkId).containsExactly(5L, 6L, 3L, 1L);
+    }
+
+    @Test
+    void summaryDoesNotTakeKeywordGuaranteeSlot() {
+        RetrievedChunk summary = new RetrievedChunk(9L, 1L, "简历.pdf", "文档摘要", null, "求职简历", 0.5, null, null, 1,
+                null, false, true, RetrievedChunk.SUMMARY);
+        List<RetrievedChunk> fused = List.of(chunk(1, 1, null), chunk(2, 2, null), summary, chunk(4, null, 2),
+                chunk(5, null, 3), chunk(6, null, 4));
+
+        // 关键词前 3 名里有摘要，必进名额顺延给关键词第 4 名的正文片段；摘要按 RRF 顺序补进候选
+        assertThat(Retriever.rerankPool(fused, 6, 3)).extracting(RetrievedChunk::chunkId)
+                .containsExactly(4L, 5L, 6L, 1L, 2L, 9L);
     }
 
     @Test
@@ -53,10 +66,10 @@ class RetrieverTests {
 
     private static RetrievedChunk chunk(long id, Integer vectorRank, Integer keywordRank) {
         return new RetrievedChunk(id, 1L, "a.pdf", null, null, "正文", 0.5, null, vectorRank, keywordRank, null, false,
-                true);
+                true, "TEXT");
     }
 
     private static RetrievedChunk chunk(long id, String content) {
-        return new RetrievedChunk(id, 1L, "a.pdf", null, null, content, 0.5, null, null, null, null, false, true);
+        return new RetrievedChunk(id, 1L, "a.pdf", null, null, content, 0.5, null, null, null, null, false, true, "TEXT");
     }
 }

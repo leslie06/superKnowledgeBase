@@ -22,6 +22,8 @@
     expected_section 预期章节路径（子串匹配，对应 headingPath）
     expected_text    预期片段中包含的原文（子串匹配，最精确）
     note             备注，不参与计算
+    history          可选，多轮对话中之前几轮的问答，JSON 数组：[["问题", "回答"], ...]，与问答一样交给查询改写；
+                     题目没通过时会打印改写后的检索文本，用于检查改写有没有补全指代、有没有被旧话题带偏
     scope            可选，检索范围：文件夹路径（对应 document.source_path 的前缀，如"电子书/计算机"），| 分隔多个；
                      为空时在整个知识库里检索，与问答页面选择范围的效果相同
 
@@ -42,6 +44,7 @@ import re
 import sys
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -58,6 +61,7 @@ class Case:
     expected_text: list[str]
     note: str
     scope: list[str] = field(default_factory=list)
+    history: list[list[str]] = field(default_factory=list)
 
     @property
     def answerable(self) -> bool:
@@ -68,6 +72,7 @@ class Case:
 class Outcome:
     case: Case
     results: list[dict]
+    search_query: str | None = None  # 后端改写后的检索文本
     rank: int | None = None  # 第一个正确片段的排名，从 1 开始
     score: float | None = None  # 第一个正确片段的分数
     error: str | None = None
@@ -132,6 +137,7 @@ def load_cases(path: Path) -> list[Case]:
                 expected_text=split_alternatives(row.get("expected_text")),
                 note=(row.get("note") or "").strip(),
                 scope=[v.strip().strip("/") for v in (row.get("scope") or "").split("|") if v.strip().strip("/")],
+                history=json.loads(row["history"]) if (row.get("history") or "").strip() else [],
             ))
     return cases
 
@@ -148,11 +154,14 @@ def is_relevant(chunk: dict, min_score: float) -> bool:
 
 
 def search(base_url: str, kb_id: int, query: str, top_k: int, mode: str | None, rerank: str | None,
-           rewrite: str | None, folders: list[str]) -> list[dict]:
+           rewrite: str | None, folders: list[str], history: list[list[str]]) -> tuple[list[dict], str | None]:
+    """返回 (检索结果, 改写后的检索文本)"""
     url = f"{base_url.rstrip('/')}/api/knowledge-bases/{kb_id}/search"
     payload = {"query": query, "topK": top_k}
     if folders:
         payload["folders"] = folders
+    if history:
+        payload["history"] = [{"question": q, "answer": a} for q, a in history]
     if mode:
         payload["mode"] = mode
     if rerank:
@@ -163,7 +172,9 @@ def search(base_url: str, kb_id: int, query: str, top_k: int, mode: str | None, 
     request = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(request, timeout=60) as response:
-            return json.loads(response.read().decode("utf-8"))
+            search_query = response.headers.get("X-Search-Query")
+            return (json.loads(response.read().decode("utf-8")),
+                    urllib.parse.unquote_plus(search_query) if search_query else None)
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", errors="replace")
         try:
@@ -185,10 +196,11 @@ def matches(case: Case, chunk: dict) -> bool:
 def evaluate(case: Case, base_url: str, kb_id: int, top_k: int, mode: str | None, rerank: str | None,
              rewrite: str | None, scope: bool) -> Outcome:
     try:
-        results = search(base_url, kb_id, case.question, top_k, mode, rerank, rewrite, case.scope if scope else [])
+        results, search_query = search(base_url, kb_id, case.question, top_k, mode, rerank, rewrite,
+                                       case.scope if scope else [], case.history)
     except (RuntimeError, OSError) as e:  # OSError 含 URLError、超时和连接被断开
         return Outcome(case, [], error=str(e))
-    outcome = Outcome(case, results)
+    outcome = Outcome(case, results, search_query=search_query)
     if case.answerable:
         for rank, chunk in enumerate(results, start=1):
             if matches(case, chunk):
@@ -283,6 +295,10 @@ def print_report(outcomes: list[Outcome], top_k: int, retrieval_top_k: int, min_
                 status = f"无答案题但有片段被判为相关（最高分 {o.top1_score:.3f}）"
             print(f"\n  第 {c.line} 行：{c.question}" + (f"    范围：{' | '.join(c.scope)}" if c.scope and scope else ""))
             print(f"    结果：{status}" + (f"    备注：{c.note}" if c.note else ""))
+            if c.history:
+                print(f"    对话历史：{' → '.join(q for q, _ in c.history)}")
+            if o.search_query and o.search_query != c.question:
+                print(f"    检索文本：{o.search_query.replace(chr(10), ' / ')}")
             for i, chunk in enumerate(o.results[:show], start=1):
                 mark = "✓" if c.answerable and matches(c, chunk) else " "
                 flag = "" if is_relevant(chunk, min_score) else "（不相关）"

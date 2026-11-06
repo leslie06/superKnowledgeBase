@@ -9,7 +9,7 @@ import org.springframework.stereotype.Component;
 import java.util.List;
 
 /**
- * 为加入文档摘要之前处理完成的文档补生成摘要片段。只调用一次 LLM 和一次向量化，不用重新处理正文，
+ * 为加入文档摘要之前处理完成的文档补生成摘要片段，并清掉短文档（skb.summary.min-chunks）的摘要片段。只调用一次 LLM 和一次向量化，不用重新处理正文，
  * 所以启动时在后台逐个补齐（一次一个，不占用摄入线程池，新上传的文档不用排在后面）；失败的下次启动再试。
  */
 @Component
@@ -36,7 +36,11 @@ public class SummaryBackfill {
     }
 
     void backfill() {
-        List<Long> ids = chunks.findDocumentsWithoutSummary();
+        int removed = chunks.deleteShortDocumentSummaries(summarizer.minChunks());
+        if (removed > 0) {
+            log.info("删除 {} 个短文档的摘要片段（正文片段少于 {} 个）", removed, summarizer.minChunks());
+        }
+        List<Long> ids = chunks.findDocumentsWithoutSummary(summarizer.minChunks());
         if (ids.isEmpty()) {
             return;
         }

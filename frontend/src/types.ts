@@ -65,6 +65,8 @@ export interface RetrievedChunk {
   exactMatch: boolean
   /** 是否通过相关性过滤，问答时只使用通过的片段 */
   relevant: boolean
+  /** 片段类型：TEXT 正文 / SUMMARY 文档摘要 */
+  kind: 'TEXT' | 'SUMMARY'
 }
 
 export interface Citation {
