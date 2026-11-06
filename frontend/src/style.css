@@ -950,3 +950,100 @@ a:hover {
   margin: 4px 0 0;
   padding-left: 18px;
 }
+
+.answer-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.answer-actions button {
+  padding: 2px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.answer-actions button:hover,
+.answer-actions button.active {
+  color: var(--primary);
+  border-color: var(--primary);
+  background: var(--primary-soft);
+}
+
+.feedback-reasons {
+  margin-bottom: 12px;
+}
+
+.insight-stats {
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+}
+
+.insight-stats b.small {
+  font-size: 16px;
+  line-height: 33px;
+}
+
+.days-select {
+  width: 130px;
+  margin-left: auto;
+}
+
+.daily {
+  margin-top: 12px;
+}
+
+.insights-page .panel-header {
+  flex-wrap: wrap;
+}
+
+.case-detail {
+  padding: 4px 48px 8px;
+}
+
+.case-detail dl {
+  display: grid;
+  grid-template-columns: 72px 1fr;
+  gap: 8px 12px;
+  margin: 0;
+  font-size: 13px;
+}
+
+.case-detail dt {
+  color: var(--muted);
+}
+
+.case-detail dd {
+  margin: 0;
+  min-width: 0;
+}
+
+.case-detail .pre {
+  white-space: pre-wrap;
+  max-height: 240px;
+  overflow: auto;
+}
+
+.case-hit {
+  margin-bottom: 8px;
+}
+
+.case-hit .snippet {
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.flag {
+  margin: 2px 4px 2px 0;
+}
+
+.export-link {
+  margin-left: auto;
+}
+
+.full {
+  width: 100%;
+}

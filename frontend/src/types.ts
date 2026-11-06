@@ -108,6 +108,16 @@ export interface AnswerVerification {
   citationErrors: VerificationIssue[]
 }
 
+export type FeedbackReason = 'NOT_FOUND' | 'WRONG' | 'INCOMPLETE' | 'CITATION' | 'OTHER'
+
+/** 用户对回答的评价 */
+export interface Feedback {
+  rating: 'UP' | 'DOWN'
+  /** 没用的原因，有用时为 null */
+  reason: FeedbackReason | null
+  note: string | null
+}
+
 export interface ChatMessage {
   id: number | null
   role: 'user' | 'assistant'
@@ -115,8 +125,88 @@ export interface ChatMessage {
   citations: Citation[]
   /** 没有核对时为 null（未开启、无命中直接拒答、停止生成或核对失败） */
   verification?: AnswerVerification | null
+  feedback?: Feedback | null
   streaming?: boolean
   /** 回答已生成，正在核对 */
   verifying?: boolean
   error?: string
+}
+
+/** 坏案例类型：差评、有用、拒答、核对发现问题、精排未生效、慢（改写 + 检索 + 首字超过 15 秒） */
+export type InsightFlag = 'DOWN' | 'UP' | 'REFUSED' | 'VERIFY_ISSUE' | 'UNRERANKED' | 'SLOW'
+
+/** 毫秒；没有数据时为 null */
+export interface Timing {
+  p50: number | null
+  p90: number | null
+}
+
+export interface InsightStats {
+  answers: number
+  up: number
+  down: number
+  refused: number
+  verifyIssues: number
+  unreranked: number
+  slow: number
+  rewrite: Timing
+  retrieve: Timing
+  firstToken: Timing
+}
+
+export interface InsightDaily {
+  date: string
+  answers: number
+  down: number
+  refused: number
+  verifyIssues: number
+}
+
+export interface InsightHit {
+  index: number
+  chunkId: number
+  documentId: number
+  filename: string
+  headingPath: string | null
+  location: string | null
+  snippet: string
+  score: number | null
+  rerankScore: number | null
+}
+
+export interface InsightCase {
+  messageId: number
+  conversationId: number
+  createdAt: string
+  question: string | null
+  answer: string
+  searchQuery: string | null
+  scope: SearchScope
+  hits: InsightHit[]
+  timings: Record<string, number>
+  verification: AnswerVerification | null
+  feedback: Feedback | null
+  flags: InsightFlag[]
+}
+
+export interface InsightOverview {
+  days: number
+  stats: InsightStats
+  daily: InsightDaily[]
+  cases: InsightCase[]
+}
+
+/** 从真实问答中整理出的检索评测题，字段与 scripts/eval_retrieval.py 的题集 CSV 对应 */
+export interface EvalCase {
+  id: number
+  kbId: number
+  question: string
+  expectedFile: string | null
+  expectedSection: string | null
+  expectedText: string | null
+  /** 文件夹路径，| 分隔；为空表示整个知识库 */
+  scope: string | null
+  note: string | null
+  messageId: number | null
+  createdAt: string
 }

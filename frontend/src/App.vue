@@ -2,7 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { ChatDotRound, Folder, Plus, MoreFilled } from '@element-plus/icons-vue'
+import { ChatDotRound, DataAnalysis, Folder, Plus, MoreFilled } from '@element-plus/icons-vue'
 import KbDialog from './components/KbDialog.vue'
 import { api } from './api'
 import { loadKbs, store } from './store'
@@ -15,7 +15,9 @@ const editing = ref<KnowledgeBase | null>(null)
 
 const currentKbId = computed(() => (route.params.kbId ? Number(route.params.kbId) : null))
 const currentKb = computed(() => store.kbs.find((kb) => kb.id === currentKbId.value) ?? null)
-const tab = computed(() => (route.name === 'docs' ? 'docs' : 'chat'))
+/** 知识库内的页面：智能问答、文档管理、问答分析 */
+type Tab = 'chat' | 'docs' | 'insights'
+const tab = computed<Tab>(() => (route.name === 'docs' || route.name === 'insights' ? route.name : 'chat'))
 
 onMounted(async () => {
   try {
@@ -26,11 +28,11 @@ onMounted(async () => {
 })
 
 function switchKb(id: number) {
-  router.push(tab.value === 'docs' ? `/kb/${id}/docs` : `/kb/${id}/chat`)
+  router.push(`/kb/${id}/${tab.value}`)
 }
 
-function switchTab(name: string) {
-  if (currentKbId.value) router.push(name === 'docs' ? `/kb/${currentKbId.value}/docs` : `/kb/${currentKbId.value}/chat`)
+function switchTab(name: Tab) {
+  if (currentKbId.value) router.push(`/kb/${currentKbId.value}/${name}`)
 }
 
 function openCreate() {
@@ -93,6 +95,9 @@ async function onKbCommand(command: string) {
         </button>
         <button :class="{ active: tab === 'docs' }" @click="switchTab('docs')">
           <el-icon><Folder /></el-icon>文档管理
+        </button>
+        <button :class="{ active: tab === 'insights' }" @click="switchTab('insights')">
+          <el-icon><DataAnalysis /></el-icon>问答分析
         </button>
       </nav>
     </header>

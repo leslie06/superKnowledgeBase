@@ -139,6 +139,33 @@ public class ChatService {
         conversations.delete(id);
     }
 
+    /** 评价回答；rating 为空时清除评价。没用时必须给出原因 */
+    public Feedback feedback(long messageId, String rating, String reason, String note) {
+        String role = conversations.findMessageRole(messageId)
+                .orElseThrow(() -> new NotFoundException("消息不存在：" + messageId));
+        if (!ChatMessage.ASSISTANT.equals(role)) {
+            throw new IllegalArgumentException("只能评价回答");
+        }
+        if (!StringUtils.hasText(rating)) {
+            conversations.updateFeedback(messageId, null);
+            return null;
+        }
+        Feedback feedback;
+        if (Feedback.UP.equals(rating)) {
+            feedback = new Feedback(Feedback.UP, null, StringUtils.hasText(note) ? note.strip() : null);
+        } else if (Feedback.DOWN.equals(rating)) {
+            // Set.of 的 contains(null) 会抛空指针，先判空
+            if (reason == null || !Feedback.REASONS.contains(reason)) {
+                throw new IllegalArgumentException("请选择原因：" + String.join("、", Feedback.REASONS));
+            }
+            feedback = new Feedback(Feedback.DOWN, reason, StringUtils.hasText(note) ? note.strip() : null);
+        } else {
+            throw new IllegalArgumentException("rating 只能是 UP 或 DOWN");
+        }
+        conversations.updateFeedback(messageId, feedback);
+        return feedback;
+    }
+
     public List<ChatMessage> messages(long id) {
         get(id);
         return conversations.findMessages(id);

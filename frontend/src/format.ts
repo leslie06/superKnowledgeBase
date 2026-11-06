@@ -1,3 +1,14 @@
+import type { FeedbackReason } from './types'
+
+/** 回答评价为"没用"时的原因 */
+export const FEEDBACK_REASONS: Record<FeedbackReason, string> = {
+  NOT_FOUND: '没找到',
+  WRONG: '答错了',
+  INCOMPLETE: '不完整',
+  CITATION: '引用不对',
+  OTHER: '其他',
+}
+
 export function formatSize(bytes: number) {
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`

@@ -1,5 +1,6 @@
 import type {
-  AnswerVerification, ChatMessage, ChunkView, Citation, Conversation, KbDocument, KnowledgeBase, RetrievedChunk, SearchScope, UploadResult,
+  AnswerVerification, ChatMessage, ChunkView, Citation, Conversation, EvalCase, Feedback, FeedbackReason,
+  InsightOverview, KbDocument, KnowledgeBase, RetrievedChunk, SearchScope, UploadResult,
 } from './types'
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
@@ -53,6 +54,16 @@ export const api = {
     request<Conversation>(`/api/conversations/${id}`, { method: 'PUT', body: json({ title }) }),
   deleteConversation: (id: number) => request<void>(`/api/conversations/${id}`, { method: 'DELETE' }),
   listMessages: (id: number) => request<ChatMessage[]>(`/api/conversations/${id}/messages`),
+  /** rating 为 null 时取消评价 */
+  feedback: (messageId: number, rating: 'UP' | 'DOWN' | null, reason?: FeedbackReason, note?: string) =>
+    request<Feedback | undefined>(`/api/messages/${messageId}/feedback`, { method: 'PUT', body: json({ rating, reason, note }) }),
+
+  insights: (kbId: number, days: number) =>
+    request<InsightOverview>(`/api/knowledge-bases/${kbId}/insights?days=${days}`),
+  listEvalCases: (kbId: number) => request<EvalCase[]>(`/api/knowledge-bases/${kbId}/eval-cases`),
+  createEvalCase: (kbId: number, draft: Partial<EvalCase>) =>
+    request<EvalCase>(`/api/knowledge-bases/${kbId}/eval-cases`, { method: 'POST', body: json(draft) }),
+  deleteEvalCase: (id: number) => request<void>(`/api/eval-cases/${id}`, { method: 'DELETE' }),
 }
 
 /** 原文件地址；PDF 带上页码锚点，浏览器内置阅读器会跳到对应页 */
@@ -114,4 +125,9 @@ function dispatch(raw: string, handlers: ChatStreamHandlers) {
     case 'verification': handlers.onVerification?.(payload); break
     case 'error': handlers.onError(payload.message); break
   }
+}
+
+/** 评测题导出地址，评测脚本可以直接用：--csv 这个地址 */
+export function evalCasesCsvUrl(kbId: number) {
+  return `/api/knowledge-bases/${kbId}/eval-cases.csv`
 }

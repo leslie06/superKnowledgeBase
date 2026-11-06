@@ -11,6 +11,8 @@
     python3 scripts/eval_retrieval.py --kb-id 5 --csv scripts/eval/laws.csv --rerank off    # 对比不精排的效果
     python3 scripts/eval_retrieval.py --kb-id 5 --csv scripts/eval/laws.csv --rewrite off   # 对比不做查询改写的效果
     python3 scripts/eval_retrieval.py --kb-id 12 --csv scripts/eval/library.csv --scope off # 忽略 scope 列，在整个知识库里检索
+    python3 scripts/eval_retrieval.py --kb-id 12 --csv http://localhost:8080/api/knowledge-bases/12/eval-cases.csv
+                                                    # 直接读取在"问答分析"页从真实问答中整理出的评测题
 
 默认与问答一致：先由后端调用 LLM 做查询改写（原问题 + 术语改写）再检索，每题多一次 DeepSeek 调用。
 
@@ -38,6 +40,7 @@ import csv
 import json
 import re
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -313,11 +316,20 @@ def write_details(path: Path, outcomes: list[Outcome]):
             ])
 
 
+def fetch_csv(url: str) -> Path:
+    """下载后端导出的评测题 CSV 到临时文件。"""
+    with urllib.request.urlopen(url, timeout=60) as response:
+        data = response.read()
+    path = Path(tempfile.gettempdir()) / "skb-eval-cases.csv"
+    path.write_bytes(data)
+    return path
+
+
 def main():
     default_top_k, default_min_score = read_retrieval_defaults()
     parser = argparse.ArgumentParser(description="知识库检索评测")
     parser.add_argument("--kb-id", type=int, required=True, help="知识库 ID")
-    parser.add_argument("--csv", type=Path, required=True, help="题集 CSV 路径")
+    parser.add_argument("--csv", required=True, help="题集 CSV 路径，也可以是后端导出评测题的地址（http 开头）")
     parser.add_argument("--base-url", default="http://localhost:8080", help="后端地址，默认 %(default)s")
     parser.add_argument("--top-k", type=int, default=10, help="每题召回条数（1~50），默认 %(default)s")
     parser.add_argument("--retrieval-top-k", type=int, default=default_top_k,
@@ -334,7 +346,7 @@ def main():
     parser.add_argument("--out", type=Path, help="把逐题明细写入 CSV")
     args = parser.parse_args()
 
-    cases = load_cases(args.csv)
+    cases = load_cases(fetch_csv(args.csv) if args.csv.startswith(("http://", "https://")) else Path(args.csv))
     if not cases:
         sys.exit("题集为空")
 

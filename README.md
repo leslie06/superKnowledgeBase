@@ -166,6 +166,7 @@ python3 scripts/import_dir.py --kb-id 7 --dir ~/资料 --out import.csv    # 上
 - **去重与上下文扩展**：精排后去掉内容几乎相同的结果（同一本书的多个副本）；组装参考资料时把命中片段在同一章节里的前后片段接上（每条最多 1500 字），跨片段的列举项、段落不再只给模型一半。
 - **精排**（`retrieval/RerankClient`）：RRF 前 20 个片段交给交叉编码器 bge-reranker-v2-m3 逐对打分并重排，相关性过滤改用精排分数。余弦相似度只反映话题像不像，分不清"有相关章节但没有答案"；精排后无答案题拒答 7/19 → 14/19，问答可用 114/118 → 117/118，单次检索总耗时约 2 秒（M2 Pro，MPS）。
 - **查询改写**（`retrieval/QueryRewriter`）：检索前让 DeepSeek 把口语问题改写成文档术语（如「10岁买游戏装备算数吗」→「限制民事行为能力人 民事法律行为效力」），多轮时补全指代；检索文本为「原问题 + 改写结果」。首字延迟增加约 1～2 秒，改写失败或超过 10 秒时退回原问题。
+- **反馈与问答分析**：每个回答下方可以点「有用 / 没用」，没用时选原因（没找到、答错了、不完整、引用不对）并补充说明。「问答分析」页统计最近的回答数、拒答率、差评、核对发现问题、精排未生效、慢（出字超过 15 秒）的回答，以及查询改写、检索、首字耗时的中位数和 P90；回答明细可展开查看检索查询、参考资料及分数、核对结果，确认是检索问题的点「加入评测题」，以后用 `python3 scripts/eval_retrieval.py --kb-id 12 --csv http://localhost:8080/api/knowledge-bases/12/eval-cases.csv` 回归。
 - **检索评测**：`scripts/eval_retrieval.py` 按题集统计 Hit@k、MRR、问答可用率和无答案题拒答率，题集与基线在 `scripts/eval/`。
 - **答案级评测**：`scripts/eval_answer.py` 逐题真实调用问答接口，由 DeepSeek 当裁判检查要点是否答全、有没有资料之外的内容、`[n]` 引用是否正确、无答案题是否拒答；答案要点在 `scripts/eval/answers/`。当前 109 道有答案题答对 105 道，19 道无答案题全部拒答，116 个回答中 3 个含资料外的内容，未发现引用错误。
 - **去重与版本替换**：同一知识库内按 SHA-256 去重；路径（单独上传时为文件名）相同而内容变化的文件替换旧版本。
@@ -185,7 +186,10 @@ python3 scripts/import_dir.py --kb-id 7 --dir ~/资料 --out import.csv    # 上
 | POST | `/api/documents/{id}/reindex` | 重新处理 |
 | POST | `/api/knowledge-bases/{id}/search` | 检索调试（不调用 LLM），可用 `folders`、`documentIds` 限定范围 |
 | PUT | `/api/conversations/{id}/scope` | 修改对话的检索范围（`{"folders": [...], "documentIds": [...]}`，都为空表示整个知识库） |
-| POST | `/api/conversations/{id}/chat` | 问答，SSE 事件：`citations` → `delta`* → `done` / `error` |
+| POST | `/api/conversations/{id}/chat` | 问答，SSE 事件：`citations` → `delta`* → `done` → `verification` / `error` |
+| PUT | `/api/messages/{id}/feedback` | 评价回答：`{"rating": "UP" \| "DOWN" \| null, "reason": "NOT_FOUND", "note": "..."}` |
+| GET | `/api/knowledge-bases/{id}/insights?days=30` | 问答统计和需要关注的回答（差评、拒答、核对有问题、精排未生效、慢） |
+| GET/POST | `/api/knowledge-bases/{id}/eval-cases` | 从真实问答中整理的评测题；`eval-cases.csv` 导出为评测脚本的题集格式 |
 
 ## 后续路线
 

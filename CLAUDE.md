@@ -65,6 +65,12 @@ npm run typecheck    # vue-tsc 类型检查
 - `chat/ChatService`：先用 `retrieval/QueryRewriter` 让 LLM 把问题改写成文档术语（多轮时同时补全指代），检索文本为「原问题 + 换行 + 改写结果」，单轮也改写 → 检索 → `Retriever.expand` 把命中片段在同一文档、同一章节里的前后片段接上（每条最多 `skb.chat.expand-chars` 字，相邻的命中片段并成一条）→ 按 `skb.chat.max-context-chars` 预算组装带编号的参考资料 → `ChatClient` 流式生成。返回 SSE 事件 `citations` → `delta`* → `done` → `verification`（出错时为 `error`），前端 `ChatView.vue` 依赖这个顺序。`verification` 来自 `AnswerVerifier`：回答保存后再请 DeepSeek 对照参考资料找出无依据内容和对不上的 `[n]` 引用（判定标准与 `scripts/eval_answer.py` 的裁判一致），写入 `message.verification` 并推给前端；`skb.chat.verify-answers` 关闭，核对失败时不发送。前端收到 `done` 就允许继续提问，核对结果稍后到达。无命中时不调用 LLM，直接返回固定回答。改写后的查询和命中分数作为 `retrieval_trace` 存入 `message` 表，便于排查 bad case。
 - 未配置 DeepSeek Key 时应用依然可以启动（占位值 `not-configured`），只有问答接口会返回 error 事件。
 
+### 反馈与问答分析
+
+- 回答评价存在 `message.feedback / feedback_reason / feedback_note`（`PUT /api/messages/{id}/feedback`，取消时返回 204）。
+- `insight/InsightService` 从 `message` 已有的 `retrieval_trace`（检索查询、命中分数、`timings`）、`verification`、评价算统计和坏案例，不需要额外埋点；判定规则见 `flags()`：拒答 = 没有参考资料或回答含「知识库中没有找到」（不用「资料中没有说明」，正常回答里也常出现）；精排未生效 = 命中片段都没有 `rerankScore`；慢 = 改写 + 检索 + 首字超过 15 秒。评测脚本创建的会话（标题以「[评测]」开头）不计入。
+- `eval_case` 表存从坏案例整理出的评测题，`/api/knowledge-bases/{id}/eval-cases.csv` 导出为 `eval_retrieval.py` 的题集格式，脚本的 `--csv` 可以直接填这个地址。
+
 ### 错误处理
 
 Service 层用异常表达业务错误，`GlobalExceptionHandler` 统一映射为 `ProblemDetail`：`NotFoundException` → 404，`IllegalArgumentException` → 400，`IllegalStateException` → 409。前端 `api.ts` 读取响应中的 `detail` 字段展示错误。

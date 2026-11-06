@@ -6,9 +6,10 @@ import { ChatLineSquare, Delete, EditPen, MoreFilled, Plus, Promotion, VideoPaus
 import CitationDrawer from '../components/CitationDrawer.vue'
 import ScopeSelector from '../components/ScopeSelector.vue'
 import { api, streamChat } from '../api'
+import { FEEDBACK_REASONS } from '../format'
 import { renderMarkdown } from '../markdown'
 import { store } from '../store'
-import type { AnswerVerification, ChatMessage, Citation, Conversation, SearchScope } from '../types'
+import type { AnswerVerification, ChatMessage, Citation, Conversation, FeedbackReason, SearchScope } from '../types'
 
 const props = defineProps<{ kbId: string; convId?: string }>()
 const router = useRouter()
@@ -23,6 +24,10 @@ const question = ref('')
 const streaming = ref(false)
 const messagesEl = ref<HTMLElement>()
 const activeCitation = ref<Citation | null>(null)
+/** 正在填写"没用"原因的回答 */
+const feedbackTarget = ref<ChatMessage | null>(null)
+const feedbackReason = ref<FeedbackReason>('NOT_FOUND')
+const feedbackNote = ref('')
 /** 当前会话的检索范围；还没有会话时，新建会话会带上它 */
 const scope = ref<SearchScope>({ folders: [], documentIds: [] })
 let abortController: AbortController | null = null
@@ -173,6 +178,34 @@ function scrollToBottom(force = false) {
   })
 }
 
+/** 再点一次同一个按钮取消评价；"没用"先选原因 */
+async function rate(m: ChatMessage, rating: 'UP' | 'DOWN') {
+  if (m.id == null) return
+  if (rating === 'DOWN' && m.feedback?.rating !== 'DOWN') {
+    feedbackTarget.value = m
+    feedbackReason.value = 'NOT_FOUND'
+    feedbackNote.value = ''
+    return
+  }
+  try {
+    m.feedback = (await api.feedback(m.id, m.feedback?.rating === rating ? null : rating)) ?? null
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  }
+}
+
+async function submitDown() {
+  const m = feedbackTarget.value
+  if (!m || m.id == null) return
+  try {
+    m.feedback = (await api.feedback(m.id, 'DOWN', feedbackReason.value, feedbackNote.value.trim())) ?? null
+    feedbackTarget.value = null
+    ElMessage.success('已记录，可以在「问答分析」中查看')
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  }
+}
+
 function issueCount(v: AnswerVerification) {
   return v.unsupported.length + v.citationErrors.length
 }
@@ -280,6 +313,12 @@ async function onConversationCommand(command: string, conv: Conversation) {
                 </li>
               </ul>
             </div>
+            <div v-if="m.id != null && !m.streaming" class="answer-actions">
+              <button :class="{ active: m.feedback?.rating === 'UP' }" @click="rate(m, 'UP')">👍 有用</button>
+              <button :class="{ active: m.feedback?.rating === 'DOWN' }" @click="rate(m, 'DOWN')">
+                👎 没用<template v-if="m.feedback?.rating === 'DOWN' && m.feedback.reason">：{{ FEEDBACK_REASONS[m.feedback.reason] }}</template>
+              </button>
+            </div>
           </div>
         </div>
       </div>
@@ -302,5 +341,17 @@ async function onConversationCommand(command: string, conv: Conversation) {
     </section>
 
     <CitationDrawer :citation="activeCitation" @close="activeCitation = null" />
+
+    <el-dialog :model-value="!!feedbackTarget" title="这个回答哪里不好？" width="440px" @close="feedbackTarget = null">
+      <el-radio-group v-model="feedbackReason" class="feedback-reasons">
+        <el-radio v-for="(label, key) in FEEDBACK_REASONS" :key="key" :value="key">{{ label }}</el-radio>
+      </el-radio-group>
+      <el-input v-model="feedbackNote" type="textarea" :rows="3" maxlength="500"
+                placeholder="可选：正确答案在哪个文件、哪里说得不对，方便以后排查" />
+      <template #footer>
+        <el-button @click="feedbackTarget = null">取消</el-button>
+        <el-button type="primary" @click="submitDown">提交</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>

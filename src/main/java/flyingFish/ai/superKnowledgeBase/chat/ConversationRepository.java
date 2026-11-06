@@ -95,11 +95,35 @@ public class ConversationRepository {
                 .params(toJson(verification), messageId).update();
     }
 
+    public Optional<String> findMessageRole(long messageId) {
+        return jdbc.sql("SELECT role FROM message WHERE id = ?").param(messageId).query(String.class).optional();
+    }
+
+    /** feedback 为 null 时清除评价 */
+    public void updateFeedback(long messageId, Feedback feedback) {
+        if (feedback == null) {
+            jdbc.sql("""
+                            UPDATE message SET feedback = NULL, feedback_reason = NULL, feedback_note = NULL, feedback_at = NULL
+                            WHERE id = ?
+                            """)
+                    .param(messageId).update();
+            return;
+        }
+        jdbc.sql("""
+                        UPDATE message SET feedback = ?, feedback_reason = ?, feedback_note = ?, feedback_at = now()
+                        WHERE id = ?
+                        """)
+                .params(feedback.rating(), feedback.reason(), feedback.note(), messageId)
+                .update();
+    }
+
     private ChatMessage mapMessage(ResultSet rs, int rowNum) throws SQLException {
         String verification = rs.getString("verification");
+        String rating = rs.getString("feedback");
         return new ChatMessage(rs.getLong("id"), rs.getLong("conversation_id"), rs.getString("role"),
                 rs.getString("content"), parseCitations(rs.getString("citations")),
                 verification == null ? null : jsonMapper.readValue(verification, Verification.class),
+                rating == null ? null : new Feedback(rating, rs.getString("feedback_reason"), rs.getString("feedback_note")),
                 rs.getObject("created_at", OffsetDateTime.class));
     }
 

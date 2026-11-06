@@ -3,6 +3,7 @@ package flyingFish.ai.superKnowledgeBase.chat;
 import flyingFish.ai.superKnowledgeBase.retrieval.SearchScope;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
 import org.springframework.http.codec.ServerSentEvent;
 import org.springframework.web.bind.annotation.*;
 import reactor.core.publisher.Flux;
@@ -18,6 +19,10 @@ public class ChatController {
     }
 
     public record ChatRequest(String question) {
+    }
+
+    /** @param rating UP / DOWN，为空表示取消评价；reason 见 {@link Feedback} */
+    public record FeedbackRequest(String rating, String reason, String note) {
     }
 
     private final ChatService service;
@@ -57,6 +62,13 @@ public class ChatController {
     @GetMapping("/conversations/{id}/messages")
     public List<ChatMessage> messages(@PathVariable long id) {
         return service.messages(id);
+    }
+
+    @PutMapping("/messages/{id}/feedback")
+    public ResponseEntity<Feedback> feedback(@PathVariable long id, @RequestBody FeedbackRequest request) {
+        Feedback feedback = service.feedback(id, request.rating(), request.reason(), request.note());
+        // 取消评价时没有内容返回
+        return feedback == null ? ResponseEntity.noContent().build() : ResponseEntity.ok(feedback);
     }
 
     @PostMapping(value = "/conversations/{id}/chat", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
