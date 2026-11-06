@@ -16,8 +16,10 @@ import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
@@ -39,6 +41,21 @@ public class Retriever {
     public enum Mode {HYBRID, VECTOR, KEYWORD}
 
     private record Hit(long chunkId, double score) {
+    }
+
+    /**
+     * 交给模型的上下文。
+     *
+     * @param chunks            按顺序排好的参考资料：先是读全文的小文档（按原文顺序分段），再是其他文档的命中片段（已扩展）
+     * @param fullTextDocuments 读了全文的文档的文件名
+     */
+    public record Context(List<RetrievedChunk> chunks, List<String> fullTextDocuments) {
+    }
+
+    private record DocumentSize(Long documentId, long chars) {
+    }
+
+    record TextRow(Long chunkId, String headingPath, String location, String content) {
     }
 
     /** 命中片段所在章节里的相邻片段（含命中片段本身） */
@@ -70,12 +87,16 @@ public class Retriever {
      * 向量相似度却排不进全库前 30。精排候选总数不变，由它们挤掉 RRF 排名最靠后的几个。
      */
     private static final int KEYWORD_RERANK_GUARANTEE = 3;
+    /** 含问题中编号的片段最多补进这么多个候选；同一编号在别的文档里被引用（"本法第十七条"）时也会命中 */
+    private static final int MAX_EXACT_CANDIDATES = 10;
     /**
      * 与排名更靠前的结果相似度达到这个值的片段视为重复，不再返回。同一本书的多个副本、同一译本的不同扫描版
      * 会让同一段话占掉好几个参考资料名额（"林黛玉进贾府"的前 6 个结果里有 3 对完全相同）；
      * 同一页的相邻片段、格式相近的表格行相似度在 0.5～0.7，不受影响。
      */
     private static final double DUPLICATE_SIMILARITY = 0.85;
+    /** 读全文时每段最多这么多字：按章节切开，每段作为一条参考资料，模型可以按 [n] 标注出处 */
+    private static final int FULL_TEXT_SECTION_CHARS = 2500;
     private static final Pattern PAGE_LOCATION = Pattern.compile("^第(\\d+)(?:-(\\d+))?页$");
 
     private final JdbcClient jdbc;
@@ -209,12 +230,17 @@ public class Retriever {
             Map<Long, Double> fused = new HashMap<>();
             vectorRanks.forEach((id, rank) -> fused.merge(id, 1.0 / (rrfK + rank), Double::sum));
             keywordRanks.forEach((id, rank) -> fused.merge(id, keywordWeight / (rrfK + rank), Double::sum));
-            if (fused.isEmpty()) {
-                return List.of();
-            }
 
             // 纯向量模式用于对比单路效果，不做精确命中优先
             Set<String> exactTerms = mode == Mode.VECTOR ? Set.of() : KeywordAnalyzer.exactTerms(terms);
+            // 含问题中编号的片段必进候选：精确命中优先只能给已召回的片段排序。改写后检索文本多了"中华人民共和国""条文内容"
+            // 这类词，民法典第十七条被挤出了关键词召回的前 30，向量召回也没有它，问"民法典第十七条是什么"就答不上来
+            if (!exactTerms.isEmpty()) {
+                exactMatchIds(kbId, documentIds, exactTerms).forEach(id -> fused.putIfAbsent(id, 0.0));
+            }
+            if (fused.isEmpty()) {
+                return List.of();
+            }
             Map<Long, ChunkRow> rows = loadChunks(fused.keySet(), vector, exactTerms);
             // 问题里写明了"第39条""Q5"这类编号时，包含它的片段几乎一定是用户要找的，直接排到最前
             return rows.values().stream()
@@ -290,6 +316,77 @@ public class Retriever {
             grams.add(compact.substring(i, i + 3));
         }
         return grams;
+    }
+
+    /**
+     * 组装交给模型的上下文。命中片段所属的小文档整篇交给模型：按排名依次取文档，全文字数累计不超过 fullTextChars 的
+     * 读全文，其余文档（几十万字的书）仍是命中片段加相邻片段（{@link #expand}）。
+     * 只给命中的几段时，答案常常恰好在第 7、第 10 段；合同、手册这类几万字的文档，读完全文才能回答"押金和违约金一共多少"
+     * "哪些条款对承租人不利"这类要综合多处的问题。fullTextChars 为 0 时不读全文。
+     */
+    public Context context(List<RetrievedChunk> hits, int expandChars, int fullTextChars) {
+        if (hits.isEmpty() || fullTextChars <= 0) {
+            return new Context(expand(hits, expandChars), List.of());
+        }
+        List<Long> documentIds = hits.stream().map(RetrievedChunk::documentId).distinct().toList();
+        Map<Long, Long> sizes = jdbc.sql("""
+                        SELECT document_id, sum(length(content)) AS chars FROM chunk
+                        WHERE kind = 'TEXT' AND document_id IN (:ids) GROUP BY document_id
+                        """)
+                .param("ids", documentIds)
+                .query(DocumentSize.class).list().stream()
+                .collect(Collectors.toMap(DocumentSize::documentId, DocumentSize::chars));
+        Set<Long> fullText = new LinkedHashSet<>();
+        long used = 0;
+        for (Long id : documentIds) {
+            long size = sizes.getOrDefault(id, Long.MAX_VALUE);
+            if (used + size <= fullTextChars) {
+                fullText.add(id);
+                used += size;
+            }
+        }
+        List<RetrievedChunk> chunks = new ArrayList<>();
+        List<String> names = new ArrayList<>();
+        for (Long id : fullText) {
+            RetrievedChunk best = hits.stream().filter(h -> h.documentId().equals(id)).findFirst().orElseThrow();
+            chunks.addAll(fullTextSections(best));
+            names.add(best.filename());
+        }
+        chunks.addAll(expand(hits.stream().filter(h -> !fullText.contains(h.documentId())).toList(), expandChars));
+        return new Context(chunks, names);
+    }
+
+    /** 文档全文按原文顺序分段：章节变化或超过 FULL_TEXT_SECTION_CHARS 时另起一段；分数沿用该文档排名最前的命中片段 */
+    private List<RetrievedChunk> fullTextSections(RetrievedChunk best) {
+        List<TextRow> rows = jdbc.sql("""
+                        SELECT id AS chunk_id, heading_path, location, content FROM chunk
+                        WHERE document_id = ? AND kind = 'TEXT' ORDER BY chunk_index
+                        """)
+                .param(best.documentId())
+                .query(TextRow.class).list();
+        return sections(rows, FULL_TEXT_SECTION_CHARS).stream().map(section -> new RetrievedChunk(section.getFirst().chunkId(), best.documentId(),
+                best.filename(), section.getFirst().headingPath(),
+                mergeLocations(section.getFirst().location(), section.getLast().location()),
+                section.stream().map(TextRow::content).collect(Collectors.joining("\n")), best.score(), null, null, null,
+                best.rerankScore(), false, true, "TEXT")).toList();
+    }
+
+    /** 按原文顺序分段：章节变化或累计超过 maxChars 时另起一段 */
+    static List<List<TextRow>> sections(List<TextRow> rows, int maxChars) {
+        List<List<TextRow>> sections = new ArrayList<>();
+        int length = 0;
+        for (TextRow row : rows) {
+            List<TextRow> current = sections.isEmpty() ? null : sections.getLast();
+            if (current == null || !Objects.equals(current.getFirst().headingPath(), row.headingPath())
+                    || length + row.content().length() > maxChars) {
+                current = new ArrayList<>();
+                sections.add(current);
+                length = 0;
+            }
+            current.add(row);
+            length += row.content().length();
+        }
+        return sections;
     }
 
     /**
@@ -502,6 +599,20 @@ public class Retriever {
                 .param("b", BM25_B)
                 .param("limit", limit)
                 .query(Hit.class)
+                .list();
+    }
+
+    /** 含精确词项（条款号、型号等）的片段，最多 MAX_EXACT_CANDIDATES 个 */
+    private List<Long> exactMatchIds(long kbId, List<Long> documentIds, Set<String> exactTerms) {
+        return withScope(jdbc.sql("""
+                        SELECT c.id FROM chunk c
+                        WHERE c.kb_id = :kbId %s AND c.keyword_tsv @@ CAST(:exact AS tsquery)
+                        LIMIT :limit
+                        """.formatted(scopeCondition(documentIds))), documentIds)
+                .param("kbId", kbId)
+                .param("exact", KeywordAnalyzer.toTsquery(exactTerms))
+                .param("limit", MAX_EXACT_CANDIDATES)
+                .query(Long.class)
                 .list();
     }
 

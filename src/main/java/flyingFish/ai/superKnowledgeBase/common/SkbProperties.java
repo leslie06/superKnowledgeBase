@@ -47,9 +47,10 @@ public record SkbProperties(String storageDir, Ingestion ingestion, Chunk chunk,
      * @param expandChars     每条参考资料扩展到的最大字数：把命中片段在同一章节里的前后片段一起交给模型，0 表示不扩展
      * @param verifyAnswers   生成回答后是否再请 LLM 对照参考资料核对（找出无依据内容和引用错误），每个问题多一次调用
      * @param aggregateContextChars 汇总类问题的参考资料字数预算（普通问题是 maxContextChars）
+     * @param fullTextChars   命中片段所属的小文档整篇交给模型，全文字数累计不超过这个值（另计，不占上面两个预算）；0 表示不读全文
      */
     public record Chat(int historyMessages, int maxContextChars, int expandChars, boolean verifyAnswers,
-                       int aggregateContextChars) {
+                       int aggregateContextChars, int fullTextChars) {
     }
 
     /**

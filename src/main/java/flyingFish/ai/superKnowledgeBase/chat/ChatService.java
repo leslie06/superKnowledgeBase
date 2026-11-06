@@ -32,6 +32,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.stream.Collectors;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -69,7 +70,8 @@ public class ChatService {
     /** 汇总类问题附在参考资料后面的说明：资料是多路检索合起来的，可能只覆盖一部分 */
     private static final String AGGREGATE_HINT = """
             【说明】这个问题需要汇总多处资料，以上参考资料来自几次检索。请逐项整理资料中涉及的内容，分别标注来源；
-            资料只覆盖了一部分时，在回答中说明"以下根据检索到的资料整理，可能不完整"，资料中没有的项不要自行补充。
+            资料只覆盖了一部分时，在回答中说明"以下根据检索到的资料整理，可能不完整"（已提供全文的文档不需要这样说明），
+            资料中没有的项不要自行补充。
 
             """;
 
@@ -78,7 +80,8 @@ public class ChatService {
      * @param timings 各环节耗时（毫秒），同样写入 retrieval_trace，用于排查"回答慢"
      */
     private record PreparedChat(Conversation conversation, List<ChatMessage> history, String question,
-                                String searchQuery, QueryPlanner.Plan plan, List<Citation> citations,
+                                String searchQuery, QueryPlanner.Plan plan, List<String> fullTextDocuments,
+                                List<Citation> citations,
                                 List<Map<String, Object>> hits, Map<String, Long> timings) {
     }
 
@@ -94,6 +97,7 @@ public class ChatService {
     private final int historyMessages;
     private final int maxContextChars;
     private final int aggregateContextChars;
+    private final int fullTextChars;
     private final int expandChars;
     private final boolean verifyAnswers;
     private final boolean apiKeyConfigured;
@@ -115,6 +119,7 @@ public class ChatService {
         this.historyMessages = properties.chat().historyMessages();
         this.maxContextChars = properties.chat().maxContextChars();
         this.aggregateContextChars = properties.chat().aggregateContextChars();
+        this.fullTextChars = properties.chat().fullTextChars();
         this.expandChars = properties.chat().expandChars();
         this.verifyAnswers = properties.chat().verifyAnswers();
         this.apiKeyConfigured = StringUtils.hasText(apiKey) && !NO_API_KEY.equals(apiKey) && !"sk-xxxx".equals(apiKey);
@@ -228,15 +233,17 @@ public class ChatService {
         List<RetrievedChunk> chunks = plan.aggregate()
                 ? retriever.retrieveAggregate(conversation.kbId(), searchQuery, plan.subQueries(), conversation.scope())
                 : retriever.retrieve(conversation.kbId(), searchQuery, conversation.scope());
-        // 扩展后相邻的命中片段会并成一条，trace 仍按原始命中记录
-        List<RetrievedChunk> context = retriever.expand(chunks, expandChars);
+        // 小文档读全文，其余扩展相邻片段（相邻的命中片段会并成一条）；trace 仍按原始命中记录
+        Retriever.Context context = retriever.context(chunks, expandChars, fullTextChars);
         Map<String, Long> timings = new LinkedHashMap<>();
         timings.put("rewriteMs", (rewrittenAt - start) / 1_000_000);
         timings.put("retrieveMs", (System.nanoTime() - rewrittenAt) / 1_000_000);
-        log.info("问答准备完成：查询改写 {} ms，检索 {} ms{}", timings.get("rewriteMs"), timings.get("retrieveMs"),
-                plan.aggregate() ? "（汇总类问题，" + plan.subQueries().size() + " 个子问题）" : "");
-        return new PreparedChat(conversation, history, question, searchQuery, plan,
-                toCitations(context, plan.aggregate() ? aggregateContextChars : maxContextChars), trace(chunks), timings);
+        log.info("问答准备完成：查询改写 {} ms，检索 {} ms{}{}", timings.get("rewriteMs"), timings.get("retrieveMs"),
+                plan.aggregate() ? "（汇总类问题，" + plan.subQueries().size() + " 个子问题）" : "",
+                context.fullTextDocuments().isEmpty() ? "" : "，读全文：" + context.fullTextDocuments());
+        int budget = (plan.aggregate() ? aggregateContextChars : maxContextChars) + fullTextChars;
+        return new PreparedChat(conversation, history, question, searchQuery, plan, context.fullTextDocuments(),
+                toCitations(context.chunks(), budget), trace(chunks), timings);
     }
 
     private Flux<ServerSentEvent<String>> answer(PreparedChat chat) {
@@ -314,7 +321,7 @@ public class ChatService {
     /** done 事件带上各环节耗时，前端显示在回答下方 */
     private ServerSentEvent<String> doneEvent(long messageId, PreparedChat chat) {
         return event("done", Map.of("messageId", messageId, "timings", chat.timings(),
-                "subQueries", chat.plan().subQueries()));
+                "subQueries", chat.plan().subQueries(), "fullTextDocuments", chat.fullTextDocuments()));
     }
 
     private long saveAssistantMessage(PreparedChat chat, String answer) {
@@ -325,6 +332,9 @@ public class ChatService {
         }
         if (chat.plan().aggregate()) {
             trace.put("subQueries", chat.plan().subQueries());
+        }
+        if (!chat.fullTextDocuments().isEmpty()) {
+            trace.put("fullTextDocuments", chat.fullTextDocuments());
         }
         trace.put("hits", chat.hits());
         trace.put("timings", chat.timings());
@@ -378,6 +388,10 @@ public class ChatService {
                 sb.append(" ｜ ").append(c.location());
             }
             sb.append('\n').append(c.content()).append("\n\n");
+        }
+        if (!chat.fullTextDocuments().isEmpty()) {
+            sb.append("【说明】以上参考资料包含").append(chat.fullTextDocuments().stream().map(n -> "《" + n + "》")
+                    .collect(Collectors.joining())).append("的全文（按原文顺序分段），可以通读后综合判断；其余是检索到的片段。\n\n");
         }
         if (chat.plan().aggregate()) {
             sb.append(AGGREGATE_HINT);

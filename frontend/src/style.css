@@ -1059,6 +1059,14 @@ a:hover {
   cursor: help;
 }
 
+.answer-plan {
+  max-width: 260px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.answer-plan + .answer-plan,
 .answer-plan + .answer-timing {
   margin-left: 8px;
 }

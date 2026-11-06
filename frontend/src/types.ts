@@ -132,6 +132,8 @@ export interface ChatMessage {
   timings?: Record<string, number>
   /** 汇总类问题拆出的子问题（多步检索），普通问题为空 */
   subQueries?: string[]
+  /** 整篇交给模型的小文档的文件名 */
+  fullTextDocuments?: string[]
   /** 前端记录：按下发送的时间（毫秒时间戳），用于显示实时耗时 */
   startedAt?: number
   streaming?: boolean

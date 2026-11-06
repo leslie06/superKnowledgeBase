@@ -66,6 +66,19 @@ class RetrieverTests {
     }
 
     @Test
+    void fullTextSectionsSplitOnHeadingChangeAndLength() {
+        List<Retriever.TextRow> rows = List.of(
+                new Retriever.TextRow(1L, "第一章", "第1页", "a".repeat(400)),
+                new Retriever.TextRow(2L, "第一章", "第2页", "b".repeat(400)),
+                new Retriever.TextRow(3L, "第一章", "第3页", "c".repeat(400)),
+                new Retriever.TextRow(4L, "第二章", "第3页", "d".repeat(100)),
+                new Retriever.TextRow(5L, null, "第4页", "e".repeat(100)));
+
+        assertThat(Retriever.sections(rows, 1000)).extracting(s -> s.stream().map(Retriever.TextRow::chunkId).toList())
+                .containsExactly(List.of(1L, 2L), List.of(3L), List.of(4L), List.of(5L));
+    }
+
+    @Test
     void mergesPageLocations() {
         assertThat(Retriever.mergeLocations("第3页", "第4-5页")).isEqualTo("第3-5页");
         assertThat(Retriever.mergeLocations("第3-4页", "第4页")).isEqualTo("第3-4页");
