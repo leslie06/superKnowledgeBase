@@ -89,7 +89,7 @@ skb:
     sub-query-rerank-candidates: 10
     # 迭代检索：检索后先请 LLM 判断资料够不够回答，不够时换原文可能用的说法补查（"西门庆死在谁的床上"首轮只检索到
     # 生前"床上"的情节，原文写的是"断气身亡""丧命"），最多补查这么多轮；资料够用时只多一次判断调用。0 表示不补查
-    max-follow-ups: 2
+    max-follow-ups: 1
   rerank:
     # 交叉编码器精排，需先启动 scripts/rerank_server.py；服务不可用时退回 RRF 排序和上面的 min-score
     enabled: true

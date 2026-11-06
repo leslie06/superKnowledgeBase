@@ -42,8 +42,8 @@ public class RetrievalPipeline {
     public record FollowUp(int round, String missing, List<String> queries, List<String> context, int added) {
     }
 
-    /** 补看前后文时，每处最多补进这么多字（约十几个片段） */
-    private static final int SURROUNDING_CHARS = 10_000;
+    /** 补看前后文时，每处最多补进这么多字（约七八个片段）；一万字时一题要读 6 万字资料、30 秒 */
+    public static final int SURROUNDING_CHARS = 5_000;
 
     /**
      * @param hits      交给问答的相关片段：普通问题最多 top-k 个，汇总类问题和补充检索后更多
