@@ -11,6 +11,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.Deque;
 import java.util.HashMap;
@@ -91,6 +92,8 @@ public class Retriever {
     private static final int MAX_EXACT_CANDIDATES = 10;
     /** 每轮补充检索最多补进这么多个新片段 */
     private static final int FOLLOW_UP_MAX_NEW = 8;
+    /** 补看前后文时最多取这么多个片段，再按字数截断 */
+    private static final int SURROUNDING_MAX_CHUNKS = 30;
     /**
      * 与排名更靠前的结果相似度达到这个值的片段视为重复，不再返回。同一本书的多个副本、同一译本的不同扫描版
      * 会让同一段话占掉好几个参考资料名额（"林黛玉进贾府"的前 6 个结果里有 3 对完全相同）；
@@ -190,6 +193,42 @@ public class Retriever {
         found.stream().filter(c -> !known.contains(c.chunkId())).forEach(merged::add);
         // 已有片段排在前面，dropDuplicates 保留先出现的，与已有内容重复的新片段会被去掉
         return dropDuplicates(merged).stream().filter(c -> !known.contains(c.chunkId())).limit(FOLLOW_UP_MAX_NEW).toList();
+    }
+
+    private record OrderedRow(Long chunkId, int chunkIndex, String headingPath, String location, String content) {
+    }
+
+    /**
+     * 原文中紧挨着 anchor 的前文或后文，按原文顺序，累计最多 maxChars 字。叙事类文本里原因写在事件之前、结果写在之后：
+     * 找到"西门庆断气身亡"这段后，死因（潘金莲灌下三丸药、吴神仙诊为"酒色过度"）在之前十来段里。分数沿用 anchor。
+     */
+    public List<RetrievedChunk> surrounding(RetrievedChunk anchor, boolean before, int maxChars) {
+        List<OrderedRow> rows = jdbc.sql("""
+                        SELECT c.id AS chunk_id, c.chunk_index, c.heading_path, c.location, c.content
+                        FROM chunk c JOIN chunk a ON a.id = :anchor AND c.document_id = a.document_id
+                        WHERE c.kind = 'TEXT' AND %s
+                        ORDER BY c.chunk_index %s
+                        LIMIT :limit
+                        """.formatted(before ? "c.chunk_index < a.chunk_index" : "c.chunk_index > a.chunk_index",
+                        before ? "DESC" : "ASC"))
+                .param("anchor", anchor.chunkId())
+                .param("limit", SURROUNDING_MAX_CHUNKS)
+                .query(OrderedRow.class).list();
+        List<RetrievedChunk> result = new ArrayList<>();
+        int used = 0;
+        for (OrderedRow row : rows) {
+            if (!result.isEmpty() && used + row.content().length() > maxChars) {
+                break;
+            }
+            used += row.content().length();
+            result.add(new RetrievedChunk(row.chunkId(), anchor.documentId(), anchor.filename(), row.headingPath(),
+                    row.location(), row.content(), anchor.score(), null, null, null, anchor.rerankScore(), false, true,
+                    "TEXT"));
+        }
+        if (before) {
+            Collections.reverse(result);
+        }
+        return result;
     }
 
     /** 依次取每一路的第 1 个、再依次取第 2 个……，同一片段只保留第一次出现 */

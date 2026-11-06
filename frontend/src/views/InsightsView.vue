@@ -196,7 +196,8 @@ const evalCommand = computed(() =>
                   <dt>补充检索</dt>
                   <dd>
                     <div v-for="f in row.followUps" :key="f.round">
-                      第 {{ f.round }} 轮：{{ f.missing }} → 查{{ f.queries.map((q: string) => `「${q}」`).join('') }}，补到 {{ f.added }} 段
+                      第 {{ f.round }} 轮：{{ f.missing }} →
+                      {{ [...f.queries.map((q: string) => `查「${q}」`), ...(f.context ?? []).map((c: string) => `补看${c}`)].join('、') }}，补到 {{ f.added }} 段
                     </div>
                   </dd>
                 </template>

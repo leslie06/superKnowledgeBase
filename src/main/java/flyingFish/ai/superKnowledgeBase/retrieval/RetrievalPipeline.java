@@ -8,10 +8,12 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 /**
@@ -32,9 +34,16 @@ public class RetrievalPipeline {
         public static final Options CHAT = new Options(true, true, 0);
     }
 
-    /** 一轮补充检索：缺什么、查了什么、补进几个新片段 */
-    public record FollowUp(int round, String missing, List<String> queries, int added) {
+    /**
+     * 一轮补充检索：缺什么、查了什么、补看了哪些资料的前后文、补进几个新片段
+     *
+     * @param context 补看前后文的资料，如"《金瓶梅》第655-656页的前文"
+     */
+    public record FollowUp(int round, String missing, List<String> queries, List<String> context, int added) {
     }
+
+    /** 补看前后文时，每处最多补进这么多字（约十几个片段） */
+    private static final int SURROUNDING_CHARS = 10_000;
 
     /**
      * @param hits      交给问答的相关片段：普通问题最多 top-k 个，汇总类问题和补充检索后更多
@@ -102,12 +111,29 @@ public class RetrievalPipeline {
                     break;
                 }
                 tried.addAll(verdict.queries());
-                List<RetrievedChunk> added = retriever.retrieveMore(kbId, verdict.queries(), scope, hits);
-                followUps.add(new FollowUp(round, verdict.missing(), verdict.queries(), added.size()));
-                if (added.isEmpty()) {
+                List<RetrievedChunk> merged = new ArrayList<>(hits);
+                // 前后文插在那段资料的前面或后面，模型读到的是连贯的原文
+                List<String> context = new ArrayList<>();
+                int before = merged.size();
+                for (EvidenceChecker.ContextRequest request : verdict.context()) {
+                    RetrievedChunk anchor = hits.get(request.index() - 1);
+                    Set<Long> known = merged.stream().map(RetrievedChunk::chunkId).collect(Collectors.toSet());
+                    List<RetrievedChunk> around = retriever.surrounding(anchor, request.before(), SURROUNDING_CHARS).stream()
+                            .filter(c -> !known.contains(c.chunkId())).toList();
+                    int position = merged.indexOf(anchor);
+                    merged.addAll(request.before() ? position : position + 1, around);
+                    context.add("《" + anchor.filename() + "》" + Objects.requireNonNullElse(anchor.location(), "")
+                            + (request.before() ? "的前文" : "的后文"));
+                }
+                if (!verdict.queries().isEmpty()) {
+                    merged.addAll(retriever.retrieveMore(kbId, verdict.queries(), scope, merged));
+                }
+                int added = merged.size() - before;
+                followUps.add(new FollowUp(round, verdict.missing(), verdict.queries(), context, added));
+                if (added == 0) {
                     break;
                 }
-                hits = Stream.concat(hits.stream(), added.stream()).toList();
+                hits = List.copyOf(merged);
                 raw = hits;
             }
         }

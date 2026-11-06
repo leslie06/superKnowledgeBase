@@ -70,6 +70,9 @@ public class ChatService {
             5. 用中文回答，先给出结论，再展开说明；内容较多时使用 Markdown 列表或表格。
             """;
 
+    /** 补看一处前后文额外增加的参考资料预算，与 RetrievalPipeline 每处补进的字数一致 */
+    private static final int FOLLOW_UP_CONTEXT_CHARS = 10_000;
+
     /** 汇总类问题附在参考资料后面的说明：资料是多路检索合起来的，可能只覆盖一部分 */
     private static final String AGGREGATE_HINT = """
             【说明】这个问题需要汇总多处资料，以上参考资料来自几次检索。请逐项整理资料中涉及的内容，分别标注来源；
@@ -234,9 +237,10 @@ public class ChatService {
                 result.followUps().isEmpty() ? "" : "，补充检索 " + result.followUps().size() + " 轮 "
                         + timings.get("followUpMs") + " ms",
                 context.fullTextDocuments().isEmpty() ? "" : "，读全文：" + context.fullTextDocuments());
-        // 汇总类问题和补充检索后片段更多，用更大的预算
-        boolean more = result.plan().aggregate() || !result.followUps().isEmpty();
-        int budget = (more ? aggregateContextChars : maxContextChars) + fullTextChars;
+        // 汇总类问题和补充检索后片段更多，用更大的预算；补看前后文时每处最多再多一万字
+        int budget = (result.plan().aggregate() || !result.followUps().isEmpty() ? aggregateContextChars : maxContextChars)
+                + fullTextChars + FOLLOW_UP_CONTEXT_CHARS * (int) result.followUps().stream()
+                .mapToLong(f -> f.context().size()).sum();
         return new PreparedChat(conversation, history, question, result.searchQuery(), result.plan(),
                 result.followUps(), context.fullTextDocuments(), toCitations(context.chunks(), budget), trace(chunks),
                 timings);

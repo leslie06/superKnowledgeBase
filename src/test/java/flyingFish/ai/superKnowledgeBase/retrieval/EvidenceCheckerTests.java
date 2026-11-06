@@ -18,7 +18,7 @@ class EvidenceCheckerTests {
                 ```json
                 {"sufficient": false, "missing": "缺少西门庆临终的情节",
                  "queries": ["西门庆 断气身亡", "西门庆死在谁的床上", "金瓶梅 第七十九回", "西门庆 丧命"]}
-                ```""", Set.of("西门庆死在谁的床上"));
+                ```""", Set.of("西门庆死在谁的床上"), 10);
 
         assertThat(v.sufficient()).isFalse();
         assertThat(v.missing()).isEqualTo("缺少西门庆临终的情节");
@@ -27,12 +27,24 @@ class EvidenceCheckerTests {
     }
 
     @Test
+    void contextRequestAloneMakesEvidenceInsufficient() {
+        EvidenceChecker.Verdict v = EvidenceChecker.parse(jsonMapper, """
+                {"sufficient": false, "missing": "死因在前文", "queries": [],
+                 "context": [{"index": 3, "direction": "before"}, {"index": 9, "direction": "before"},
+                             {"index": 2, "direction": "sideways"}]}""", Set.of(), 5);
+
+        assertThat(v.sufficient()).isFalse();
+        // 编号超出资料数量、方向不认识的请求忽略
+        assertThat(v.context()).containsExactly(new EvidenceChecker.ContextRequest(3, true));
+    }
+
+    @Test
     void treatsAnythingElseAsSufficient() {
-        assertThat(EvidenceChecker.parse(jsonMapper, "{\"sufficient\": true, \"queries\": []}", Set.of()).sufficient()).isTrue();
+        assertThat(EvidenceChecker.parse(jsonMapper, "{\"sufficient\": true, \"queries\": []}", Set.of(), 3).sufficient()).isTrue();
         // 判为不足却没有可用的新查询，补查也没有意义
-        assertThat(EvidenceChecker.parse(jsonMapper, "{\"sufficient\": false, \"queries\": [\"已试过\"]}", Set.of("已试过"))
+        assertThat(EvidenceChecker.parse(jsonMapper, "{\"sufficient\": false, \"queries\": [\"已试过\"]}", Set.of("已试过"), 3)
                 .sufficient()).isTrue();
-        assertThat(EvidenceChecker.parse(jsonMapper, "资料足够", Set.of()).sufficient()).isTrue();
+        assertThat(EvidenceChecker.parse(jsonMapper, "资料足够", Set.of(), 3).sufficient()).isTrue();
     }
 
     @Test

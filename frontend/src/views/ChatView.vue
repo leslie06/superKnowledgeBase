@@ -205,7 +205,8 @@ function scrollToBottom(force = false) {
 /** 例如"第 1 轮：缺少西门庆临终的情节 → 查「西门庆 断气身亡」「第七十九回」，补到 5 段" */
 function followUpTitle(m: ChatMessage) {
   return ['首轮检索到的资料不够回答，换说法补充检索：', ...m.followUps!.map((f) =>
-    `第 ${f.round} 轮：${f.missing ?? ''} → 查${f.queries.map((q) => `「${q}」`).join('')}，补到 ${f.added} 段`)].join('\n')
+    `第 ${f.round} 轮：${f.missing ?? ''} → ${[...f.queries.map((q) => `查「${q}」`), ...(f.context ?? []).map((c) => `补看${c}`)]
+      .join('、')}，补到 ${f.added} 段`)].join('\n')
 }
 
 /** 检索（改写 + 召回与精排）超过这个时长时标出来，通常是精排服务被换出到磁盘 */

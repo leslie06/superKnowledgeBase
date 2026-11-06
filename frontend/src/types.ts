@@ -125,6 +125,8 @@ export interface FollowUp {
   round: number
   missing: string | null
   queries: string[]
+  /** 补看前后文的资料，如"《金瓶梅》第655-656页的前文"；早期记录没有这一项 */
+  context?: string[]
   added: number
 }
 
