@@ -151,7 +151,6 @@ async function send(text = question.value) {
       onDone: (messageId, timings) => {
         answer.id = messageId
         answer.timings = timings
-        answer.elapsedMs = Date.now() - startedAt
         // 回答已保存，之后的核对在后台进行，不妨碍继续提问
         answer.streaming = false
         answer.verifying = true
@@ -211,14 +210,19 @@ function retrievalMs(m: ChatMessage) {
   return t && (t.rewriteMs != null || t.retrieveMs != null) ? (t.rewriteMs ?? 0) + (t.retrieveMs ?? 0) : null
 }
 
-/** 例如"检索 5.5 秒（改写 1.0 · 召回与精排 4.5）· 首字 1.1 秒 · 生成完成 6.2 秒" */
+/**
+ * 例如"检索 6.9 秒（改写 1.4 · 召回与精排 5.5）· 生成 4.1 秒（首字 1.5）· 总计 11.0 秒"。
+ * 各段可以直接相加：首字包含在生成里，所以放在括号中；总计 = 检索 + 生成，不用前端实测时间
+ * （实测还包含网络和保存消息的时间，会比各段之和多零点几秒，看起来对不上）。
+ */
 function timingText(m: ChatMessage) {
   const t = m.timings!
-  const parts = [`检索 ${sec(retrievalMs(m)!)} 秒（改写 ${sec(t.rewriteMs)} · 召回与精排 ${sec(t.retrieveMs)}）`]
-  if (t.firstTokenMs != null) parts.push(`首字 ${sec(t.firstTokenMs)} 秒`)
-  if (t.answerMs != null) parts.push(`生成完成 ${sec(t.answerMs)} 秒`)
-  // 刚问完的回答用前端实测的总耗时；历史消息用后端各段相加
-  parts.push(`总计 ${sec(m.elapsedMs ?? retrievalMs(m)! + (t.answerMs ?? 0))} 秒`)
+  const retrieval = retrievalMs(m)!
+  const parts = [`检索 ${sec(retrieval)} 秒（改写 ${sec(t.rewriteMs)} · 召回与精排 ${sec(t.retrieveMs)}）`]
+  if (t.answerMs != null) {
+    parts.push(`生成 ${sec(t.answerMs)} 秒` + (t.firstTokenMs != null ? `（首字 ${sec(t.firstTokenMs)}）` : ''))
+  }
+  parts.push(`总计 ${sec(retrieval + (t.answerMs ?? 0))} 秒`)
   return parts.join(' · ')
 }
 
@@ -365,7 +369,7 @@ async function onConversationCommand(command: string, conv: Conversation) {
                 👎 没用<template v-if="m.feedback?.rating === 'DOWN' && m.feedback.reason">：{{ FEEDBACK_REASONS[m.feedback.reason] }}</template>
               </button>
               <span v-if="retrievalMs(m) != null" class="answer-timing" :class="{ slow: retrievalMs(m)! > SLOW_RETRIEVAL_MS }"
-                    title="检索 = 查询改写 + 召回与精排；首字和生成完成从开始生成算起">
+                    title="总计 = 检索 + 生成；检索 = 查询改写 + 召回与精排；首字是从开始生成到出现第一个字，包含在生成里">
                 {{ timingText(m) }}
               </span>
             </div>
