@@ -44,6 +44,8 @@ public class SearchController {
     static final String SUB_QUERIES_HEADER = "X-Sub-Queries";
     /** 响应头：补充检索用过的查询，换行分隔、URL 编码；没有补查时为空 */
     static final String FOLLOW_UPS_HEADER = "X-Follow-Ups";
+    /** 响应头：口语、俗语的问法换成本意后的问题（URL 编码），照字面理解时为空 */
+    static final String INTENT_HEADER = "X-Intent";
 
     private final Retriever retriever;
     private final QueryRewriter queryRewriter;
@@ -89,6 +91,7 @@ public class SearchController {
                 .header(PLAN_HEADER, plan.aggregate() ? "AGGREGATE" : "SINGLE")
                 .header(SUB_QUERIES_HEADER, URLEncoder.encode(String.join("\n", plan.subQueries()), StandardCharsets.UTF_8))
                 .header(FOLLOW_UPS_HEADER, URLEncoder.encode(followUpQueries, StandardCharsets.UTF_8))
+                .header(INTENT_HEADER, URLEncoder.encode(Objects.requireNonNullElse(plan.intent(), ""), StandardCharsets.UTF_8))
                 .body(chunks);
     }
 

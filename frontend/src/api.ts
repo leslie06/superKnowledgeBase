@@ -77,7 +77,7 @@ export interface ChatStreamHandlers {
   onCitations: (citations: Citation[]) => void
   onDelta: (text: string) => void
   onDone: (messageId: number, timings?: Record<string, number>, subQueries?: string[], fullTextDocuments?: string[],
-           followUps?: FollowUp[]) => void
+           followUps?: FollowUp[], intent?: string) => void
   /** 回答核对结果，在 done 之后到达；未开启核对或核对失败时没有 */
   onVerification?: (verification: AnswerVerification) => void
   onError: (message: string) => void
@@ -123,7 +123,8 @@ function dispatch(raw: string, handlers: ChatStreamHandlers) {
     case 'citations': handlers.onCitations(payload); break
     case 'delta': handlers.onDelta(payload.text); break
     case 'done':
-      handlers.onDone(payload.messageId, payload.timings, payload.subQueries, payload.fullTextDocuments, payload.followUps)
+      handlers.onDone(payload.messageId, payload.timings, payload.subQueries, payload.fullTextDocuments, payload.followUps,
+        payload.intent)
       break
     case 'verification': handlers.onVerification?.(payload); break
     case 'error': handlers.onError(payload.message); break

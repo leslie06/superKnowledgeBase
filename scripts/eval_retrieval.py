@@ -79,6 +79,7 @@ class Outcome:
     search_query: str | None = None  # 后端改写后的检索文本
     plan: str = "SINGLE"  # 后端判断的问题类型：SINGLE 普通问题 / AGGREGATE 汇总类问题
     follow_ups: list[str] = field(default_factory=list)  # 资料不够时补充检索用过的查询
+    intent: str | None = None  # 后端理解的问题本意（口语、俗语的问法），照字面理解时为空
     sub_queries: list[str] = field(default_factory=list)
     rank: int | None = None  # 第一个正确片段的排名，从 1 开始
     score: float | None = None  # 第一个正确片段的分数
@@ -193,6 +194,7 @@ def search(base_url: str, kb_id: int, query: str, top_k: int, mode: str | None, 
                 "plan": headers.get("X-Plan") or "SINGLE",
                 "sub_queries": [q for q in urllib.parse.unquote_plus(headers.get("X-Sub-Queries") or "").split("\n") if q],
                 "follow_ups": [q for q in urllib.parse.unquote_plus(headers.get("X-Follow-Ups") or "").split("\n") if q],
+                "intent": urllib.parse.unquote_plus(headers.get("X-Intent") or "") or None,
             }
             return json.loads(response.read().decode("utf-8")), info
     except urllib.error.HTTPError as e:
@@ -221,7 +223,7 @@ def evaluate(case: Case, base_url: str, kb_id: int, top_k: int, mode: str | None
     except (RuntimeError, OSError) as e:  # OSError 含 URLError、超时和连接被断开
         return Outcome(case, [], error=str(e))
     outcome = Outcome(case, results, search_query=info["search_query"], plan=info["plan"], sub_queries=info["sub_queries"],
-                      follow_ups=info["follow_ups"])
+                      follow_ups=info["follow_ups"], intent=info["intent"])
     if case.answerable:
         for rank, chunk in enumerate(results, start=1):
             if matches(case, chunk):
@@ -328,6 +330,8 @@ def print_report(outcomes: list[Outcome], top_k: int, retrieval_top_k: int, aggr
                 print(f"    对话历史：{' → '.join(q for q, _ in c.history)}")
             if o.search_query and o.search_query != c.question:
                 print(f"    检索文本：{o.search_query.replace(chr(10), ' / ')}")
+            if o.intent:
+                print(f"    理解为：{o.intent}")
             if o.sub_queries:
                 print(f"    子问题：{' | '.join(o.sub_queries)}")
             if o.follow_ups:

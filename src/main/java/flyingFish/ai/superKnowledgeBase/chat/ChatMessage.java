@@ -14,11 +14,12 @@ import java.util.Map;
  * @param subQueries   汇总类问题拆出的子问题（多步检索），普通问题为空
  * @param fullTextDocuments 整篇交给模型的小文档的文件名，没有时为空
  * @param followUps    资料不够时的补充检索（迭代检索），每轮缺什么、查了什么；没有补查时为空
+ * @param intent       口语、俗语的问法换成本意后的问题，照字面理解时为 null
  */
 public record ChatMessage(Long id, Long conversationId, String role, String content, List<Citation> citations,
                           Verification verification, Feedback feedback, Map<String, Long> timings,
                           List<String> subQueries, List<String> fullTextDocuments,
-                          List<RetrievalPipeline.FollowUp> followUps, OffsetDateTime createdAt) {
+                          List<RetrievalPipeline.FollowUp> followUps, String intent, OffsetDateTime createdAt) {
 
     public static final String USER = "user";
     public static final String ASSISTANT = "assistant";

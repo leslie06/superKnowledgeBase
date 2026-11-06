@@ -29,14 +29,22 @@ import java.util.concurrent.TimeUnit;
 @Service
 public class QueryPlanner {
 
-    /** @param subQueries 汇总类问题拆出的子问题，每个都是脱离对话也能看懂的检索查询；普通问题为空 */
-    public record Plan(boolean aggregate, List<String> subQueries) {
+    /**
+     * @param subQueries 汇总类问题拆出的子问题，每个都是脱离对话也能看懂的检索查询；普通问题为空
+     * @param intent     问题的本意：口语、俗语、比喻的问法换成本意后的问题（"西门庆死在谁的床上"→"西门庆因哪个女人而死"）；
+     *                   照字面理解就对时为 null
+     */
+    public record Plan(boolean aggregate, List<String> subQueries, String intent) {
 
-        public static final Plan SINGLE = new Plan(false, List.of());
+        public static final Plan SINGLE = new Plan(false, List.of(), null);
+
+        public Plan(boolean aggregate, List<String> subQueries) {
+            this(aggregate, subQueries, null);
+        }
     }
 
     @JsonIgnoreProperties(ignoreUnknown = true)
-    record RawPlan(Boolean aggregate, List<String> subQueries) {
+    record RawPlan(Boolean aggregate, List<String> subQueries, String intent) {
     }
 
     private static final Logger log = LoggerFactory.getLogger(QueryPlanner.class);
@@ -45,8 +53,11 @@ public class QueryPlanner {
     private static final int MAX_SUB_QUERY_CHARS = 60;
 
     private static final String SYSTEM_PROMPT = """
-            你是知识库检索的问题规划助手。判断用户的最新问题能否靠一次检索找到答案，输出 JSON：
-            {"aggregate": true 或 false, "subQueries": ["子问题1", "子问题2"]}
+            你是知识库检索的问题规划助手。理解用户最新问题的本意，并判断能否靠一次检索找到答案，输出 JSON：
+            {"intent": "问题的本意", "aggregate": true 或 false, "subQueries": ["子问题1", "子问题2"]}
+            0. intent：问题用了口语、俗语、比喻或反问，照字面理解会答偏时，用一句话写出用户真正想问什么，
+               例如"西门庆死在谁的床上"是问"西门庆是因为哪个女人而死的"，"这事谁背锅"是问"这件事由谁承担责任"；
+               照字面理解就对时 intent 为空字符串。
             1. aggregate 为 true 的情况：答案分散在多处、需要汇总，例如要求列举全部（"哪些""有什么""都有谁"）、
                比较多个对象（"区别""对比""各自"）、概括整本书或多个人物、统计次数或找"最多/最少"。
             2. 只问一个事实、定义、规定、步骤或原因的，即使回答很长也为 false，subQueries 为空数组。
@@ -84,6 +95,9 @@ public class QueryPlanner {
                 .call().content());
         try {
             Plan plan = parse(jsonMapper, call.get(timeout.toMillis(), TimeUnit.MILLISECONDS));
+            if (plan.intent() != null) {
+                log.info("问题的本意：{} → {}", question, plan.intent());
+            }
             if (plan.aggregate()) {
                 log.info("汇总类问题，拆成 {} 个子问题：{} → {}", plan.subQueries().size(), question, plan.subQueries());
             }
@@ -111,8 +125,9 @@ public class QueryPlanner {
         } catch (RuntimeException e) {
             return Plan.SINGLE;
         }
+        String intent = StringUtils.hasText(raw.intent()) ? raw.intent().strip() : null;
         if (!Boolean.TRUE.equals(raw.aggregate()) || raw.subQueries() == null) {
-            return Plan.SINGLE;
+            return new Plan(false, List.of(), intent);
         }
         List<String> subQueries = raw.subQueries().stream()
                 .filter(Objects::nonNull)
@@ -123,6 +138,6 @@ public class QueryPlanner {
                 .limit(MAX_SUB_QUERIES)
                 .toList();
         // 只拆出一个子问题等于没拆，按普通问题处理
-        return subQueries.size() < 2 ? Plan.SINGLE : new Plan(true, subQueries);
+        return subQueries.size() < 2 ? new Plan(false, List.of(), intent) : new Plan(true, subQueries, intent);
     }
 }

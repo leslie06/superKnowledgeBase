@@ -28,6 +28,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
@@ -63,6 +64,7 @@ public class ChatService {
                确实需要提及时，写明"资料中没有说明"。
             3. 要基于资料做合理的理解和推理：问题的说法和资料不同（口语、近义词、古籍的旧式说法，如"先头浑家"就是原配妻子）时，
                按问题的本意在资料中找答案；资料能推出答案时，直接给出结论并说明依据，不要因为资料没有逐字写出问题里的说法就说没有找到。
+               口语、俗语、比喻的问法按本意回答，不要按字面纠正用户（如"死在谁的床上"是问因哪个女人而死，不是问断气时在哪张床）。
                只有资料中确实没有相关内容时才说没有找到。
             4. 在使用了资料的句子末尾标注来源编号，格式为 [1]、[2]；一句话来自多个来源时写成 [1][3]。不要在末尾单独列出参考文献。
             5. 用中文回答，先给出结论，再展开说明；内容较多时使用 Markdown 列表或表格。
@@ -316,7 +318,7 @@ public class ChatService {
     private ServerSentEvent<String> doneEvent(long messageId, PreparedChat chat) {
         return event("done", Map.of("messageId", messageId, "timings", chat.timings(),
                 "subQueries", chat.plan().subQueries(), "fullTextDocuments", chat.fullTextDocuments(),
-                "followUps", chat.followUps()));
+                "followUps", chat.followUps(), "intent", Objects.requireNonNullElse(chat.plan().intent(), "")));
     }
 
     private long saveAssistantMessage(PreparedChat chat, String answer) {
@@ -327,6 +329,9 @@ public class ChatService {
         }
         if (chat.plan().aggregate()) {
             trace.put("subQueries", chat.plan().subQueries());
+        }
+        if (chat.plan().intent() != null) {
+            trace.put("intent", chat.plan().intent());
         }
         if (!chat.followUps().isEmpty()) {
             trace.put("followUps", chat.followUps());
@@ -395,6 +400,9 @@ public class ChatService {
             sb.append(AGGREGATE_HINT);
         }
         sb.append("【问题】\n").append(chat.question());
+        if (chat.plan().intent() != null) {
+            sb.append("\n（问题的意思：").append(chat.plan().intent()).append("）");
+        }
         return sb.toString();
     }
 

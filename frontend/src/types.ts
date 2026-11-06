@@ -143,6 +143,8 @@ export interface ChatMessage {
   /** 整篇交给模型的小文档的文件名 */
   fullTextDocuments?: string[]
   followUps?: FollowUp[]
+  /** 口语、俗语的问法换成本意后的问题，照字面理解时为空 */
+  intent?: string | null
   /** 前端记录：按下发送的时间（毫秒时间戳），用于显示实时耗时 */
   startedAt?: number
   streaming?: boolean

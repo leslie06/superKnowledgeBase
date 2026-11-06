@@ -148,12 +148,13 @@ async function send(text = question.value) {
         answer.content += t
         scrollToBottom()
       },
-      onDone: (messageId, timings, subQueries, fullTextDocuments, followUps) => {
+      onDone: (messageId, timings, subQueries, fullTextDocuments, followUps, intent) => {
         answer.id = messageId
         answer.timings = timings
         answer.subQueries = subQueries
         answer.fullTextDocuments = fullTextDocuments
         answer.followUps = followUps
+        answer.intent = intent || null
         // 回答已保存，之后的核对在后台进行，不妨碍继续提问
         answer.streaming = false
         answer.verifying = true
@@ -382,6 +383,9 @@ async function onConversationCommand(command: string, conv: Conversation) {
               <span v-if="m.fullTextDocuments?.length" class="answer-plan"
                     :title="`这些文档篇幅不长，整篇交给模型通读后回答：\n${m.fullTextDocuments.join('\n')}`">
                 已读全文 · {{ m.fullTextDocuments.length > 1 ? `${m.fullTextDocuments.length} 个文档` : m.fullTextDocuments[0] }}
+              </span>
+              <span v-if="m.intent" class="answer-plan" :title="`口语、俗语的问法按本意检索和回答：\n${m.intent}`">
+                理解为：{{ m.intent }}
               </span>
               <span v-if="m.followUps?.length" class="answer-plan" :title="followUpTitle(m)">
                 补充检索 · {{ m.followUps.length }} 轮

@@ -24,7 +24,7 @@ public class ConversationRepository {
     /** retrieval_trace 中只取耗时、子问题、读了全文的文档和补充检索 */
     @JsonIgnoreProperties(ignoreUnknown = true)
     private record TraceSummary(Map<String, Long> timings, List<String> subQueries, List<String> fullTextDocuments,
-                                List<RetrievalPipeline.FollowUp> followUps) {
+                                List<RetrievalPipeline.FollowUp> followUps, String intent) {
     }
 
     private final JdbcClient jdbc;
@@ -130,7 +130,7 @@ public class ConversationRepository {
         String verification = rs.getString("verification");
         String rating = rs.getString("feedback");
         String traceJson = rs.getString("retrieval_trace");
-        TraceSummary trace = traceJson == null ? new TraceSummary(null, null, null, null)
+        TraceSummary trace = traceJson == null ? new TraceSummary(null, null, null, null, null)
                 : jsonMapper.readValue(traceJson, TraceSummary.class);
         return new ChatMessage(rs.getLong("id"), rs.getLong("conversation_id"), rs.getString("role"),
                 rs.getString("content"), parseCitations(rs.getString("citations")),
@@ -139,7 +139,7 @@ public class ConversationRepository {
                 trace.timings() == null ? Map.of() : trace.timings(),
                 trace.subQueries() == null ? List.of() : trace.subQueries(),
                 trace.fullTextDocuments() == null ? List.of() : trace.fullTextDocuments(),
-                trace.followUps() == null ? List.of() : trace.followUps(),
+                trace.followUps() == null ? List.of() : trace.followUps(), trace.intent(),
                 rs.getObject("created_at", OffsetDateTime.class));
     }
 

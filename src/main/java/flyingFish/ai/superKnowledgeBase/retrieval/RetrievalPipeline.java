@@ -15,7 +15,8 @@ import java.util.concurrent.Executors;
 import java.util.stream.Stream;
 
 /**
- * 问答的检索流程，问答和 /search 调试接口共用：查询改写与问题规划并行 → 检索（汇总类问题拆成子问题多路检索）
+ * 问答的检索流程，问答和 /search 调试接口共用：查询改写与问题规划并行 → 检索（汇总类问题拆成子问题多路检索，
+ * 口语、俗语的问法另按本意检索一路）
  * → 迭代检索（{@link EvidenceChecker} 判断资料不够时换说法补查，最多 skb.retrieval.max-follow-ups 轮）。
  */
 @Service
@@ -75,6 +76,10 @@ public class RetrievalPipeline {
         if (plan.aggregate()) {
             hits = retriever.retrieveAggregate(kbId, searchQuery, plan.subQueries(), scope);
             raw = hits;
+        } else if (plan.intent() != null) {
+            // 口语、俗语的问法照字面检索会找偏（"死在谁的床上"检索到的全是"床上"的情节），本意也检索一路，轮流合并
+            hits = retriever.retrieveAggregate(kbId, searchQuery, List.of(plan.intent()), scope);
+            raw = hits;
         } else {
             raw = retriever.search(kbId, searchQuery, scope, Math.max(options.rawTopK(), retriever.topK()),
                     Retriever.Mode.HYBRID, null);
@@ -85,8 +90,12 @@ public class RetrievalPipeline {
         List<FollowUp> followUps = new ArrayList<>();
         if (options.followUp()) {
             Set<String> tried = new LinkedHashSet<>(Stream.concat(Stream.of(searchQuery), plan.subQueries().stream()).toList());
-            // 多轮对话时原问题可能是"那字典呢"，判断用补全后的检索文本
-            String checkQuestion = history.isEmpty() ? question : searchQuery;
+            if (plan.intent() != null) {
+                tried.add(plan.intent());
+            }
+            // 有本意时按本意判断；多轮对话时原问题可能是"那字典呢"，判断用补全后的检索文本
+            String checkQuestion = plan.intent() != null ? question + "（意思是：" + plan.intent() + "）"
+                    : history.isEmpty() ? question : searchQuery;
             for (int round = 1; round <= maxFollowUps; round++) {
                 EvidenceChecker.Verdict verdict = evidenceChecker.check(checkQuestion, tried, hits);
                 if (verdict.sufficient()) {

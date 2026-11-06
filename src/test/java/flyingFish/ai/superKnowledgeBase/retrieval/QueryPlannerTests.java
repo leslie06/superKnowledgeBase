@@ -21,6 +21,16 @@ class QueryPlannerTests {
     }
 
     @Test
+    void keepsIntentForColloquialQuestion() {
+        QueryPlanner.Plan plan = QueryPlanner.parse(jsonMapper,
+                "{\"intent\": \" 西门庆是因为哪个女人而死的 \", \"aggregate\": false, \"subQueries\": []}");
+
+        assertThat(plan.aggregate()).isFalse();
+        assertThat(plan.intent()).isEqualTo("西门庆是因为哪个女人而死的");
+        assertThat(QueryPlanner.parse(jsonMapper, "{\"intent\": \"\", \"aggregate\": false}").intent()).isNull();
+    }
+
+    @Test
     void capsSubQueries() {
         QueryPlanner.Plan plan = QueryPlanner.parse(jsonMapper,
                 "{\"aggregate\": true, \"subQueries\": [\"a\", \"b\", \"c\", \"d\", \"e\", \"f\", \"g\"]}");
