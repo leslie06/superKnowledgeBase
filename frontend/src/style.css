@@ -1059,3 +1059,15 @@ a:hover {
 .answer-timing.slow {
   color: #c27c0e;
 }
+
+.live-elapsed {
+  margin-left: 6px;
+  font-variant-numeric: tabular-nums;
+}
+
+.streaming-elapsed {
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}

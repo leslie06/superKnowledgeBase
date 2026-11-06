@@ -128,6 +128,10 @@ export interface ChatMessage {
   feedback?: Feedback | null
   /** 各环节耗时（毫秒）：rewriteMs 查询改写、retrieveMs 召回与精排、firstTokenMs 首字、answerMs 生成完成 */
   timings?: Record<string, number>
+  /** 前端记录：按下发送的时间（毫秒时间戳），用于显示实时耗时 */
+  startedAt?: number
+  /** 前端记录：从按下发送到回答完成的总耗时 */
+  elapsedMs?: number
   streaming?: boolean
   /** 回答已生成，正在核对 */
   verifying?: boolean

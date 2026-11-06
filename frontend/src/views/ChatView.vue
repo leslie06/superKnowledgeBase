@@ -83,7 +83,25 @@ onMounted(() => {
   loadConversations()
   loadMessages()
 })
-onBeforeUnmount(() => abortController?.abort())
+onBeforeUnmount(() => {
+  abortController?.abort()
+  window.clearInterval(clock)
+})
+
+/** 回答进行中每 0.1 秒刷新一次，用于显示实时耗时；没有进行中的回答时停止 */
+const now = ref(Date.now())
+let clock: number | undefined
+watch(streaming, (value) => {
+  window.clearInterval(clock)
+  if (value) {
+    now.value = Date.now()
+    clock = window.setInterval(() => (now.value = Date.now()), 100)
+  }
+})
+
+function liveSeconds(m: ChatMessage) {
+  return m.startedAt ? ((now.value - m.startedAt) / 1000).toFixed(1) : ''
+}
 watch(convId, () => {
   loadMessages()
   syncScope()
@@ -97,6 +115,7 @@ function newConversation() {
 async function send(text = question.value) {
   const q = text.trim()
   if (!q || streaming.value) return
+  const startedAt = Date.now()
   question.value = ''
   streaming.value = true
 
@@ -115,7 +134,7 @@ async function send(text = question.value) {
   }
 
   messages.value.push({ id: null, role: 'user', content: q, citations: [] })
-  messages.value.push({ id: null, role: 'assistant', content: '', citations: [], streaming: true })
+  messages.value.push({ id: null, role: 'assistant', content: '', citations: [], streaming: true, startedAt })
   // 取响应式代理，后续修改才能触发界面更新
   const answer = messages.value[messages.value.length - 1]
   scrollToBottom(true)
@@ -132,6 +151,7 @@ async function send(text = question.value) {
       onDone: (messageId, timings) => {
         answer.id = messageId
         answer.timings = timings
+        answer.elapsedMs = Date.now() - startedAt
         // 回答已保存，之后的核对在后台进行，不妨碍继续提问
         answer.streaming = false
         answer.verifying = true
@@ -197,6 +217,8 @@ function timingText(m: ChatMessage) {
   const parts = [`检索 ${sec(retrievalMs(m)!)} 秒（改写 ${sec(t.rewriteMs)} · 召回与精排 ${sec(t.retrieveMs)}）`]
   if (t.firstTokenMs != null) parts.push(`首字 ${sec(t.firstTokenMs)} 秒`)
   if (t.answerMs != null) parts.push(`生成完成 ${sec(t.answerMs)} 秒`)
+  // 刚问完的回答用前端实测的总耗时；历史消息用后端各段相加
+  parts.push(`总计 ${sec(m.elapsedMs ?? retrievalMs(m)! + (t.answerMs ?? 0))} 秒`)
   return parts.join(' · ')
 }
 
@@ -309,9 +331,11 @@ async function onConversationCommand(command: string, conv: Conversation) {
             <div v-if="m.streaming && !m.content" class="thinking">
               <span class="dot" /><span class="dot" /><span class="dot" />
               {{ m.citations.length ? `已找到 ${m.citations.length} 个相关片段，正在生成回答…` : '正在检索知识库…' }}
+              <span v-if="m.startedAt" class="live-elapsed">{{ liveSeconds(m) }} 秒</span>
             </div>
             <div class="markdown" @click="onAnswerClick($event, m)" v-html="renderMarkdown(m.content)" />
             <span v-if="m.streaming && m.content" class="cursor" />
+            <div v-if="m.streaming && m.content && m.startedAt" class="streaming-elapsed">已用时 {{ liveSeconds(m) }} 秒</div>
             <el-alert v-if="m.error" :title="m.error" type="error" :closable="false" show-icon />
             <div v-if="!m.streaming && m.citations.length" class="sources">
               <span class="sources-label">参考来源</span>
