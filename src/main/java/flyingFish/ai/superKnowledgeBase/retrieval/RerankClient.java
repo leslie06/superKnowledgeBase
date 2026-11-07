@@ -17,6 +17,15 @@ import java.util.List;
 @Component
 public class RerankClient {
 
+    record Pair(String query, String text) {
+    }
+
+    record PairsRequest(List<Pair> pairs) {
+    }
+
+    record PairsResult(double[] scores) {
+    }
+
     record RerankRequest(String query, List<String> texts) {
     }
 
@@ -38,6 +47,23 @@ public class RerankClient {
                 // 缓冲请求体以带上 Content-Length，否则 JDK HttpClient 用分块传输，Python 的 http.server 读不到请求体
                 .requestFactory(new BufferingClientHttpRequestFactory(requestFactory))
                 .build();
+    }
+
+    /**
+     * 多个问题各自的片段一次打分（/rerank_pairs），顺序与 pairs 一致。精排按每批 16 对计算，不满一批也按一批的耗时，
+     * 汇总类问题 7 路分 7 次请求要 11 秒，合成一次 5 秒。
+     */
+    public double[] scorePairs(List<Pair> pairs) {
+        PairsResult result = restClient.post()
+                .uri("/rerank_pairs")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(new PairsRequest(pairs))
+                .retrieve()
+                .body(PairsResult.class);
+        if (result == null || result.scores() == null || result.scores().length != pairs.size()) {
+            throw new IllegalStateException("Rerank 服务返回的结果数量与片段数不一致");
+        }
+        return result.scores();
     }
 
     /** 返回每个片段的相关性分数（0~1），顺序与 texts 一致。服务不可用时抛出异常，由调用方决定如何降级。 */

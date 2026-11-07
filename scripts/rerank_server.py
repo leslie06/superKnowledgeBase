@@ -6,6 +6,11 @@
 
     POST /rerank   {"query": "年假有几天", "texts": ["片段1", "片段2"]}
     →              [{"index": 1, "score": 0.93}, {"index": 0, "score": 0.02}]   按分数从高到低
+
+另有 /rerank_pairs，一次给多个问题各自的片段打分（汇总类问题的原问题和各子问题合成一次请求）：
+
+    POST /rerank_pairs   {"pairs": [{"query": "问题1", "text": "片段"}, ...]}
+    →                    {"scores": [0.93, 0.02, ...]}   与 pairs 顺序一致
     GET  /health   → {"model": "...", "device": "mps"}
 
 score 经过 sigmoid，范围 0~1，可以直接当相关性阈值使用。
@@ -67,27 +72,36 @@ class Reranker:
             torch.cuda.empty_cache()
 
     def rerank(self, query: str, texts: list[str]) -> list[dict]:
+        scores = self.score_pairs([(query, t) for t in texts])
+        ranked = sorted(range(len(texts)), key=lambda i: scores[i], reverse=True)
+        return [{"index": i, "score": scores[i]} for i in ranked]
+
+    def score_pairs(self, pairs: list[tuple[str, str]]) -> list[float]:
         """
         MPS 为每一种输入形状（批大小 × 序列长度）编译一张计算图并一直缓存，每批片段长度都不一样时几乎每次都是新形状：
         实测每次请求涨约 60MB，连续运行一天涨到 17GB。所以序列长度补齐到 LENGTH_BUCKET 的倍数、批大小补齐到 2 的幂，
         形状最多 8 × 5 种，缓存满了就不再增长。补齐的部分有 attention mask，不影响分数。
+        
+        按每批 batch_size 对计算，不满一批也按一批的耗时（10 对 1.6 秒，20 对 1.8 秒），所以多个问题的片段合成一次请求
+        更快；按长度排序后再分批，同一批长度相近，补齐的浪费少。
         """
-        if not texts:
+        if not pairs:
             return []
-        scores = []
+        order = sorted(range(len(pairs)), key=lambda i: len(pairs[i][0]) + len(pairs[i][1]))
+        scores = [0.0] * len(pairs)
         with self.lock:
-            for start in range(0, len(texts), self.batch_size):
-                batch = texts[start:start + self.batch_size]
-                size = min(self.batch_size, 1 << (len(batch) - 1).bit_length())
-                pairs = [(query, t) for t in batch] + [(query, "")] * (size - len(batch))
-                features = self.model.tokenizer(pairs, padding=True, truncation=True, max_length=self.max_length,
+            for start in range(0, len(order), self.batch_size):
+                indexes = order[start:start + self.batch_size]
+                size = min(self.batch_size, 1 << (len(indexes) - 1).bit_length())
+                batch = [pairs[i] for i in indexes] + [(pairs[indexes[0]][0], "")] * (size - len(indexes))
+                features = self.model.tokenizer(batch, padding=True, truncation=True, max_length=self.max_length,
                                                 pad_to_multiple_of=LENGTH_BUCKET, return_tensors="pt").to(self.device)
                 with torch.inference_mode():
                     logits = self.model.model(**features).logits.view(-1).float()
-                scores.extend(torch.sigmoid(logits)[:len(batch)].cpu().tolist())
+                for i, score in zip(indexes, torch.sigmoid(logits)[:len(indexes)].cpu().tolist()):
+                    scores[i] = float(score)
             self.release_cache()
-        ranked = sorted(range(len(texts)), key=lambda i: scores[i], reverse=True)
-        return [{"index": i, "score": float(scores[i])} for i in ranked]
+        return scores
 
 
 def make_handler(reranker: Reranker):
@@ -101,6 +115,8 @@ def make_handler(reranker: Reranker):
             self.reply(200, {"model": reranker.model_name, "device": reranker.device})
 
         def do_POST(self):
+            if self.path == "/rerank_pairs":
+                return self.rerank_pairs()
             if self.path != "/rerank":
                 return self.reply(404, {"error": "not found"})
             try:
@@ -114,6 +130,20 @@ def make_handler(reranker: Reranker):
             result = reranker.rerank(query, texts)
             log.info("%d 个片段，耗时 %.0f ms：%s", len(texts), (time.perf_counter() - start) * 1000, query[:40])
             self.reply(200, result)
+
+        def rerank_pairs(self):
+            try:
+                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))))
+                pairs = [(p["query"], p["text"]) for p in body["pairs"]]
+                if not all(isinstance(q, str) and isinstance(t, str) for q, t in pairs):
+                    raise ValueError("query 和 text 必须是字符串")
+            except (ValueError, KeyError, TypeError) as e:
+                return self.reply(400, {"error": f"请求格式错误：{e}"})
+            start = time.perf_counter()
+            scores = reranker.score_pairs(pairs)
+            log.info("%d 对（%d 个问题），耗时 %.0f ms：%s", len(pairs), len({q for q, _ in pairs}),
+                     (time.perf_counter() - start) * 1000, pairs[0][0][:40] if pairs else "")
+            self.reply(200, {"scores": scores})
 
         def reply(self, status: int, payload):
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")

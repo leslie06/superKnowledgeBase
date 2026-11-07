@@ -12,6 +12,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.Deque;
@@ -169,17 +170,57 @@ public class Retriever {
      * 按分数排时，分数普遍偏高的一路会占满名额。子问题只精排 subQueryRerankCandidates 个，控制总耗时。
      */
     public List<RetrievedChunk> retrieveAggregate(long kbId, String query, List<String> subQueries, SearchScope scope) {
-        // 各路并行：精排服务一次只处理一个请求，但向量化和数据库查询可以和其他路的精排重叠
-        List<CompletableFuture<List<RetrievedChunk>>> futures = new ArrayList<>();
-        futures.add(CompletableFuture.supplyAsync(
-                () -> relevant(rank(kbId, query, scope, Mode.HYBRID, candidates, rerankEnabled, rerankCandidates)),
-                aggregateExecutor));
-        for (String subQuery : subQueries) {
-            futures.add(CompletableFuture.supplyAsync(() -> relevant(rank(kbId, subQuery, scope, Mode.HYBRID, candidates,
-                    rerankEnabled, subQueryRerankCandidates)), aggregateExecutor));
-        }
-        List<List<RetrievedChunk>> routes = futures.stream().map(CompletableFuture::join).toList();
+        List<String> queries = new ArrayList<>(List.of(query));
+        queries.addAll(subQueries);
+        List<Integer> limits = new ArrayList<>(List.of(rerankCandidates));
+        subQueries.forEach(q -> limits.add(subQueryRerankCandidates));
+        List<List<RetrievedChunk>> routes = rankAll(kbId, queries, limits, scope).stream().map(Retriever::relevant).toList();
         return dropDuplicates(interleave(routes)).stream().limit(aggregateTopK).toList();
+    }
+
+    /**
+     * 多个查询各自检索：召回并行，精排合成一次请求（{@link RerankClient#scorePairs}），再按查询拆开各自排序。
+     * 精排服务一次只处理一个请求、按每批 16 对计算，各路分别请求时 7 路要 11 秒，合成一次 5 秒。
+     *
+     * @param rerankLimits 每个查询送去精排的片段数
+     */
+    private List<List<RetrievedChunk>> rankAll(long kbId, List<String> queries, List<Integer> rerankLimits,
+                                               SearchScope scope) {
+        long start = System.nanoTime();
+        List<List<RetrievedChunk>> fused = queries.stream()
+                .map(q -> CompletableFuture.supplyAsync(() -> fuse(kbId, q, scope, Mode.HYBRID, candidates), aggregateExecutor))
+                .toList().stream().map(CompletableFuture::join).toList();
+        long fusedAt = System.nanoTime();
+        List<List<RetrievedChunk>> heads = new ArrayList<>();
+        List<RerankClient.Pair> pairs = new ArrayList<>();
+        for (int i = 0; i < queries.size(); i++) {
+            List<RetrievedChunk> head = rerankEnabled ? rerankPool(fused.get(i), rerankLimits.get(i), KEYWORD_RERANK_GUARANTEE)
+                    : List.of();
+            heads.add(head);
+            String query = queries.get(i);
+            head.forEach(c -> pairs.add(new RerankClient.Pair(query, rerankText(c))));
+        }
+        double[] scores = null;
+        if (!pairs.isEmpty()) {
+            try {
+                scores = rerankClient.scorePairs(pairs);
+            } catch (RuntimeException e) {
+                log.warn("精排失败，退回 RRF 排序：{}", e.getMessage());
+            }
+        }
+        List<List<RetrievedChunk>> result = new ArrayList<>();
+        int offset = 0;
+        for (int i = 0; i < queries.size(); i++) {
+            List<RetrievedChunk> head = heads.get(i);
+            List<RetrievedChunk> ranked = scores == null ? fused.get(i)
+                    : applyRerank(fused.get(i), head, Arrays.copyOfRange(scores, offset, offset + head.size()));
+            offset += head.size();
+            result.add(dropDuplicates(ranked));
+        }
+        long end = System.nanoTime();
+        log.info("检索 {} 个查询耗时 {} ms：召回 {} ms，精排 {} ms（{} 对）", queries.size(), (end - start) / 1_000_000,
+                (fusedAt - start) / 1_000_000, (end - fusedAt) / 1_000_000, pairs.size());
+        return result;
     }
 
     private static List<RetrievedChunk> relevant(List<RetrievedChunk> ranked) {
@@ -197,11 +238,8 @@ public class Retriever {
      */
     public List<RetrievedChunk> retrieveMore(long kbId, List<String> queries, SearchScope scope,
                                              List<RetrievedChunk> existing) {
-        List<CompletableFuture<List<RetrievedChunk>>> futures = queries.stream()
-                .map(q -> CompletableFuture.supplyAsync(() -> relevant(rank(kbId, q, scope, Mode.HYBRID, candidates,
-                        rerankEnabled, subQueryRerankCandidates)), aggregateExecutor))
-                .toList();
-        List<RetrievedChunk> found = interleave(futures.stream().map(CompletableFuture::join).toList());
+        List<RetrievedChunk> found = interleave(rankAll(kbId, queries,
+                queries.stream().map(q -> subQueryRerankCandidates).toList(), scope).stream().map(Retriever::relevant).toList());
         Set<Long> known = existing.stream().map(RetrievedChunk::chunkId).collect(Collectors.toSet());
         List<RetrievedChunk> merged = new ArrayList<>(existing);
         found.stream().filter(c -> !known.contains(c.chunkId())).forEach(merged::add);
@@ -409,6 +447,11 @@ public class Retriever {
             log.warn("精排失败，退回 RRF 排序：{}", e.getMessage());
             return fused;
         }
+        return applyRerank(fused, head, scores);
+    }
+
+    /** 精排过的片段按分数排在前面（精确命中优先），没送去精排的按 RRF 顺序接在后面 */
+    private List<RetrievedChunk> applyRerank(List<RetrievedChunk> fused, List<RetrievedChunk> head, double[] scores) {
         List<RetrievedChunk> reranked = new ArrayList<>(fused.size());
         for (int i = 0; i < head.size(); i++) {
             RetrievedChunk c = head.get(i);
