@@ -70,11 +70,12 @@ public record SkbProperties(String storageDir, Ingestion ingestion, Chunk chunk,
      *                   还会和正文、和其他短文档的摘要抢名次（14 个激活码文件的摘要把操作教程挤出前 10）
      */
     /**
+     * @param chapterEnabled     是否生成章节摘要；关闭时已生成的章节摘要片段保留
      * @param chapterMinChars    正文达到这个字数的章节（第X章 / 第X回 / 第X篇）才生成章节摘要
      * @param chapterInputChars  每个章节交给 LLM 的字数上限，超过时取开头和均匀抽样
      * @param chapterConcurrency 同时生成章节摘要的 LLM 调用数
      */
-    public record Summary(boolean enabled, int inputChars, int minChunks, int chapterMinChars, int chapterInputChars,
-                          int chapterConcurrency) {
+    public record Summary(boolean enabled, int inputChars, int minChunks, boolean chapterEnabled, int chapterMinChars,
+                          int chapterInputChars, int chapterConcurrency) {
     }
 }

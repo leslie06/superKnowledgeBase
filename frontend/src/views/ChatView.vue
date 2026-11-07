@@ -382,7 +382,7 @@ async function onConversationCommand(command: string, conv: Conversation) {
                 👎 没用<template v-if="m.feedback?.rating === 'DOWN' && m.feedback.reason">：{{ FEEDBACK_REASONS[m.feedback.reason] }}</template>
               </button>
               <span v-if="m.fullTextDocuments?.length" class="answer-plan"
-                    :title="`这些文档篇幅不长，整篇交给模型通读后回答：\n${m.fullTextDocuments.join('\n')}`">
+                    :title="`这些文档篇幅不长（或是问题点名的章节），整篇交给模型通读后回答：\n${m.fullTextDocuments.join('\n')}`">
                 已读全文 · {{ m.fullTextDocuments.length > 1 ? `${m.fullTextDocuments.length} 个文档` : m.fullTextDocuments[0] }}
               </span>
               <span v-if="m.intent" class="answer-plan" :title="`口语、俗语的问法按本意检索和回答：\n${m.intent}`">

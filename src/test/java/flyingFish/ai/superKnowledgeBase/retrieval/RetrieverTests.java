@@ -95,4 +95,18 @@ class RetrieverTests {
     private static RetrievedChunk chunk(long id, String content) {
         return new RetrievedChunk(id, 1L, "a.pdf", null, null, content, 0.5, null, null, null, null, false, true, "TEXT");
     }
+
+    @Test
+    void findsChaptersNamedInQuestion() {
+        assertThat(Retriever.chapterNumbers("金瓶梅第七十九回讲了什么")).containsExactly(79);
+        assertThat(Retriever.chapterNumbers("红楼梦第5章和第一百零一回")).containsExactly(5, 101);
+        assertThat(Retriever.chapterNumbers("劳动合同法第三十九条")).isEmpty();
+        assertThat(Retriever.parseNumber("十一")).isEqualTo(11);
+        assertThat(Retriever.parseNumber("一百二十")).isEqualTo(120);
+        assertThat(Retriever.chineseNumber(79)).isEqualTo("七十九");
+        assertThat(Retriever.chineseNumber(10)).isEqualTo("十");
+        assertThat(Retriever.chineseNumber(101)).isEqualTo("一百零一");
+        assertThat(Retriever.chineseNumber(110)).isEqualTo("一百一十");
+        assertThat(Retriever.chineseNumber(100)).isEqualTo("一百");
+    }
 }

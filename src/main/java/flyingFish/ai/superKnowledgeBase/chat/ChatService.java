@@ -227,7 +227,7 @@ public class ChatService {
                 RetrievalPipeline.Options.CHAT);
         List<RetrievedChunk> chunks = result.hits();
         // 小文档读全文，其余扩展相邻片段（相邻的命中片段会并成一条）；trace 仍按原始命中记录
-        Retriever.Context context = retriever.context(chunks, expandChars, fullTextChars);
+        Retriever.Context context = retriever.context(chunks, expandChars, fullTextChars, result.searchQuery());
         Map<String, Long> timings = result.timings();
         log.info("问答准备完成：查询改写 {} ms，检索 {} ms{}{}{}", timings.get("rewriteMs"), timings.get("retrieveMs"),
                 result.plan().aggregate() ? "（汇总类问题，" + result.plan().subQueries().size() + " 个子问题）" : "",

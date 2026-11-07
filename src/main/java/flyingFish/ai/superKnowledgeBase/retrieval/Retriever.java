@@ -94,6 +94,9 @@ public class Retriever {
     private static final int MAX_EXACT_CANDIDATES = 10;
     /** 每轮补充检索最多补进这么多个新片段 */
     private static final int FOLLOW_UP_MAX_NEW = 8;
+    private static final Pattern CHAPTER_REFERENCE = Pattern.compile("第([一二三四五六七八九十百零〇\\d]+)[回囘囬章篇]");
+    private static final String CHINESE_DIGITS = "零一二三四五六七八九";
+    private static final int MAX_CHAPTER_REFERENCES = 2;
     /** 补看前后文时取紧挨着的这么多个片段（约两三万字，三丸药那段在断气那段之前七八页） */
     private static final int SURROUNDING_MAX_CHUNKS = 40;
     /** 按向量相似度粗筛后交给精排的片段数 */
@@ -460,11 +463,34 @@ public class Retriever {
      * 读全文，其余文档（几十万字的书）仍是命中片段加相邻片段（{@link #expand}）。
      * 只给命中的几段时，答案常常恰好在第 7、第 10 段；合同、手册这类几万字的文档，读完全文才能回答"押金和违约金一共多少"
      * "哪些条款对承租人不利"这类要综合多处的问题。fullTextChars 为 0 时不读全文。
+     * <p>
+     * 问题点名了章节（"第七十九回讲了什么""红楼梦第5章"）时，先在命中片段所属的文档中按排名找有这一章的，
+     * 把这一章整章按原文顺序读入（与读全文共用 fullTextChars）：几十万字的书读不了全文，一回一万来字可以。
+     *
+     * @param question 用来找点名的章节，多轮对话时用补全后的检索文本
      */
-    public Context context(List<RetrievedChunk> hits, int expandChars, int fullTextChars) {
+    public Context context(List<RetrievedChunk> hits, int expandChars, int fullTextChars, String question) {
         if (hits.isEmpty() || fullTextChars <= 0) {
             return new Context(expand(hits, expandChars), List.of());
         }
+        List<RetrievedChunk> chunks = new ArrayList<>();
+        List<String> names = new ArrayList<>();
+        Set<Long> chapterChunkIds = new HashSet<>();
+        int budget = fullTextChars;
+        for (int number : chapterNumbers(question)) {
+            ChapterText chapter = chapterText(hits, number, budget);
+            if (chapter != null) {
+                chunks.addAll(toSections(chapter.best(), chapter.rows()));
+                names.add(chapter.best().filename() + " " + chapter.title());
+                budget -= chapter.rows().stream().mapToInt(r -> r.content().length()).sum();
+                chapter.rows().forEach(r -> chapterChunkIds.add(r.chunkId()));
+            }
+        }
+        hits = hits.stream().filter(h -> !chapterChunkIds.contains(h.chunkId())).toList();
+        if (hits.isEmpty()) {
+            return new Context(chunks, names);
+        }
+        fullTextChars = budget;
         List<Long> documentIds = hits.stream().map(RetrievedChunk::documentId).distinct().toList();
         Map<Long, Long> sizes = jdbc.sql("""
                         SELECT document_id, sum(length(content)) AS chars FROM chunk
@@ -482,8 +508,6 @@ public class Retriever {
                 used += size;
             }
         }
-        List<RetrievedChunk> chunks = new ArrayList<>();
-        List<String> names = new ArrayList<>();
         for (Long id : fullText) {
             RetrievedChunk best = hits.stream().filter(h -> h.documentId().equals(id)).findFirst().orElseThrow();
             chunks.addAll(fullTextSections(best));
@@ -495,17 +519,108 @@ public class Retriever {
 
     /** 文档全文按原文顺序分段：章节变化或超过 FULL_TEXT_SECTION_CHARS 时另起一段；分数沿用该文档排名最前的命中片段 */
     private List<RetrievedChunk> fullTextSections(RetrievedChunk best) {
-        List<TextRow> rows = jdbc.sql("""
+        return toSections(best, jdbc.sql("""
                         SELECT id AS chunk_id, heading_path, location, content FROM chunk
                         WHERE document_id = ? AND kind = 'TEXT' ORDER BY chunk_index
                         """)
                 .param(best.documentId())
-                .query(TextRow.class).list();
+                .query(TextRow.class).list());
+    }
+
+    /** @param title 章节标题，如"第七十九回 西门庆贪欲丧命 吴月娘失偶生儿" */
+    private record ChapterText(RetrievedChunk best, String title, List<TextRow> rows) {
+    }
+
+    /**
+     * 命中片段所属的文档中，按排名找第一个有第 number 章（回）的，返回这一章的正文；整章超过 maxChars 时不读。
+     * 同一本书有多个版本时（金瓶梅崇祯本、词话本）取排名最前的那个。
+     */
+    private ChapterText chapterText(List<RetrievedChunk> hits, int number, int maxChars) {
+        String chapter = "第(?:" + chineseNumber(number) + "|" + number + ")[回囘囬章篇]";
+        for (Long documentId : hits.stream().map(RetrievedChunk::documentId).distinct().toList()) {
+            List<TextRow> rows = jdbc.sql("""
+                            SELECT id AS chunk_id, heading_path, location, content FROM chunk
+                            WHERE document_id = :id AND kind = 'TEXT' AND heading_path ~ :pattern ORDER BY chunk_index
+                            """)
+                    .param("id", documentId)
+                    .param("pattern", "(^| > )" + chapter + "( |$)")
+                    .query(TextRow.class).list();
+            if (rows.isEmpty()) {
+                continue;
+            }
+            if (rows.stream().mapToInt(r -> r.content().length()).sum() > maxChars) {
+                return null;
+            }
+            Matcher title = Pattern.compile(chapter + "[^>]*").matcher(rows.getFirst().headingPath());
+            RetrievedChunk best = hits.stream().filter(h -> h.documentId().equals(documentId)).findFirst().orElseThrow();
+            return new ChapterText(best, title.find() ? title.group().strip() : "第" + number + "章", rows);
+        }
+        return null;
+    }
+
+    private List<RetrievedChunk> toSections(RetrievedChunk best, List<TextRow> rows) {
         return sections(rows, FULL_TEXT_SECTION_CHARS).stream().map(section -> new RetrievedChunk(section.getFirst().chunkId(), best.documentId(),
                 best.filename(), section.getFirst().headingPath(),
                 mergeLocations(section.getFirst().location(), section.getLast().location()),
                 section.stream().map(TextRow::content).collect(Collectors.joining("\n")), best.score(), null, null, null,
                 best.rerankScore(), false, true, "TEXT")).toList();
+    }
+
+    /** 问题里点名的章节号，最多 2 个："第七十九回讲了什么"→ 79，"第5章和第6章"→ 5、6 */
+    static List<Integer> chapterNumbers(String question) {
+        if (question == null) {
+            return List.of();
+        }
+        return CHAPTER_REFERENCE.matcher(question).results()
+                .map(m -> parseNumber(m.group(1)))
+                .filter(n -> n > 0)
+                .distinct()
+                .limit(MAX_CHAPTER_REFERENCES)
+                .toList();
+    }
+
+    /** "七十九"→ 79，"一百零一"→ 101，"十一"→ 11，"79"→ 79 */
+    static int parseNumber(String text) {
+        if (text.chars().allMatch(Character::isDigit)) {
+            return Integer.parseInt(text);
+        }
+        int total = 0;
+        int current = 0;
+        for (char ch : text.toCharArray()) {
+            int digit = CHINESE_DIGITS.indexOf(ch);
+            if (digit >= 0) {
+                current = digit;
+            } else if (ch == '十') {
+                total += (current == 0 ? 1 : current) * 10;
+                current = 0;
+            } else if (ch == '百') {
+                total += current * 100;
+                current = 0;
+            }
+        }
+        return total + current;
+    }
+
+    /** 79 →"七十九"，101 →"一百零一"，110 →"一百一十"，与回目的写法一致 */
+    static String chineseNumber(int n) {
+        if (n < 10) {
+            return String.valueOf(CHINESE_DIGITS.charAt(n));
+        }
+        if (n < 20) {
+            return "十" + (n % 10 == 0 ? "" : CHINESE_DIGITS.charAt(n % 10));
+        }
+        if (n < 100) {
+            return CHINESE_DIGITS.charAt(n / 10) + "十" + (n % 10 == 0 ? "" : CHINESE_DIGITS.charAt(n % 10));
+        }
+        int rest = n % 100;
+        String hundreds = CHINESE_DIGITS.charAt(n / 100) + "百";
+        if (rest == 0) {
+            return hundreds;
+        }
+        if (rest < 10) {
+            return hundreds + "零" + CHINESE_DIGITS.charAt(rest);
+        }
+        return hundreds + (rest < 20 ? "一" : "") + chineseNumber(rest);
     }
 
     /** 按原文顺序分段：章节变化或累计超过 maxChars 时另起一段 */

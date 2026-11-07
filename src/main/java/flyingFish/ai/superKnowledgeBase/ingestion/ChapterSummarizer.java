@@ -65,6 +65,7 @@ public class ChapterSummarizer {
     private final ChunkRepository chunks;
     private final DocumentSummarizer summarizer;
     private final EmbeddingModel embeddingModel;
+    private final boolean enabled;
     private final int minChars;
     private final Semaphore permits;
     private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
@@ -79,13 +80,14 @@ public class ChapterSummarizer {
         this.chunks = chunks;
         this.summarizer = summarizer;
         this.embeddingModel = embeddingModel;
+        this.enabled = properties.summary().chapterEnabled();
         this.minChars = properties.summary().chapterMinChars();
         this.permits = new Semaphore(Math.max(1, properties.summary().chapterConcurrency()));
     }
 
     @EventListener(ApplicationReadyEvent.class)
     public void backfillOnStartup() {
-        if (summarizer.available()) {
+        if (enabled && summarizer.available()) {
             executor.submit(() -> chunks.findReadyDocuments().forEach(this::submit));
         }
     }
@@ -98,7 +100,7 @@ public class ChapterSummarizer {
 
     /** 文档处理完成后调用：补齐缺少的章节摘要，删掉已不存在的章节的摘要 */
     public void submit(long documentId) {
-        if (!summarizer.available() || stopping) {
+        if (!enabled || !summarizer.available() || stopping) {
             return;
         }
         if (!active.add(documentId)) {
