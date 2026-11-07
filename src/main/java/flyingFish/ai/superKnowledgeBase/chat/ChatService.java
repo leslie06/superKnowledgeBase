@@ -481,7 +481,10 @@ public class ChatService {
         }
         if (!chat.chapterVersions().isEmpty()) {
             sb.append("【说明】").append(chat.chapterVersions().stream().map(n -> "《" + n + "》").collect(Collectors.joining("、")))
-                    .append("是同一章在不同版本中的全文。请分别说明各版本的内容，再比较版本之间的差异（回目、情节、人物、文字、删改）。\n\n");
+                    .append("是同一章在不同版本中的全文。先概括这一章的内容（各版本相同的部分合在一起说，"
+                            + "某个版本独有的情节注明版本），再用 Markdown 表格列出版本差异：每行一个方面（回目、开篇诗词、情节、人物、"
+                            + "文字、删改等），第一列是方面，后面每个版本一列，各格写该版本的具体写法并标注来源编号；只列有差异的方面，"
+                            + "没有差异的方面在表格后用一句话说明。\n\n");
         }
         if (chat.plan().aggregate()) {
             sb.append(AGGREGATE_HINT);
