@@ -27,6 +27,7 @@ import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 import tools.jackson.databind.json.JsonMapper;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -96,6 +97,8 @@ public class ChatService {
                                 List<Citation> citations,
                                 List<Map<String, Object>> hits, Map<String, Long> timings) {
     }
+
+    private static final Duration STREAM_IDLE_TIMEOUT = Duration.ofSeconds(60);
 
     private final ConversationRepository conversations;
     private final KnowledgeBaseService knowledgeBaseService;
@@ -300,13 +303,18 @@ public class ChatService {
                 timings);
     }
 
+    /**
+     * 连续 STREAM_IDLE_TIMEOUT 没有新内容就报错：DeepSeek 过载时流式请求可能一个字都不返回，挂 6 分钟后才以空内容结束
+     */
     private Flux<String> generate(PreparedChat chat) {
         return chatClient.prompt()
                 .system(ANSWER_SYSTEM_PROMPT)
                 .messages(historyMessages(chat.history()))
                 .user(userPrompt(chat))
                 .stream()
-                .content();
+                .content()
+                .timeout(STREAM_IDLE_TIMEOUT, Flux.error(new IllegalStateException(
+                        "DeepSeek 超过 " + STREAM_IDLE_TIMEOUT.toSeconds() + " 秒没有返回内容，请稍后重试")));
     }
 
     /**
@@ -346,6 +354,9 @@ public class ChatService {
                 })
                 .map(text -> event("delta", Map.of("text", text)));
         return Flux.concat(head, body, Flux.defer(() -> {
+            if (answer.isEmpty()) {
+                return Flux.just(event("error", Map.of("message", "DeepSeek 没有返回内容，请稍后重试")));
+            }
             Mono<Long> saved = Mono.fromCallable(() -> saveAssistantMessage(chat, answer.toString()))
                     .subscribeOn(Schedulers.boundedElastic())
                     .cache();
