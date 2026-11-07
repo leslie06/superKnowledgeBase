@@ -38,7 +38,7 @@ public class EvidenceChecker {
      */
     public record Verdict(boolean sufficient, String missing, List<String> queries, List<ContextRequest> context) {
 
-        static final Verdict SUFFICIENT = new Verdict(true, null, List.of(), List.of());
+        public static final Verdict SUFFICIENT = new Verdict(true, null, List.of(), List.of());
     }
 
     /**
@@ -89,7 +89,7 @@ public class EvidenceChecker {
     public EvidenceChecker(ChatClient.Builder chatClientBuilder, JsonMapper jsonMapper, SkbProperties properties) {
         this.chatClient = chatClientBuilder.build();
         this.jsonMapper = jsonMapper;
-        this.timeout = properties.retrieval().rewriteTimeout();
+        this.timeout = properties.retrieval().checkTimeout();
     }
 
     /**

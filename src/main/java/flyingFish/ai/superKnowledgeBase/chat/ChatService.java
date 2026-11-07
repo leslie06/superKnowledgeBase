@@ -3,6 +3,7 @@ package flyingFish.ai.superKnowledgeBase.chat;
 import flyingFish.ai.superKnowledgeBase.common.NotFoundException;
 import flyingFish.ai.superKnowledgeBase.common.SkbProperties;
 import flyingFish.ai.superKnowledgeBase.kb.KnowledgeBaseService;
+import flyingFish.ai.superKnowledgeBase.retrieval.EvidenceChecker;
 import flyingFish.ai.superKnowledgeBase.retrieval.QueryPlanner;
 import flyingFish.ai.superKnowledgeBase.retrieval.QueryRewriter;
 import flyingFish.ai.superKnowledgeBase.retrieval.RetrievalPipeline;
@@ -19,6 +20,8 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.codec.ServerSentEvent;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
+import reactor.core.Disposable;
+import reactor.core.publisher.ConnectableFlux;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
@@ -82,6 +85,11 @@ public class ChatService {
      * @param hits    检索命中的片段及分数，写入 retrieval_trace 便于排查 bad case
      * @param timings 各环节耗时（毫秒），同样写入 retrieval_trace，用于排查"回答慢"
      */
+    /** 用户问题已保存、首轮检索已完成，还没判断资料够不够 */
+    private record Started(Conversation conversation, List<ChatMessage> history, String question,
+                           RetrievalPipeline.FirstRound first) {
+    }
+
     private record PreparedChat(Conversation conversation, List<ChatMessage> history, String question,
                                 String searchQuery, QueryPlanner.Plan plan,
                                 List<RetrievalPipeline.FollowUp> followUps, List<String> fullTextDocuments,
@@ -203,16 +211,16 @@ public class ChatService {
         if (!apiKeyConfigured) {
             return Flux.just(event("error", Map.of("message", "未配置 DeepSeek API Key，请设置环境变量 DEEPSEEK_API_KEY 后重启服务")));
         }
-        return Mono.fromCallable(() -> prepare(conversationId, question.trim()))
+        return Mono.fromCallable(() -> start(conversationId, question.trim()))
                 .subscribeOn(Schedulers.boundedElastic())
-                .flatMapMany(this::answer)
+                .flatMapMany(this::answerWhileChecking)
                 .onErrorResume(e -> {
                     log.warn("问答失败，conversationId={}", conversationId, e);
                     return Flux.just(event("error", Map.of("message", "回答生成失败：" + e.getMessage())));
                 });
     }
 
-    private PreparedChat prepare(long conversationId, String question) {
+    private Started start(long conversationId, String question) {
         Conversation conversation = get(conversationId);
         List<ChatMessage> history = conversations.findRecentMessages(conversationId, historyMessages);
         conversations.insertMessage(conversationId, ChatMessage.USER, question, null, null);
@@ -223,8 +231,57 @@ public class ChatService {
         List<QueryRewriter.Turn> turns = history.stream()
                 .map(m -> new QueryRewriter.Turn(ChatMessage.USER.equals(m.role()), m.content()))
                 .toList();
-        RetrievalPipeline.Result result = pipeline.run(conversation.kbId(), turns, question, conversation.scope(),
-                RetrievalPipeline.Options.CHAT);
+        return new Started(conversation, history, question, pipeline.first(conversation.kbId(), turns, question,
+                conversation.scope(), RetrievalPipeline.Options.CHAT));
+    }
+
+    /**
+     * 判断资料够不够（2～3 秒）的同时，就用首轮资料开始生成回答，先不发给前端：资料足够（约八成问题）时直接放出已生成的内容，
+     * 省掉判断的等待；不够时丢掉这次生成，补查后重新生成，多花的是这一小段生成的 token。
+     * 引用要等判断完才确定，所以 citations 事件也在判断之后发送，SSE 事件顺序不变。
+     */
+    private Flux<ServerSentEvent<String>> answerWhileChecking(Started started) {
+        RetrievalPipeline.FirstRound first = started.first();
+        PreparedChat draft = prepare(started, pipeline.finish(first, EvidenceChecker.Verdict.SUFFICIENT));
+        long checkStart = System.nanoTime();
+        Mono<EvidenceChecker.Verdict> verdict = Mono.fromCallable(() -> pipeline.check(first))
+                .subscribeOn(Schedulers.boundedElastic())
+                .doOnNext(v -> {
+                    long checkMs = (System.nanoTime() - checkStart) / 1_000_000;
+                    first.timings().put("checkMs", checkMs);
+                    draft.timings().put("checkMs", checkMs);
+                });
+        if (draft.citations().isEmpty()) {
+            // 首轮什么都没检索到，没有可以提前生成的；补查后可能找到
+            return verdict.publishOn(Schedulers.boundedElastic())
+                    .flatMapMany(v -> v.sufficient() ? answer(draft, null, 0)
+                            : answerAfterFollowUp(started, v));
+        }
+        long generateStart = System.nanoTime();
+        ConnectableFlux<String> generation = generate(draft).replay();
+        Disposable connection = generation.connect();
+        return verdict.publishOn(Schedulers.boundedElastic())
+                .flatMapMany(v -> {
+                    if (v.sufficient()) {
+                        return answer(draft, generation, generateStart);
+                    }
+                    connection.dispose();
+                    log.info("资料不够，丢弃已开始生成的回答，补查后重新生成");
+                    return answerAfterFollowUp(started, v);
+                })
+                .doOnCancel(connection::dispose);
+    }
+
+    private Flux<ServerSentEvent<String>> answerAfterFollowUp(Started started, EvidenceChecker.Verdict verdict) {
+        PreparedChat chat = prepare(started, pipeline.finish(started.first(), verdict));
+        return answer(chat, generate(chat), System.nanoTime());
+    }
+
+    /** 组装上下文和引用 */
+    private PreparedChat prepare(Started started, RetrievalPipeline.Result result) {
+        Conversation conversation = started.conversation();
+        List<ChatMessage> history = started.history();
+        String question = started.question();
         List<RetrievedChunk> chunks = result.hits();
         // 小文档读全文，其余扩展相邻片段（相邻的命中片段会并成一条）；trace 仍按原始命中记录
         Retriever.Context context = retriever.context(chunks, expandChars, fullTextChars, result.searchQuery());
@@ -243,7 +300,20 @@ public class ChatService {
                 timings);
     }
 
-    private Flux<ServerSentEvent<String>> answer(PreparedChat chat) {
+    private Flux<String> generate(PreparedChat chat) {
+        return chatClient.prompt()
+                .system(ANSWER_SYSTEM_PROMPT)
+                .messages(historyMessages(chat.history()))
+                .user(userPrompt(chat))
+                .stream()
+                .content();
+    }
+
+    /**
+     * @param content 回答的文字流（{@link #generate}），可能已提前开始生成
+     * @param start   开始生成的时刻，用于计算首字和生成耗时
+     */
+    private Flux<ServerSentEvent<String>> answer(PreparedChat chat, Flux<String> content, long start) {
         Flux<ServerSentEvent<String>> head = Flux.just(event("citations", chat.citations()));
         if (chat.citations().isEmpty()) {
             String notFound = chat.conversation().scope().isAll() ? NOT_FOUND_ANSWER : NOT_FOUND_IN_SCOPE_ANSWER;
@@ -254,14 +324,8 @@ public class ChatService {
 
         StringBuilder answer = new StringBuilder();
         AtomicBoolean completed = new AtomicBoolean();
-        long start = System.nanoTime();
         AtomicLong firstToken = new AtomicLong();
-        Flux<ServerSentEvent<String>> body = chatClient.prompt()
-                .system(ANSWER_SYSTEM_PROMPT)
-                .messages(historyMessages(chat.history()))
-                .user(userPrompt(chat))
-                .stream()
-                .content()
+        Flux<ServerSentEvent<String>> body = content
                 .doOnNext(text -> {
                     if (firstToken.compareAndSet(0, System.nanoTime())) {
                         chat.timings().put("firstTokenMs", (firstToken.get() - start) / 1_000_000);

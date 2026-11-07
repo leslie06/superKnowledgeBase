@@ -155,8 +155,10 @@ public class InsightService {
         if (!traceHits.isEmpty() && traceHits.stream().allMatch(h -> h.rerankScore() == null)) {
             flags.add(Flag.UNRERANKED);
         }
+        // 资料判断与生成同时进行，已含在首字里；补查时判断是实际等待
         long waited = timings.getOrDefault("rewriteMs", 0L) + timings.getOrDefault("retrieveMs", 0L)
-                + timings.getOrDefault("followUpMs", 0L) + timings.getOrDefault("firstTokenMs", 0L);
+                + (timings.containsKey("followUpMs") ? timings.getOrDefault("checkMs", 0L) + timings.get("followUpMs") : 0)
+                + timings.getOrDefault("firstTokenMs", 0L);
         if (waited > SLOW_MS) {
             flags.add(Flag.SLOW);
         }

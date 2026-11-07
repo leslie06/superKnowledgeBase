@@ -138,7 +138,10 @@ export interface ChatMessage {
   /** 没有核对时为 null（未开启、无命中直接拒答、停止生成或核对失败） */
   verification?: AnswerVerification | null
   feedback?: Feedback | null
-  /** 各环节耗时（毫秒）：rewriteMs 查询改写、retrieveMs 召回与精排、firstTokenMs 首字、answerMs 生成完成 */
+  /**
+   * 各环节耗时（毫秒）：rewriteMs 查询改写、retrieveMs 召回与精排、checkMs 判断资料够不够（与生成同时进行，
+   * 补查时才是实际等待）、followUpMs 补充检索、firstTokenMs 首字、answerMs 生成完成
+   */
   timings?: Record<string, number>
   /** 汇总类问题拆出的子问题（多步检索），普通问题为空 */
   subQueries?: string[]

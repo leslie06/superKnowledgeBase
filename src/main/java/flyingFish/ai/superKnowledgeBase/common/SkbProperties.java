@@ -20,16 +20,17 @@ public record SkbProperties(String storageDir, Ingestion ingestion, Chunk chunk,
      * @param candidates    向量、关键词两路各自召回的候选数
      * @param rrfK          RRF 融合常数，片段得分 = 1 / (rrfK + 向量排名) + keywordWeight / (rrfK + 关键词排名)
      * @param keywordWeight 关键词一路在 RRF 中的权重；二字组 BM25 对改写、口语化的问题噪声较大，所以低于向量
-     * @param rewriteTimeout 查询改写（同步调用 LLM）的最长等待时间，超时后用原问题检索
+     * @param rewriteTimeout 查询改写和问题规划（同步调用 LLM）的最长等待时间，超时后用原问题检索、不拆分
      * @param efSearch      向量召回时 HNSW 索引的搜索范围（hnsw.ef_search），越大越接近精确结果；必须明显大于 candidates
      * @param planQueries   是否先判断问题是否需要汇总多处资料，需要时拆成子问题分别检索（多一次与改写并行的 LLM 调用）
      * @param aggregateTopK 汇总类问题合并多路检索结果后最多保留的片段数（普通问题是 topK）
      * @param subQueryRerankCandidates 每个子问题送去精排的片段数，少于 rerank.candidates 以控制多路检索的总耗时
      * @param maxFollowUps  迭代检索：资料不够回答时换说法补充检索的最多轮数，0 表示不补查
+     * @param checkTimeout  判断资料够不够的最长等待时间，超时视为足够；输入有几千字，比改写慢
      */
     public record Retrieval(int topK, double minScore, int candidates, int rrfK, double keywordWeight,
                             Duration rewriteTimeout, int efSearch, boolean planQueries, int aggregateTopK,
-                            int subQueryRerankCandidates, int maxFollowUps) {
+                            int subQueryRerankCandidates, int maxFollowUps, Duration checkTimeout) {
     }
 
     /**

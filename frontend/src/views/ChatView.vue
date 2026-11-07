@@ -216,10 +216,15 @@ function sec(ms: number | undefined) {
   return ms == null ? '-' : (ms / 1000).toFixed(1)
 }
 
+/**
+ * 资料判断（checkMs）和生成回答同时进行：资料够时它藏在首字等待里，不另算；
+ * 判断为不够、补查后重新生成时，判断和补查都是实际的等待，算进检索
+ */
 function retrievalMs(m: ChatMessage) {
   const t = m.timings
   return t && (t.rewriteMs != null || t.retrieveMs != null)
-    ? (t.rewriteMs ?? 0) + (t.retrieveMs ?? 0) + (t.followUpMs ?? 0) : null
+    ? (t.rewriteMs ?? 0) + (t.retrieveMs ?? 0)
+      + (t.followUpMs != null ? (t.checkMs ?? 0) + t.followUpMs : 0) : null
 }
 
 /**
@@ -230,10 +235,12 @@ function retrievalMs(m: ChatMessage) {
 function timingText(m: ChatMessage) {
   const t = m.timings!
   const retrieval = retrievalMs(m)!
+  const followUp = t.followUpMs != null
   const parts = [`检索 ${sec(retrieval)} 秒（改写 ${sec(t.rewriteMs)} · 召回与精排 ${sec(t.retrieveMs)}`
-    + (t.followUpMs != null ? ` · 补充检索 ${sec(t.followUpMs)}` : '') + '）']
+    + (followUp ? `${t.checkMs != null ? ` · 资料判断 ${sec(t.checkMs)}` : ''} · 补充检索 ${sec(t.followUpMs)}` : '') + '）']
   if (t.answerMs != null) {
-    parts.push(`生成 ${sec(t.answerMs)} 秒` + (t.firstTokenMs != null ? `（首字 ${sec(t.firstTokenMs)}）` : ''))
+    const overlapped = !followUp && t.checkMs != null ? `，期间判断资料 ${sec(t.checkMs)}` : ''
+    parts.push(`生成 ${sec(t.answerMs)} 秒` + (t.firstTokenMs != null ? `（首字 ${sec(t.firstTokenMs)}${overlapped}）` : ''))
   }
   parts.push(`总计 ${sec(retrieval + (t.answerMs ?? 0))} 秒`)
   return parts.join(' · ')
