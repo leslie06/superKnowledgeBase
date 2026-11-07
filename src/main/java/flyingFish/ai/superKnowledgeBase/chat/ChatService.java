@@ -72,6 +72,8 @@ public class ChatService {
                只有资料中确实没有相关内容时才说没有找到。
             4. 在使用了资料的句子末尾标注来源编号，格式为 [1]、[2]；一句话来自多个来源时写成 [1][3]。不要在末尾单独列出参考文献。
             5. 用中文回答，先给出结论，再展开说明；内容较多时使用 Markdown 列表或表格。
+            6. 回答的详略跟着问题走：问"讲了什么""主要内容""概括""总结"时，先用两三句话说清主线，再分点列出主要情节或要点，
+               每点一两句，总长 300～600 字，不要逐段复述原文；用户明确要求"详细""具体经过""逐段"时再展开。
             """;
 
     /** 汇总类问题附在参考资料后面的说明：资料是多路检索合起来的，可能只覆盖一部分 */
@@ -254,6 +256,10 @@ public class ChatService {
                     first.timings().put("checkMs", checkMs);
                     draft.timings().put("checkMs", checkMs);
                 });
+        if (!draft.fullTextDocuments().isEmpty()) {
+            // 整篇（或问题点名的整章）已经读入，判断只看得到首轮几个片段，会误以为缺内容而白白补查（"第21回讲了什么"补查了 9 秒）
+            return answer(draft, generate(draft), System.nanoTime());
+        }
         if (draft.citations().isEmpty()) {
             // 首轮什么都没检索到，没有可以提前生成的；补查后可能找到
             return verdict.publishOn(Schedulers.boundedElastic())
