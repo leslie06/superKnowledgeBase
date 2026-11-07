@@ -10,11 +10,17 @@ package flyingFish.ai.superKnowledgeBase.retrieval;
  * @param rerankScore  交叉编码器精排分数（0~1）；未精排时为 null
  * @param exactMatch   是否包含问题中的精确词项（条款编号、q5、商品编码等），包含时不受阈值限制
  * @param relevant     是否通过相关性过滤（精排分数或余弦相似度达到阈值，或精确命中），问答只使用通过的片段
- * @param kind         片段类型：TEXT 正文 / SUMMARY 文档摘要
+ * @param kind         片段类型：TEXT 正文 / SUMMARY 文档摘要 / CHAPTER 章节摘要
  */
 public record RetrievedChunk(Long chunkId, Long documentId, String filename, String headingPath, String location,
                              String content, double score, Double keywordScore, Integer vectorRank,
                              Integer keywordRank, Double rerankScore, boolean exactMatch, boolean relevant, String kind) {
 
     public static final String SUMMARY = "SUMMARY";
+    public static final String CHAPTER = "CHAPTER";
+
+    /** 文档摘要或章节摘要：LLM 生成的概括，不是原文 */
+    public boolean isSummary() {
+        return SUMMARY.equals(kind) || CHAPTER.equals(kind);
+    }
 }

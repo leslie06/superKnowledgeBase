@@ -120,6 +120,55 @@ class ChunkerTests {
     }
 
     @Test
+    void recognizesNovelChapterTitles() {
+        assertThat(DocumentParser.novelChapter("第七十九回 西门庆贪欲丧命 吴月娘失偶生儿"))
+                .isEqualTo(new DocumentParser.NovelChapter("第七十九回 西门庆贪欲丧命 吴月娘失偶生儿", "", false));
+        // 词话本的"囬"，下联后面粘着正文：在"詞曰"处切开
+        assertThat(DocumentParser.novelChapter("第一囬 景陽岡武松打虎 潘金蓮嫌夫賣風月詞曰："))
+                .isEqualTo(new DocumentParser.NovelChapter("第一囬 景陽岡武松打虎 潘金蓮嫌夫賣風月", "詞曰：", false));
+        // 没有切分标记时按上联字数切
+        assertThat(DocumentParser.novelChapter("第十一囬 潘金蓮激打孫雪娥 西門慶梳籠李桂姐婦人嫉妒非常，浪子落魄無賴。"))
+                .isEqualTo(new DocumentParser.NovelChapter("第十一囬 潘金蓮激打孫雪娥 西門慶梳籠李桂姐",
+                        "婦人嫉妒非常，浪子落魄無賴。", false));
+        // 只有编号，回目名在下一行
+        assertThat(DocumentParser.novelChapter("第一回")).isEqualTo(new DocumentParser.NovelChapter("第一回", "", true));
+        assertThat(DocumentParser.isChapterTitle("西门庆热结十弟兄武二郎冷遇亲哥嫂")).isTrue();
+        assertThat(DocumentParser.isChapterTitle("诗曰：")).isFalse();
+        // 正文和目录不算
+        assertThat(DocumentParser.novelChapter("第二回了。你怎么尝不出来？")).isNull();
+        assertThat(DocumentParser.novelChapter("第三十三回 陈敬济失钥罚唱 韩道国纵妇争锋第三十四回 献芳樽内室乞恩")).isNull();
+    }
+
+    @Test
+    void plainTextLinesAreParagraphs() {
+        TikaBlockHandler handler = new TikaBlockHandler(true);
+        handler.startElement("", "p", "p", new org.xml.sax.helpers.AttributesImpl());
+        String text = "第1章 甄士隐梦幻识通灵 贾雨村风尘怀闺秀\r\n　　此开卷第一回也。\r\n作者自云";
+        handler.characters(text.toCharArray(), 0, text.length());
+        handler.endElement("", "p", "p");
+
+        assertThat(handler.blocks()).extracting(TikaBlockHandler.Block::text)
+                .containsExactly("第1章 甄士隐梦幻识通灵 贾雨村风尘怀闺秀", "此开卷第一回也。", "作者自云");
+    }
+
+    @Test
+    void groupsChunksByChapter() {
+        List<ChunkRepository.ChunkView> chunks = List.of(
+                new ChunkRepository.ChunkView(1L, 0, "前言", null, null),
+                new ChunkRepository.ChunkView(2L, 1, "正文一", "第七十九回 西门庆贪欲丧命", "第643页"),
+                new ChunkRepository.ChunkView(3L, 2, "正文二", "第七十九回 西门庆贪欲丧命", "第655-656页"),
+                new ChunkRepository.ChunkView(4L, 3, "条文", "第一编 总则 > 第一章 基本规定 > 第一节 一般规定", null));
+
+        List<ChapterSummarizer.Chapter> chapters = ChapterSummarizer.chapters(chunks);
+
+        assertThat(chapters).extracting(ChapterSummarizer.Chapter::heading)
+                .containsExactly("第七十九回 西门庆贪欲丧命", "第一编 总则 > 第一章 基本规定");
+        assertThat(chapters.getFirst().location()).isEqualTo("第643-656页");
+        assertThat(ChapterSummarizer.chapterOf("Chapter 3 Indexing > 3.1 B-Trees")).isEqualTo("Chapter 3 Indexing");
+        assertThat(ChapterSummarizer.chapterOf("员工手册 > 第二节 考勤")).isNull();
+    }
+
+    @Test
     void stripsAutoNumberFromStyledHeadings() {
         assertThat(DocumentParser.stripHeadingNumber("1.4.1.4.1.1.1. 查看活动")).isEqualTo("查看活动");
         assertThat(DocumentParser.stripHeadingNumber("2.1 工作时间")).isEqualTo("工作时间");

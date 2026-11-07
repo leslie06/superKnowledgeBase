@@ -8,7 +8,11 @@ import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Repository;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
+import java.util.Optional;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 @Repository
 public class ChunkRepository {
@@ -61,6 +65,67 @@ public class ChunkRepository {
                 .params(documentId, kbId, SUMMARY_INDEX, summary, SUMMARY_HEADING, PgVectors.toLiteral(embedding),
                         KeywordAnalyzer.toTsvector(terms), terms.size())
                 .update();
+    }
+
+    /** 章节摘要片段的章节路径是"章节路径 > 章节摘要"，和正文区分开，上下文扩展也不会把它和正文接在一起 */
+    public static final String CHAPTER_SUMMARY_SUFFIX = " > 章节摘要";
+
+    /**
+     * 写入一个章节摘要片段；同一章节已有摘要片段时不重复写入（重新处理与补生成可能先后提交同一文档）。
+     * 关键词索引和文档摘要一样加上文件出处，"红楼梦第五回讲了什么"能靠书名和回目命中。
+     *
+     * @param chunkIndex 从 -2 往下，排在文档摘要和正文之前
+     */
+    void insertChapterSummary(long documentId, long kbId, int chunkIndex, String chapter, String location,
+                              String source, String summary, float[] embedding) {
+        String heading = chapter + CHAPTER_SUMMARY_SUFFIX;
+        List<String> terms = keywordTerms(heading + "\n" + source, summary);
+        jdbc.sql("""
+                        INSERT INTO chunk (document_id, kb_id, chunk_index, kind, content, heading_path, location, embedding,
+                                           keyword_tsv, keyword_token_count)
+                        SELECT ?, ?, ?, 'CHAPTER', ?, ?, ?, ?::vector, ?::tsvector, ?
+                        WHERE NOT EXISTS (SELECT 1 FROM chunk WHERE document_id = ? AND kind = 'CHAPTER' AND heading_path = ?)
+                        """)
+                .params(documentId, kbId, chunkIndex, summary, heading, location, PgVectors.toLiteral(embedding),
+                        KeywordAnalyzer.toTsvector(terms), terms.size(), documentId, heading)
+                .update();
+    }
+
+    /** 已有章节摘要片段的章节路径（去掉"> 章节摘要"后缀） */
+    Set<String> findChapterSummaryHeadings(long documentId) {
+        return jdbc.sql("SELECT heading_path FROM chunk WHERE document_id = ? AND kind = 'CHAPTER'")
+                .param(documentId).query(String.class).list().stream()
+                .map(h -> h.endsWith(CHAPTER_SUMMARY_SUFFIX) ? h.substring(0, h.length() - CHAPTER_SUMMARY_SUFFIX.length()) : h)
+                .collect(Collectors.toSet());
+    }
+
+    /** 删除不再存在（或不再需要摘要）的章节的摘要片段 */
+    int deleteChapterSummaries(long documentId, Collection<String> chapters) {
+        if (chapters.isEmpty()) {
+            return 0;
+        }
+        return jdbc.sql("DELETE FROM chunk WHERE document_id = :id AND kind = 'CHAPTER' AND heading_path IN (:headings)")
+                .param("id", documentId)
+                .param("headings", chapters.stream().map(c -> c + CHAPTER_SUMMARY_SUFFIX).toList())
+                .update();
+    }
+
+    Optional<String> findCachedChapterSummary(String sha256, String chapter) {
+        return jdbc.sql("SELECT summary FROM chapter_summary WHERE sha256 = ? AND heading_path = ?")
+                .params(sha256, chapter).query(String.class).optional();
+    }
+
+    void cacheChapterSummary(String sha256, String chapter, String summary) {
+        jdbc.sql("""
+                        INSERT INTO chapter_summary (sha256, heading_path, summary) VALUES (?, ?, ?)
+                        ON CONFLICT (sha256, heading_path) DO UPDATE SET summary = EXCLUDED.summary, created_at = now()
+                        """)
+                .params(sha256, chapter, summary).update();
+    }
+
+    /** 已处理完成的文档，启动时逐个检查章节摘要是否齐全 */
+    List<Long> findReadyDocuments() {
+        return jdbc.sql("SELECT id FROM document WHERE status = 'READY' ORDER BY id").query(Long.class).list();
     }
 
     public void deleteSummary(long documentId) {

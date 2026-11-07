@@ -42,6 +42,7 @@ public class IngestionService {
     private final int embeddingBatchSize;
     private final OcrService ocr;
     private final DocumentSummarizer summarizer;
+    private final ChapterSummarizer chapterSummarizer;
     private final ExecutorService executor;
     private final Set<Long> inFlight = ConcurrentHashMap.newKeySet();
     /** 应用正在关闭：此时处理中断不算失败，保持原状态，下次启动后继续 */
@@ -50,6 +51,7 @@ public class IngestionService {
     public IngestionService(DocumentRepository documents, ChunkRepository chunks, FileStorage fileStorage,
                             DocumentParser parser, Chunker chunker, EmbeddingModel embeddingModel,
                             TransactionTemplate transactionTemplate, OcrService ocr, DocumentSummarizer summarizer,
+                            ChapterSummarizer chapterSummarizer,
                             SkbProperties properties) {
         this.documents = documents;
         this.chunks = chunks;
@@ -60,6 +62,7 @@ public class IngestionService {
         this.transactionTemplate = transactionTemplate;
         this.ocr = ocr;
         this.summarizer = summarizer;
+        this.chapterSummarizer = chapterSummarizer;
         this.embeddingBatchSize = properties.ingestion().embeddingBatchSize();
         this.executor = Executors.newFixedThreadPool(properties.ingestion().concurrency(),
                 Thread.ofVirtual().name("ingest-", 0).factory());
@@ -171,6 +174,7 @@ public class IngestionService {
             });
             log.info("文档处理完成：{}（{} 个片段，耗时 {} ms）", doc.filename(), drafts.size(),
                     System.currentTimeMillis() - start);
+            chapterSummarizer.submit(documentId);
         } catch (Exception e) {
             if (stopping) {
                 log.info("应用关闭，文档下次启动后继续处理：{}", doc.filename());

@@ -40,6 +40,18 @@ public class DocumentParser {
     private static final Pattern APPENDIX_HEADING = Pattern.compile("^附\\s*则$");
     private static final Pattern CHAPTER_HEADING = Pattern.compile("^第[一二三四五六七八九十百零〇\\d]+(?:章|篇|部分)\\s*.*");
     private static final Pattern SECTION_HEADING = Pattern.compile("^第[一二三四五六七八九十百零〇\\d]+节\\s*.*");
+    /**
+     * 章回小说的回目："第七十九回 西门庆贪欲丧命 吴月娘失偶生儿"，词话本写作"囬""囘"。回字后面是空格或行尾，
+     * "第二回了"这样的正文不算；group(2) 是回目名（可能粘着正文，见 novelChapter）
+     */
+    private static final Pattern NOVEL_CHAPTER = Pattern.compile("^(第[一二三四五六七八九十百零〇\\d]+[回囘囬])(?:[\\s\\u3000]+(.*))?$");
+    /** 一行里出现第二个回目的是目录 */
+    private static final Pattern ANOTHER_CHAPTER = Pattern.compile("第[一二三四五六七八九十百零〇\\d]+[回囘囬]");
+    /** 回目名后面粘着的正文开头：PDF 清理时把"詞曰："这类下一行接到了回目后面 */
+    private static final Pattern CHAPTER_BODY_START = Pattern.compile("[，。；：！？、,.;:!?「“]|[詩诗詞词]曰|[詩诗詞词]云|[話话]說|[話话]说|[却卻且][說说]|看官");
+    private static final int MAX_CHAPTER_TITLE_CHARS = 30;
+    /** 回目与"章"同级 */
+    private static final int CHAPTER_LEVEL = 3;
     private static final Pattern CN_NUMBER_HEADING = Pattern.compile("^[一二三四五六七八九十]+、.+");
     private static final Pattern CN_PAREN_HEADING = Pattern.compile("^[（(][一二三四五六七八九十]+[)）].+");
     /** 首段编号限两位数，避免把"300 高工、主管"这类表格残行、"2026 年计划"这类年份误认成标题 */
@@ -80,7 +92,7 @@ public class DocumentParser {
     public List<TextUnit> parse(Path file, String filename, String sha256, OcrService.Progress ocrProgress)
             throws IOException {
         DocType type = DocType.fromFilename(filename);
-        TikaBlockHandler handler = new TikaBlockHandler();
+        TikaBlockHandler handler = new TikaBlockHandler(type == DocType.TEXT);
         Metadata metadata = new Metadata();
         metadata.set(TikaCoreProperties.RESOURCE_NAME_KEY, filename);
         try (InputStream in = Files.newInputStream(file)) {
@@ -231,11 +243,20 @@ public class DocumentParser {
         return context;
     }
 
+    /**
+     * 回目：heading 是"第七十九回 西门庆贪欲丧命 吴月娘失偶生儿"，body 是粘在回目后面的正文（没有时为空），
+     * titleMissing 表示这一行只有"第一回"，回目名在下一行
+     */
+    record NovelChapter(String heading, String body, boolean titleMissing) {
+    }
+
     /** Word / PDF / 文本：按标题层级维护章节路径；没有样式标题时用编号规则识别标题。 */
     private List<TextUnit> flowUnits(List<Block> blocks, DocType type) {
         boolean hasStyledHeadings = blocks.stream().anyMatch(b -> b.kind() == Kind.HEADING);
         String[] headings = new String[MAX_HEADING_LEVEL + 1];
         List<TextUnit> units = new ArrayList<>();
+        // 上一行只有"第一回"，这一行可能是回目名
+        String pendingChapter = null;
         for (Block block : blocks) {
             String location = type == DocType.PDF && block.unit() > 0 ? "第" + block.unit() + "页" : null;
             switch (block.kind()) {
@@ -243,6 +264,25 @@ public class DocumentParser {
                 case PARAGRAPH -> {
                     if (NOISE_LINE.matcher(block.text()).matches()) {
                         continue;
+                    }
+                    if (!hasStyledHeadings) {
+                        String chapter = pendingChapter;
+                        pendingChapter = null;
+                        if (chapter != null && isChapterTitle(block.text())) {
+                            pushHeading(headings, CHAPTER_LEVEL, chapter + " " + block.text());
+                            continue;
+                        }
+                        NovelChapter novel = novelChapter(block.text());
+                        if (novel != null) {
+                            pushHeading(headings, CHAPTER_LEVEL, novel.heading());
+                            if (novel.titleMissing()) {
+                                pendingChapter = novel.heading();
+                            }
+                            if (!novel.body().isEmpty()) {
+                                units.add(new TextUnit(novel.body(), headingPath(headings), block.unit(), location));
+                            }
+                            continue;
+                        }
                     }
                     int level = hasStyledHeadings ? 0 : guessHeadingLevel(block.text());
                     if (level > 0) {
@@ -384,6 +424,53 @@ public class DocumentParser {
             return Math.min(depth + 3, MAX_HEADING_LEVEL);
         }
         return 0;
+    }
+
+    /**
+     * 识别回目并切开粘在后面的正文。回目通常是上下两联，用空格分开；下联后面粘着正文时（PDF 清理把下一行接了上来），
+     * 在"詞曰""話說"或标点处切开，找不到时按上联的字数切（"西門慶梳籠李桂姐婦人嫉妒非常，"→"西門慶梳籠李桂姐"）。
+     * 目录行（一行有多个回目）、回目名过长的返回 null，按正文处理。
+     */
+    static NovelChapter novelChapter(String text) {
+        Matcher m = NOVEL_CHAPTER.matcher(text);
+        if (!m.matches()) {
+            return null;
+        }
+        String number = m.group(1);
+        String rest = m.group(2) == null ? "" : m.group(2).strip();
+        if (rest.isEmpty()) {
+            return new NovelChapter(number, "", true);
+        }
+        if (ANOTHER_CHAPTER.matcher(rest).find()) {
+            return null;
+        }
+        String[] halves = rest.split("[\\s\\u3000]+", 3);
+        String first = halves[0];
+        Matcher firstBody = CHAPTER_BODY_START.matcher(first);
+        if (firstBody.find()) {
+            // 只有一联、后面直接是正文
+            String title = first.substring(0, firstBody.start());
+            return title.isEmpty() || title.length() > MAX_CHAPTER_TITLE_CHARS ? null
+                    : new NovelChapter(number + " " + title, rest.substring(firstBody.start()).strip(), false);
+        }
+        if (halves.length == 1) {
+            return first.length() > MAX_CHAPTER_TITLE_CHARS ? null : new NovelChapter(number + " " + first, "", false);
+        }
+        String second = halves[1];
+        Matcher secondBody = CHAPTER_BODY_START.matcher(second);
+        int end = secondBody.find() ? secondBody.start() : second.length();
+        if (end > first.length() + 2) {
+            end = first.length();
+        }
+        String title = first + " " + second.substring(0, end);
+        String body = (second.substring(end) + (halves.length > 2 ? " " + halves[2] : "")).strip();
+        return title.length() > MAX_CHAPTER_TITLE_CHARS ? null : new NovelChapter(number + " " + title, body, false);
+    }
+
+    /** "第一回"单独一行时，下一行是否是回目名：不长、没有标点、不是另一个编号标题 */
+    static boolean isChapterTitle(String text) {
+        return text.length() <= MAX_CHAPTER_TITLE_CHARS && !CHAPTER_BODY_START.matcher(text).find()
+                && !text.startsWith("第") && guessHeadingLevel(text) == 0;
     }
 
     static String stripHeadingNumber(String text) {

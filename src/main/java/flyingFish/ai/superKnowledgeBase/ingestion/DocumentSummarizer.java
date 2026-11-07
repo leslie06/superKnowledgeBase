@@ -44,16 +44,29 @@ public class DocumentSummarizer {
             4. 只依据给出的内容，不要编造；总长度不超过 300 字，不要使用 Markdown。
             """;
 
+    private static final String CHAPTER_PROMPT = """
+            你是章节摘要助手。根据给出的一章（一回）内容写一段摘要，用于知识库回答"这一章讲了什么"
+            "某人是怎么死的""某件事的起因和结果"这类问题。
+            要求：
+            1. 叙事类（小说、历史、传记）：写出主要人物和事件经过，交代因果和结局，人物的生死、婚嫁、获罪、离散要写明
+               原因和相关的人（如"因……而死""被……所害"），用书中的人名；
+            2. 论述类（教材、技术书、制度）：写出本章讲的主要概念、方法和结论；
+            3. 最后单独一行，以"关键词："开头，列出 5～10 个关键词（人物、地点、事件、术语），用顿号分隔；
+            4. 只依据给出的内容，不要编造；总长度不超过 300 字，不要使用 Markdown。
+            """;
+
     private final ChatClient chatClient;
     private final boolean enabled;
     private final int inputChars;
     private final int minChunks;
+    private final int chapterInputChars;
 
     public DocumentSummarizer(ChatClient.Builder chatClientBuilder, SkbProperties properties,
                               @Value("${spring.ai.deepseek.api-key:}") String apiKey) {
         this.chatClient = chatClientBuilder.build();
         this.inputChars = properties.summary().inputChars();
         this.minChunks = properties.summary().minChunks();
+        this.chapterInputChars = properties.summary().chapterInputChars();
         boolean keyConfigured = StringUtils.hasText(apiKey) && !NO_API_KEY.equals(apiKey) && !"sk-xxxx".equals(apiKey);
         this.enabled = properties.summary().enabled() && keyConfigured;
         if (properties.summary().enabled() && !keyConfigured) {
@@ -75,13 +88,28 @@ public class DocumentSummarizer {
      * @param chunks 正文片段，按顺序
      */
     public Optional<String> summarize(String source, List<ChunkDraft> chunks) {
-        if (!enabled || chunks.isEmpty()) {
+        return generate(SYSTEM_PROMPT, source, buildInput(source, chunks, inputChars));
+    }
+
+    /**
+     * 章节摘要。输入同样是"目录（小节标题）+ 开头 + 均匀抽样"，一回十来页通常能完整放下
+     *
+     * @param chapter 章节路径，如"第七十九回 西门庆贪欲丧命 吴月娘失偶生儿"
+     * @param chunks  这一章的正文片段，按顺序
+     */
+    public Optional<String> summarizeChapter(String source, String chapter, List<ChunkDraft> chunks) {
+        return generate(CHAPTER_PROMPT, source + " " + chapter,
+                buildInput(source + "\n章节：" + chapter, chunks, chapterInputChars));
+    }
+
+    private Optional<String> generate(String systemPrompt, String source, String input) {
+        if (!enabled) {
             return Optional.empty();
         }
         try {
             String summary = chatClient.prompt()
-                    .system(SYSTEM_PROMPT)
-                    .user(buildInput(source, chunks, inputChars))
+                    .system(systemPrompt)
+                    .user(input)
                     .options(ChatOptions.builder().temperature(0.2))
                     .call()
                     .content();
@@ -91,7 +119,7 @@ public class DocumentSummarizer {
             summary = summary.strip();
             return Optional.of(summary.length() > MAX_SUMMARY_CHARS ? summary.substring(0, MAX_SUMMARY_CHARS) : summary);
         } catch (Exception e) {
-            log.warn("生成文档摘要失败：{}：{}", source, e.getMessage());
+            log.warn("生成摘要失败：{}：{}", source, e.getMessage());
             return Optional.empty();
         }
     }

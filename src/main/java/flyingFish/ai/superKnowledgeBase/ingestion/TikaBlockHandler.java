@@ -30,6 +30,11 @@ class TikaBlockHandler extends DefaultHandler {
     private static final Pattern LINE_BREAK_BETWEEN_CJK = Pattern.compile("(?<=[\\u4e00-\\u9fff，。；：！？、）】》”])[ \\t]*\\R\\s*(?=[\\u4e00-\\u9fff，。；：！？、（【《“])");
 
     private final List<Block> blocks = new ArrayList<>();
+    /**
+     * 纯文本（txt / md）每一行是一个段落。Tika 把整个文本文件输出成一个 p，按 PDF 的规则把行接起来后，
+     * 整本《红楼梦》成了一个段落，"第1章 ……"这样的标题和 Markdown 的 # 标题都识别不出来
+     */
+    private final boolean lineParagraphs;
     private final StringBuilder buffer = new StringBuilder();
     /** 每个打开的 div 是否是物理单元，用于在 div 结束时判断是否离开单元 */
     private final Deque<Boolean> divStack = new ArrayDeque<>();
@@ -43,6 +48,14 @@ class TikaBlockHandler extends DefaultHandler {
     private List<List<String>> rows;
     private List<String> row;
     private StringBuilder cell;
+
+    TikaBlockHandler() {
+        this(false);
+    }
+
+    TikaBlockHandler(boolean lineParagraphs) {
+        this.lineParagraphs = lineParagraphs;
+    }
 
     List<Block> blocks() {
         return blocks;
@@ -170,13 +183,15 @@ class TikaBlockHandler extends DefaultHandler {
     }
 
     private void flushParagraph() {
-        String text = normalize(buffer.toString());
+        String raw = buffer.toString();
         buffer.setLength(0);
-        if (text.isEmpty()) {
-            return;
-        }
         Kind kind = headingLevel > 0 ? Kind.HEADING : Kind.PARAGRAPH;
-        blocks.add(new Block(kind, headingLevel, text, null, currentUnit));
+        for (String part : lineParagraphs ? raw.split("\\R") : new String[]{raw}) {
+            String text = lineParagraphs ? WHITESPACE.matcher(part).replaceAll(" ").trim() : normalize(part);
+            if (!text.isEmpty()) {
+                blocks.add(new Block(kind, headingLevel, text, null, currentUnit));
+            }
+        }
     }
 
     static String normalize(String s) {

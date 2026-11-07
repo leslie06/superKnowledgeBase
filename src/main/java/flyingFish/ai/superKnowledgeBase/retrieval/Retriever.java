@@ -1,6 +1,7 @@
 package flyingFish.ai.superKnowledgeBase.retrieval;
 
 import flyingFish.ai.superKnowledgeBase.common.PgVectors;
+import flyingFish.ai.superKnowledgeBase.ingestion.ChunkRepository;
 import flyingFish.ai.superKnowledgeBase.common.SkbProperties;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -220,7 +221,10 @@ public class Retriever {
      * @param query 按这个问题挑选（有本意时用本意）
      */
     public List<RetrievedChunk> surrounding(RetrievedChunk anchor, boolean before, String query, int fallbackChars) {
-        List<OrderedRow> rows = jdbc.sql("""
+        if (RetrievedChunk.SUMMARY.equals(anchor.kind())) {
+            return List.of();
+        }
+        List<OrderedRow> rows = RetrievedChunk.CHAPTER.equals(anchor.kind()) ? chapterRows(anchor) : jdbc.sql("""
                         SELECT c.id AS chunk_id, c.chunk_index, c.heading_path, c.location, c.content
                         FROM chunk c JOIN chunk a ON a.id = :anchor AND c.document_id = a.document_id
                         WHERE c.kind = 'TEXT' AND %s
@@ -274,6 +278,25 @@ public class Retriever {
             Collections.reverse(result);
         }
         return result;
+    }
+
+    /** 章节摘要的"前后文"就是这一章的正文：从摘要下钻到原文，挑出与问题最相关的几段 */
+    private List<OrderedRow> chapterRows(RetrievedChunk summary) {
+        String heading = summary.headingPath();
+        String chapter = heading.endsWith(ChunkRepository.CHAPTER_SUMMARY_SUFFIX)
+                ? heading.substring(0, heading.length() - ChunkRepository.CHAPTER_SUMMARY_SUFFIX.length()) : heading;
+        return jdbc.sql("""
+                        SELECT c.id AS chunk_id, c.chunk_index, c.heading_path, c.location, c.content
+                        FROM chunk c JOIN chunk a ON a.id = :anchor AND c.document_id = a.document_id
+                        WHERE c.kind = 'TEXT' AND (c.heading_path = :chapter OR starts_with(c.heading_path, :prefix))
+                        ORDER BY c.chunk_index
+                        LIMIT :limit
+                        """)
+                .param("anchor", summary.chunkId())
+                .param("chapter", chapter)
+                .param("prefix", chapter + " > ")
+                .param("limit", SURROUNDING_MAX_CHUNKS)
+                .query(OrderedRow.class).list();
     }
 
     private static RetrievedChunk surroundingChunk(RetrievedChunk anchor, OrderedRow row, Double rerankScore) {
@@ -560,7 +583,7 @@ public class Retriever {
     }
 
     /** "第3页" + "第4-5页" → "第3-5页"；不是页码时用第一段的位置 */
-    static String mergeLocations(String first, String last) {
+    public static String mergeLocations(String first, String last) {
         if (first == null || last == null || first.equals(last)) {
             return first != null ? first : last;
         }
@@ -581,7 +604,7 @@ public class Retriever {
      */
     static List<RetrievedChunk> rerankPool(List<RetrievedChunk> fused, int size, int keywordTop) {
         List<RetrievedChunk> pool = new ArrayList<>(fused.stream()
-                .filter(c -> c.keywordRank() != null && !RetrievedChunk.SUMMARY.equals(c.kind()))
+                .filter(c -> c.keywordRank() != null && !c.isSummary())
                 .sorted(Comparator.comparingInt(RetrievedChunk::keywordRank))
                 .limit(keywordTop)
                 .toList());
