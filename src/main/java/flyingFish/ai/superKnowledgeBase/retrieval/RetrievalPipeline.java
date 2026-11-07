@@ -42,7 +42,7 @@ public class RetrievalPipeline {
     public record FollowUp(int round, String missing, List<String> queries, List<String> context, int added) {
     }
 
-    /** 补看前后文时，每处最多补进这么多字（约七八个片段）；一万字时一题要读 6 万字资料、30 秒 */
+    /** 精排不可用、补看前后文按距离取时，每处最多补进这么多字；也是问答为每处前后文预留的参考资料预算 */
     public static final int SURROUNDING_CHARS = 5_000;
 
     /**
@@ -105,6 +105,8 @@ public class RetrievalPipeline {
             // 有本意时按本意判断；多轮对话时原问题可能是"那字典呢"，判断用补全后的检索文本
             String checkQuestion = plan.intent() != null ? question + "（意思是：" + plan.intent() + "）"
                     : history.isEmpty() ? question : searchQuery;
+            // 挑前后文用的问题：有本意时用本意，"西门庆因哪个女人而死"比"死在谁的床上"更能挑出死因那几段
+            String surroundingQuery = plan.intent() != null ? plan.intent() : history.isEmpty() ? question : searchQuery;
             for (int round = 1; round <= maxFollowUps; round++) {
                 EvidenceChecker.Verdict verdict = evidenceChecker.check(checkQuestion, tried, hits);
                 if (verdict.sufficient()) {
@@ -118,7 +120,7 @@ public class RetrievalPipeline {
                 for (EvidenceChecker.ContextRequest request : verdict.context()) {
                     RetrievedChunk anchor = hits.get(request.index() - 1);
                     Set<Long> known = merged.stream().map(RetrievedChunk::chunkId).collect(Collectors.toSet());
-                    List<RetrievedChunk> around = retriever.surrounding(anchor, request.before(), SURROUNDING_CHARS).stream()
+                    List<RetrievedChunk> around = retriever.surrounding(anchor, request.before(), surroundingQuery, SURROUNDING_CHARS).stream()
                             .filter(c -> !known.contains(c.chunkId())).toList();
                     int position = merged.indexOf(anchor);
                     merged.addAll(request.before() ? position : position + 1, around);

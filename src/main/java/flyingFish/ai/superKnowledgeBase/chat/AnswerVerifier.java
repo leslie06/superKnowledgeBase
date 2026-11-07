@@ -8,9 +8,11 @@ import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 import tools.jackson.databind.json.JsonMapper;
 
+import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
@@ -24,6 +26,8 @@ import java.util.stream.Collectors;
 public class AnswerVerifier {
 
     private static final Logger log = LoggerFactory.getLogger(AnswerVerifier.class);
+    /** [3]、[1,2]、[1、2] 这类引用标记 */
+    private static final Pattern CITATION = Pattern.compile("\\[(\\d+(?:\\s*[,，、]\\s*\\d+)*)]");
 
     private static final String SYSTEM_PROMPT = """
             你是知识库问答的核对员。给定【参考资料】和系统根据资料生成的【回答】，检查回答是否有依据，只输出 JSON。
@@ -49,7 +53,7 @@ public class AnswerVerifier {
             return Optional.empty();
         }
         StringBuilder sb = new StringBuilder("【参考资料】\n");
-        for (Citation c : citations) {
+        for (Citation c : cited(citations, answer)) {
             sb.append('[').append(c.index()).append("] ").append(c.content()).append("\n\n");
         }
         sb.append("【回答】\n").append(answer);
@@ -65,6 +69,20 @@ public class AnswerVerifier {
             log.warn("回答核对失败：{}", e.getMessage());
             return Optional.empty();
         }
+    }
+
+    /**
+     * 只核对回答引用到的资料：回答通常只引用十来条里的三五条，没引用的资料不会成为任何一句话的依据，全部发过去等于参考资料发两遍。
+     * 引用了不存在的编号时，核对时找不到这条资料，照样会被判为引用错误；回答没有任何 [n] 时仍发全部资料，用来判断有没有无依据内容。
+     */
+    static List<Citation> cited(List<Citation> citations, String answer) {
+        Set<Integer> indexes = CITATION.matcher(answer).results()
+                .flatMap(m -> Arrays.stream(m.group(1).split("[,，、\\s]+")))
+                .filter(StringUtils::hasText)
+                .map(Integer::valueOf)
+                .collect(Collectors.toSet());
+        List<Citation> used = citations.stream().filter(c -> indexes.contains(c.index())).toList();
+        return used.isEmpty() ? citations : used;
     }
 
     /**

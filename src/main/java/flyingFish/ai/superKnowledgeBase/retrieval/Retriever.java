@@ -29,6 +29,7 @@ import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
 /**
  * 混合检索：向量召回（语义相近）和关键词召回（BM25，擅长编号、型号、专有名词）各取若干候选，
@@ -92,8 +93,17 @@ public class Retriever {
     private static final int MAX_EXACT_CANDIDATES = 10;
     /** 每轮补充检索最多补进这么多个新片段 */
     private static final int FOLLOW_UP_MAX_NEW = 8;
-    /** 补看前后文时最多取这么多个片段，再按字数截断 */
-    private static final int SURROUNDING_MAX_CHUNKS = 30;
+    /** 补看前后文时取紧挨着的这么多个片段（约两三万字，三丸药那段在断气那段之前七八页） */
+    private static final int SURROUNDING_MAX_CHUNKS = 40;
+    /** 按向量相似度粗筛后交给精排的片段数 */
+    private static final int SURROUNDING_RERANK = 12;
+    /** 精排后留下的片段数 */
+    private static final int SURROUNDING_KEEP = 3;
+    /**
+     * 前后文片段的精排分数下限。比 rerank.min-score（0.05）严：检索结果是按相关性召回的，前后文只是按位置取来的，
+     * 大多与问题无关；实测因果链上的几段在 0.85 以上，无关段落多在 0.2 以下
+     */
+    private static final double SURROUNDING_MIN_SCORE = 0.3;
     /**
      * 与排名更靠前的结果相似度达到这个值的片段视为重复，不再返回。同一本书的多个副本、同一译本的不同扫描版
      * 会让同一段话占掉好几个参考资料名额（"林黛玉进贾府"的前 6 个结果里有 3 对完全相同）；
@@ -199,10 +209,17 @@ public class Retriever {
     }
 
     /**
-     * 原文中紧挨着 anchor 的前文或后文，按原文顺序，累计最多 maxChars 字。叙事类文本里原因写在事件之前、结果写在之后：
-     * 找到"西门庆断气身亡"这段后，死因（潘金莲灌下三丸药、吴神仙诊为"酒色过度"）在之前十来段里。分数沿用 anchor。
+     * anchor 前文或后文中与问题最相关的几段，按原文顺序。叙事类文本里原因写在事件之前、结果写在之后：
+     * 找到"西门庆断气身亡"这段后，死因（潘金莲灌下三丸药、吴神仙诊为"酒色过度"）在之前几十段里。
+     * 取紧挨着的 SURROUNDING_MAX_CHUNKS 段，先按向量相似度粗筛出 SURROUNDING_RERANK 段，再交给精排，
+     * 只留分数达到 SURROUNDING_MIN_SCORE 的前 SURROUNDING_KEEP 段：直接按距离取五千字时，大部分是无关的对话和别的情节，
+     * 离得远一点的原因又够不着。精排 40 段要 6 秒，粗筛后 12 段约 2 秒；只用向量挑选区分度太差（前几名都在 0.52～0.56），
+     * 会漏掉三丸药那段（向量排第 9）。
+     * 实测前文 40 段中挑出的 3 段正是第七十九回开头、潘金莲灌下三丸药、次日昏晕栽倒，约 2400 字。精排不可用时退回按距离取，累计最多 fallbackChars 字。
+     *
+     * @param query 按这个问题挑选（有本意时用本意）
      */
-    public List<RetrievedChunk> surrounding(RetrievedChunk anchor, boolean before, int maxChars) {
+    public List<RetrievedChunk> surrounding(RetrievedChunk anchor, boolean before, String query, int fallbackChars) {
         List<OrderedRow> rows = jdbc.sql("""
                         SELECT c.id AS chunk_id, c.chunk_index, c.heading_path, c.location, c.content
                         FROM chunk c JOIN chunk a ON a.id = :anchor AND c.document_id = a.document_id
@@ -215,20 +232,53 @@ public class Retriever {
                 .param("limit", SURROUNDING_MAX_CHUNKS)
                 .query(OrderedRow.class).list();
         List<RetrievedChunk> result = new ArrayList<>();
+        if (rerankEnabled && !rows.isEmpty()) {
+            List<OrderedRow> pool = rows;
+            if (rows.size() > SURROUNDING_RERANK) {
+                List<Long> closest = jdbc.sql("""
+                                SELECT id FROM chunk WHERE id IN (:ids)
+                                ORDER BY embedding <=> CAST(:vector AS vector) LIMIT :limit
+                                """)
+                        .param("ids", rows.stream().map(OrderedRow::chunkId).toList())
+                        .param("vector", PgVectors.toLiteral(embeddingModel.embed(query)))
+                        .param("limit", SURROUNDING_RERANK)
+                        .query(Long.class).list();
+                // 保持离 anchor 由近到远的顺序，挑完后按位置还原成原文顺序
+                pool = rows.stream().filter(r -> closest.contains(r.chunkId())).toList();
+            }
+            List<OrderedRow> candidates = pool;
+            try {
+                double[] scores = rerankClient.score(query, candidates.stream()
+                        .map(r -> r.headingPath() == null ? r.content() : r.headingPath() + "\n" + r.content()).toList());
+                List<Integer> picked = IntStream.range(0, candidates.size()).boxed()
+                        .filter(i -> scores[i] >= SURROUNDING_MIN_SCORE)
+                        .sorted(Comparator.comparingDouble((Integer i) -> scores[i]).reversed())
+                        .limit(SURROUNDING_KEEP)
+                        .sorted(before ? Comparator.reverseOrder() : Comparator.naturalOrder())
+                        .toList();
+                picked.forEach(i -> result.add(surroundingChunk(anchor, candidates.get(i), scores[i])));
+                return result;
+            } catch (RuntimeException e) {
+                log.warn("精排服务不可用，补看前后文按距离取：{}", e.getMessage());
+            }
+        }
         int used = 0;
         for (OrderedRow row : rows) {
-            if (!result.isEmpty() && used + row.content().length() > maxChars) {
+            if (!result.isEmpty() && used + row.content().length() > fallbackChars) {
                 break;
             }
             used += row.content().length();
-            result.add(new RetrievedChunk(row.chunkId(), anchor.documentId(), anchor.filename(), row.headingPath(),
-                    row.location(), row.content(), anchor.score(), null, null, null, anchor.rerankScore(), false, true,
-                    "TEXT"));
+            result.add(surroundingChunk(anchor, row, anchor.rerankScore()));
         }
         if (before) {
             Collections.reverse(result);
         }
         return result;
+    }
+
+    private static RetrievedChunk surroundingChunk(RetrievedChunk anchor, OrderedRow row, Double rerankScore) {
+        return new RetrievedChunk(row.chunkId(), anchor.documentId(), anchor.filename(), row.headingPath(),
+                row.location(), row.content(), anchor.score(), null, null, null, rerankScore, false, true, "TEXT");
     }
 
     /** 依次取每一路的第 1 个、再依次取第 2 个……，同一片段只保留第一次出现 */

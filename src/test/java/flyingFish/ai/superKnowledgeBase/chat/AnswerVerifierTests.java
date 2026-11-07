@@ -3,6 +3,9 @@ package flyingFish.ai.superKnowledgeBase.chat;
 import org.junit.jupiter.api.Test;
 import tools.jackson.databind.json.JsonMapper;
 
+import java.util.List;
+import java.util.stream.IntStream;
+
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -23,6 +26,17 @@ class AnswerVerifierTests {
         assertThat(v.unsupported()).extracting(Verification.Issue::text).containsExactly("赔偿金为经济补偿的二倍");
         assertThat(v.citationErrors()).isEmpty();
         assertThat(v.passed()).isFalse();
+    }
+
+    @Test
+    void sendsOnlyCitedReferences() {
+        List<Citation> citations = IntStream.rangeClosed(1, 5)
+                .mapToObj(i -> new Citation(i, (long) i, 1L, "员工手册.docx", null, null, "资料" + i, 0.8)).toList();
+
+        assertThat(AnswerVerifier.cited(citations, "婚假 3 天 [2]，丧假见 [4、5]，另见[1,2]。"))
+                .extracting(Citation::index).containsExactly(1, 2, 4, 5);
+        // 没有任何引用时仍发全部资料，用来判断有没有无依据内容
+        assertThat(AnswerVerifier.cited(citations, "知识库中没有找到相关内容。")).hasSize(5);
     }
 
     @Test
