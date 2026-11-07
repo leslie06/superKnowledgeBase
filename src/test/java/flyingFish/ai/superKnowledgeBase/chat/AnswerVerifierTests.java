@@ -30,13 +30,16 @@ class AnswerVerifierTests {
 
     @Test
     void sendsOnlyCitedReferences() {
-        List<Citation> citations = IntStream.rangeClosed(1, 5)
-                .mapToObj(i -> new Citation(i, (long) i, 1L, "员工手册.docx", null, null, "资料" + i, 0.8)).toList();
+        // 1~5 各属一个文档，6、7 与 2 同属文档 2（整章读入时同一章分成多条）
+        List<Citation> citations = new java.util.ArrayList<>(IntStream.rangeClosed(1, 5)
+                .mapToObj(i -> new Citation(i, (long) i, (long) i, "员工手册.docx", null, null, "资料" + i, 0.8)).toList());
+        citations.add(new Citation(6, 6L, 2L, "员工手册.docx", null, null, "资料6", 0.8));
+        citations.add(new Citation(7, 7L, 2L, "员工手册.docx", null, null, "资料7", 0.8));
 
         assertThat(AnswerVerifier.cited(citations, "婚假 3 天 [2]，丧假见 [4、5]，另见[1,2]。"))
-                .extracting(Citation::index).containsExactly(1, 2, 4, 5);
+                .extracting(Citation::index).containsExactly(1, 2, 4, 5, 6, 7);
         // 没有任何引用时仍发全部资料，用来判断有没有无依据内容
-        assertThat(AnswerVerifier.cited(citations, "知识库中没有找到相关内容。")).hasSize(5);
+        assertThat(AnswerVerifier.cited(citations, "知识库中没有找到相关内容。")).hasSize(7);
     }
 
     @Test

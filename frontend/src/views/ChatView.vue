@@ -278,6 +278,26 @@ function issueCount(v: AnswerVerification) {
   return v.unsupported.length + v.citationErrors.length
 }
 
+/** 核对问题多时只显示前几条，其余点"展开"再看 */
+const ISSUES_SHOWN = 3
+const expandedIssues = ref(new Set<number>())
+
+function verificationIssues(m: ChatMessage) {
+  const v = m.verification!
+  const all = [
+    ...v.unsupported.map((i) => ({ ...i, kind: '资料中找不到依据' })),
+    ...v.citationErrors.map((i) => ({ ...i, kind: '引用与内容不符' })),
+  ]
+  return m.id != null && expandedIssues.value.has(m.id) ? all : all.slice(0, ISSUES_SHOWN)
+}
+
+function toggleIssues(m: ChatMessage) {
+  if (m.id == null) return
+  const next = new Set(expandedIssues.value)
+  if (!next.delete(m.id)) next.add(m.id)
+  expandedIssues.value = next
+}
+
 /** 回答中实际引用到的来源；模型没标注编号时展示全部检索结果 */
 function referencedCitations(msg: ChatMessage) {
   const used = new Set(Array.from(msg.content.matchAll(/\[(\d{1,2})\]/g), (m) => Number(m[1])))
@@ -375,13 +395,13 @@ async function onConversationCommand(command: string, conv: Conversation) {
             <div v-else-if="m.verification" class="verify verify-warn">
               <div class="verify-title">⚠ 核对发现 {{ issueCount(m.verification) }} 处需要确认</div>
               <ul>
-                <li v-for="(i, k) in m.verification.unsupported" :key="'u' + k">
-                  「{{ i.text }}」<span class="muted">资料中找不到依据：{{ i.reason }}</span>
-                </li>
-                <li v-for="(i, k) in m.verification.citationErrors" :key="'c' + k">
-                  「{{ i.text }}」<span class="muted">引用与内容不符：{{ i.reason }}</span>
+                <li v-for="(i, k) in verificationIssues(m)" :key="k">
+                  「{{ i.text }}」<span class="muted">{{ i.kind }}：{{ i.reason }}</span>
                 </li>
               </ul>
+              <button v-if="issueCount(m.verification) > ISSUES_SHOWN" class="verify-more" @click="toggleIssues(m)">
+                {{ m.id != null && expandedIssues.has(m.id) ? '收起' : `展开其余 ${issueCount(m.verification) - ISSUES_SHOWN} 处` }}
+              </button>
             </div>
             <div v-if="m.id != null && !m.streaming" class="answer-actions">
               <button :class="{ active: m.feedback?.rating === 'UP' }" @click="rate(m, 'UP')">👍 有用</button>

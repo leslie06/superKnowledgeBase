@@ -54,7 +54,15 @@ public class AnswerVerifier {
         }
         StringBuilder sb = new StringBuilder("【参考资料】\n");
         for (Citation c : cited(citations, answer)) {
-            sb.append('[').append(c.index()).append("] ").append(c.content()).append("\n\n");
+            // 出处和回答时看到的一样：回目在章节路径里、版本看文件名，只给正文时会把"崇祯本回目……"判为无依据
+            sb.append('[').append(c.index()).append("] ").append(c.filename());
+            if (c.headingPath() != null) {
+                sb.append(" ｜ ").append(c.headingPath());
+            }
+            if (c.location() != null) {
+                sb.append(" ｜ ").append(c.location());
+            }
+            sb.append('\n').append(c.content()).append("\n\n");
         }
         sb.append("【回答】\n").append(answer);
         try {
@@ -72,7 +80,8 @@ public class AnswerVerifier {
     }
 
     /**
-     * 只核对回答引用到的资料：回答通常只引用十来条里的三五条，没引用的资料不会成为任何一句话的依据，全部发过去等于参考资料发两遍。
+     * 只核对回答引用到的文档的资料：回答通常只引用十来条里的三五条，全部发过去等于参考资料发两遍。
+     * 按文档而不是按编号：整章读入时同一章分成好几条，回答常把某句标成 [8]、原文其实在 [9]，只发 [8] 时这句会被误判为无依据。
      * 引用了不存在的编号时，核对时找不到这条资料，照样会被判为引用错误；回答没有任何 [n] 时仍发全部资料，用来判断有没有无依据内容。
      */
     static List<Citation> cited(List<Citation> citations, String answer) {
@@ -81,7 +90,9 @@ public class AnswerVerifier {
                 .filter(StringUtils::hasText)
                 .map(Integer::valueOf)
                 .collect(Collectors.toSet());
-        List<Citation> used = citations.stream().filter(c -> indexes.contains(c.index())).toList();
+        Set<Long> documents = citations.stream().filter(c -> indexes.contains(c.index()))
+                .map(Citation::documentId).collect(Collectors.toSet());
+        List<Citation> used = citations.stream().filter(c -> documents.contains(c.documentId())).toList();
         return used.isEmpty() ? citations : used;
     }
 
