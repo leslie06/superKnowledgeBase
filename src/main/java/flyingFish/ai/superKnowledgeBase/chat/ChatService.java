@@ -96,7 +96,7 @@ public class ChatService {
     private record PreparedChat(Conversation conversation, List<ChatMessage> history, String question,
                                 String searchQuery, QueryPlanner.Plan plan,
                                 List<RetrievalPipeline.FollowUp> followUps, List<String> fullTextDocuments,
-                                List<Citation> citations,
+                                List<String> chapterVersions, List<Citation> citations,
                                 List<Map<String, Object>> hits, Map<String, Long> timings) {
     }
 
@@ -293,7 +293,8 @@ public class ChatService {
         String question = started.question();
         List<RetrievedChunk> chunks = result.hits();
         // 小文档读全文，其余扩展相邻片段（相邻的命中片段会并成一条）；trace 仍按原始命中记录
-        Retriever.Context context = retriever.context(chunks, expandChars, fullTextChars, result.searchQuery());
+        Retriever.Context context = retriever.context(chunks, expandChars, fullTextChars, result.searchQuery(),
+                conversation.kbId(), conversation.scope());
         Map<String, Long> timings = result.timings();
         log.info("问答准备完成：查询改写 {} ms，检索 {} ms{}{}{}", timings.get("rewriteMs"), timings.get("retrieveMs"),
                 result.plan().aggregate() ? "（汇总类问题，" + result.plan().subQueries().size() + " 个子问题）" : "",
@@ -305,8 +306,8 @@ public class ChatService {
                 + fullTextChars + RetrievalPipeline.SURROUNDING_CHARS * (int) result.followUps().stream()
                 .mapToLong(f -> f.context().size()).sum();
         return new PreparedChat(conversation, history, question, result.searchQuery(), result.plan(),
-                result.followUps(), context.fullTextDocuments(), toCitations(context.chunks(), budget), trace(chunks),
-                timings);
+                result.followUps(), context.fullTextDocuments(), context.chapterVersions(),
+                toCitations(context.chunks(), budget), trace(chunks), timings);
     }
 
     /**
@@ -477,6 +478,10 @@ public class ChatService {
         if (!chat.fullTextDocuments().isEmpty()) {
             sb.append("【说明】以上参考资料包含").append(chat.fullTextDocuments().stream().map(n -> "《" + n + "》")
                     .collect(Collectors.joining())).append("的全文（按原文顺序分段），可以通读后综合判断；其余是检索到的片段。\n\n");
+        }
+        if (!chat.chapterVersions().isEmpty()) {
+            sb.append("【说明】").append(chat.chapterVersions().stream().map(n -> "《" + n + "》").collect(Collectors.joining("、")))
+                    .append("是同一章在不同版本中的全文。请分别说明各版本的内容，再比较版本之间的差异（回目、情节、人物、文字、删改）。\n\n");
         }
         if (chat.plan().aggregate()) {
             sb.append(AGGREGATE_HINT);

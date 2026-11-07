@@ -53,7 +53,14 @@ public class Retriever {
      * @param chunks            按顺序排好的参考资料：先是读全文的小文档（按原文顺序分段），再是其他文档的命中片段（已扩展）
      * @param fullTextDocuments 读了全文的文档的文件名
      */
-    public record Context(List<RetrievedChunk> chunks, List<String> fullTextDocuments) {
+    /**
+     * @param chapterVersions 同一章读入了不同版本时（金瓶梅的万历词话本和崇祯本），各版本的名称；只有一个版本时为空
+     */
+    public record Context(List<RetrievedChunk> chunks, List<String> fullTextDocuments, List<String> chapterVersions) {
+
+        public Context(List<RetrievedChunk> chunks, List<String> fullTextDocuments) {
+            this(chunks, fullTextDocuments, List.of());
+        }
     }
 
     private record DocumentSize(Long documentId, long chars) {
@@ -98,6 +105,10 @@ public class Retriever {
     private static final Pattern CHAPTER_REFERENCE = Pattern.compile("第([一二三四五六七八九十百零〇\\d]+)[回囘囬章篇]");
     private static final String CHINESE_DIGITS = "零一二三四五六七八九";
     private static final int MAX_CHAPTER_REFERENCES = 2;
+    /** 文件名开头相同的字数，判断是不是同一本书的不同版本 */
+    private static final int VERSION_PREFIX_CHARS = 2;
+    /** 同一章内容的字符三元组相似度达到这个值算同一版本（崇祯本两个文件 0.97，词话本与崇祯本 0.15） */
+    private static final double SAME_VERSION_SIMILARITY = 0.6;
     /** 补看前后文时取紧挨着的这么多个片段（约两三万字，三丸药那段在断气那段之前七八页） */
     private static final int SURROUNDING_MAX_CHUNKS = 40;
     /** 按向量相似度粗筛后交给精排的片段数 */
@@ -510,28 +521,42 @@ public class Retriever {
      * 问题点名了章节（"第七十九回讲了什么""红楼梦第5章"）时，先在命中片段所属的文档中按排名找有这一章的，
      * 把这一章整章按原文顺序读入（与读全文共用 fullTextChars）：几十万字的书读不了全文，一回一万来字可以。
      *
+     * 同一本书有不同版本时（文件名前缀相同、这一章内容明显不同），每个版本的这一章都读入，见 {@link #otherVersions}。
+     *
      * @param question 用来找点名的章节，多轮对话时用补全后的检索文本
+     * @param scope    检索范围，其他版本也要在范围内
      */
-    public Context context(List<RetrievedChunk> hits, int expandChars, int fullTextChars, String question) {
+    public Context context(List<RetrievedChunk> hits, int expandChars, int fullTextChars, String question,
+                           long kbId, SearchScope scope) {
         if (hits.isEmpty() || fullTextChars <= 0) {
             return new Context(expand(hits, expandChars), List.of());
         }
         List<RetrievedChunk> chunks = new ArrayList<>();
         List<String> names = new ArrayList<>();
+        List<String> versions = new ArrayList<>();
         Set<Long> chapterChunkIds = new HashSet<>();
         int budget = fullTextChars;
         for (int number : chapterNumbers(question)) {
             ChapterText chapter = chapterText(hits, number, budget);
-            if (chapter != null) {
-                chunks.addAll(toSections(chapter.best(), chapter.rows()));
-                names.add(chapter.best().filename() + " " + chapter.title());
-                budget -= chapter.rows().stream().mapToInt(r -> r.content().length()).sum();
-                chapter.rows().forEach(r -> chapterChunkIds.add(r.chunkId()));
+            if (chapter == null) {
+                continue;
+            }
+            List<ChapterText> all = new ArrayList<>(List.of(chapter));
+            all.addAll(otherVersions(chapter, number, kbId, scope,
+                    budget - chapter.rows().stream().mapToInt(r -> r.content().length()).sum()));
+            for (ChapterText text : all) {
+                chunks.addAll(toSections(text.best(), text.rows()));
+                names.add(text.best().filename() + " " + text.title());
+                budget -= text.rows().stream().mapToInt(r -> r.content().length()).sum();
+                text.rows().forEach(r -> chapterChunkIds.add(r.chunkId()));
+            }
+            if (all.size() > 1) {
+                all.forEach(text -> versions.add(text.best().filename() + " " + text.title()));
             }
         }
         hits = hits.stream().filter(h -> !chapterChunkIds.contains(h.chunkId())).toList();
         if (hits.isEmpty()) {
-            return new Context(chunks, names);
+            return new Context(chunks, names, versions);
         }
         fullTextChars = budget;
         List<Long> documentIds = hits.stream().map(RetrievedChunk::documentId).distinct().toList();
@@ -557,7 +582,7 @@ public class Retriever {
             names.add(best.filename());
         }
         chunks.addAll(expand(hits.stream().filter(h -> !fullText.contains(h.documentId())).toList(), expandChars));
-        return new Context(chunks, names);
+        return new Context(chunks, names, versions);
     }
 
     /** 文档全文按原文顺序分段：章节变化或超过 FULL_TEXT_SECTION_CHARS 时另起一段；分数沿用该文档排名最前的命中片段 */
@@ -599,6 +624,67 @@ public class Retriever {
             return new ChapterText(best, title.find() ? title.group().strip() : "第" + number + "章", rows);
         }
         return null;
+    }
+
+    private record DocumentName(Long id, String filename) {
+    }
+
+    /**
+     * 同一本书其他版本的这一章：文件名开头至少 VERSION_PREFIX_CHARS 个字相同（"金瓶梅（崇祯本）""金瓶梅詞話"），
+     * 也有这一章，且与已选版本的内容不重复。同一版本的不同文件（崇祯本单册版和完整版，第二十一回字符三元组相似度 0.97）
+     * 只取一个；万历词话本与崇祯本只有 0.15，是不同版本。整章超过剩余预算的不读。
+     */
+    private List<ChapterText> otherVersions(ChapterText primary, int number, long kbId, SearchScope scope, int budget) {
+        String prefix = primary.best().filename().codePoints().limit(VERSION_PREFIX_CHARS)
+                .collect(StringBuilder::new, StringBuilder::appendCodePoint, StringBuilder::append).toString();
+        if (prefix.codePoints().count() < VERSION_PREFIX_CHARS || !prefix.codePoints().allMatch(Character::isIdeographic)) {
+            return List.of();
+        }
+        List<Long> inScope = scope.isAll() ? null : scopeDocuments(kbId, scope);
+        List<DocumentName> candidates = jdbc.sql("""
+                        SELECT id, filename FROM document
+                        WHERE kb_id = :kb AND status = 'READY' AND id <> :primary AND starts_with(filename, :prefix)
+                        ORDER BY id
+                        """)
+                .param("kb", kbId)
+                .param("primary", primary.best().documentId())
+                .param("prefix", prefix)
+                .query(DocumentName.class).list().stream()
+                .filter(d -> inScope == null || inScope.contains(d.id()))
+                .toList();
+        String chapter = "第(?:" + chineseNumber(number) + "|" + number + ")[回囘囬章篇]";
+        List<Set<String>> chosen = new ArrayList<>(List.of(trigrams(joined(primary.rows()))));
+        List<ChapterText> versions = new ArrayList<>();
+        for (DocumentName doc : candidates) {
+            List<TextRow> rows = jdbc.sql("""
+                            SELECT id AS chunk_id, heading_path, location, content FROM chunk
+                            WHERE document_id = :id AND kind = 'TEXT' AND heading_path ~ :pattern ORDER BY chunk_index
+                            """)
+                    .param("id", doc.id())
+                    .param("pattern", "(^| > )" + chapter + "( |$)")
+                    .query(TextRow.class).list();
+            int chars = rows.stream().mapToInt(r -> r.content().length()).sum();
+            if (rows.isEmpty() || chars > budget) {
+                continue;
+            }
+            Set<String> grams = trigrams(joined(rows));
+            if (chosen.stream().anyMatch(g -> similarity(g, grams) >= SAME_VERSION_SIMILARITY)) {
+                continue;
+            }
+            chosen.add(grams);
+            budget -= chars;
+            RetrievedChunk p = primary.best();
+            TextRow first = rows.getFirst();
+            RetrievedChunk best = new RetrievedChunk(first.chunkId(), doc.id(), doc.filename(), first.headingPath(),
+                    first.location(), first.content(), p.score(), null, null, null, p.rerankScore(), false, true, "TEXT");
+            Matcher title = Pattern.compile(chapter + "[^>]*").matcher(first.headingPath());
+            versions.add(new ChapterText(best, title.find() ? title.group().strip() : "第" + number + "章", rows));
+        }
+        return versions;
+    }
+
+    private static String joined(List<TextRow> rows) {
+        return rows.stream().map(TextRow::content).collect(Collectors.joining());
     }
 
     private List<RetrievedChunk> toSections(RetrievedChunk best, List<TextRow> rows) {
