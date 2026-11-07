@@ -30,6 +30,8 @@ import torch
 from sentence_transformers import CrossEncoder
 
 log = logging.getLogger("rerank")
+# 序列长度补齐到它的倍数，见 Reranker.rerank
+LENGTH_BUCKET = 128
 
 
 def pick_device() -> str:
@@ -45,6 +47,7 @@ class Reranker:
         self.device = pick_device()
         self.model_name = model_name
         self.batch_size = batch_size
+        self.max_length = max_length
         # GPU / MPS 上用 fp16，速度快约 15%，分数与 fp32 相差不到 0.01
         dtype = torch.float32 if self.device == "cpu" else torch.float16
         self.model = CrossEncoder(model_name, max_length=max_length, device=self.device,
@@ -64,11 +67,24 @@ class Reranker:
             torch.cuda.empty_cache()
 
     def rerank(self, query: str, texts: list[str]) -> list[dict]:
+        """
+        MPS 为每一种输入形状（批大小 × 序列长度）编译一张计算图并一直缓存，每批片段长度都不一样时几乎每次都是新形状：
+        实测每次请求涨约 60MB，连续运行一天涨到 17GB。所以序列长度补齐到 LENGTH_BUCKET 的倍数、批大小补齐到 2 的幂，
+        形状最多 8 × 5 种，缓存满了就不再增长。补齐的部分有 attention mask，不影响分数。
+        """
         if not texts:
             return []
+        scores = []
         with self.lock:
-            scores = self.model.predict([(query, t) for t in texts], batch_size=self.batch_size,
-                                        activation_fn=torch.nn.Sigmoid(), show_progress_bar=False)
+            for start in range(0, len(texts), self.batch_size):
+                batch = texts[start:start + self.batch_size]
+                size = min(self.batch_size, 1 << (len(batch) - 1).bit_length())
+                pairs = [(query, t) for t in batch] + [(query, "")] * (size - len(batch))
+                features = self.model.tokenizer(pairs, padding=True, truncation=True, max_length=self.max_length,
+                                                pad_to_multiple_of=LENGTH_BUCKET, return_tensors="pt").to(self.device)
+                with torch.inference_mode():
+                    logits = self.model.model(**features).logits.view(-1).float()
+                scores.extend(torch.sigmoid(logits)[:len(batch)].cpu().tolist())
             self.release_cache()
         ranked = sorted(range(len(texts)), key=lambda i: scores[i], reverse=True)
         return [{"index": i, "score": float(scores[i])} for i in ranked]

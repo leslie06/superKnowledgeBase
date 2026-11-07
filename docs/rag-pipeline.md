@@ -676,7 +676,7 @@ def rerank(self, query: str, texts: list[str]) -> list[dict]:
     return [{"index": i, "score": float(scores[i])} for i in ranked]
 ```
 
-`score` 经过 sigmoid，范围 0～1。服务按 HTTP/1.1 保持连接，推理串行执行（GPU 上并发没有收益）。它不在 docker compose 里，因为 Mac 上的 Docker 用不了 MPS；安装、启动、检查和停止的方法见 README 的「Rerank 服务（Python）」一节。
+`score` 经过 sigmoid，范围 0～1。服务按 HTTP/1.1 保持连接，推理串行执行（GPU 上并发没有收益）。输入的序列长度补齐到 128 的倍数、批大小补齐到 2 的幂：MPS 为每种输入形状缓存一张计算图，形状不固定时内存每次请求涨约 60MB，一天涨到 17GB。它不在 docker compose 里，因为 Mac 上的 Docker 用不了 MPS；安装、启动、检查和停止的方法见 README 的「Rerank 服务（Python）」一节。
 
 **后端调用**（`RerankClient`、`Retriever.rerank`）：
 

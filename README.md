@@ -104,7 +104,7 @@ pkill -f rerank_server.py           # 停止
 
 - 启动用的 `python3` 必须是装了 sentence-transformers 的那个环境。先运行 `which python3` 和 `python3 -c "import sentence_transformers"` 确认；如果用 conda / venv，先激活对应环境。
 - 设备自动选择：Apple 芯片用 MPS（fp16），有 NVIDIA 显卡用 CUDA，否则用 CPU。日志里的 `device` 显示实际使用的设备，CPU 推理会慢很多。
-- **内存紧张时精排会变得很慢**：正常精排 20 个片段约 2 秒。交换区接近用满时模型会被换出到磁盘，每次精排都要先读回来，一次 15 秒以上，超过 `skb.rerank.timeout`（15 秒）后退回不精排的排序，整次问答可能拖到 30～40 秒。用 `sysctl vm.swapusage` 查看交换区，关掉暂时不用的程序和 docker 容器；Docker Desktop 停掉容器后不会把内存还给系统，要在 Settings → Resources 调小 Memory（只跑本项目的 PostgreSQL 时 3GB 足够）并重启 Docker，然后重启 Rerank 服务，让模型重新完整加载到内存。服务每次精排后会释放 PyTorch 缓存的显存（`torch.mps.empty_cache()`）：早期版本不释放，每批片段长度不同，缓存越积越大，连续运行一天后进程占到 22GB（其中 MPS 显存缓存 14GB），闲置一会儿后第一次精排要 10～25 秒。用 `footprint -p $(pgrep -f rerank_server.py) | grep phys_footprint` 可以查看它的实际占用，正常在 2～4GB。
+- **内存紧张时精排会变得很慢**：正常精排 20 个片段约 2 秒。交换区接近用满时模型会被换出到磁盘，每次精排都要先读回来，一次 15 秒以上，超过 `skb.rerank.timeout`（15 秒）后退回不精排的排序，整次问答可能拖到 30～40 秒。用 `sysctl vm.swapusage` 查看交换区，关掉暂时不用的程序和 docker 容器；Docker Desktop 停掉容器后不会把内存还给系统，要在 Settings → Resources 调小 Memory（只跑本项目的 PostgreSQL 时 3GB 足够）并重启 Docker，然后重启 Rerank 服务，让模型重新完整加载到内存。服务每次精排后会释放 PyTorch 缓存的显存（`torch.mps.empty_cache()`）：早期版本不释放，每批片段长度不同，缓存越积越大，连续运行一天后进程占到 22GB（其中 MPS 显存缓存 14GB），闲置一会儿后第一次精排要 10～25 秒。释放显存后普通堆内存仍会涨：MPS 为每一种输入形状（批大小 × 序列长度）编译一张计算图并一直缓存，片段长度每次都不同，实测每次请求涨约 60MB，运行 21 小时涨到 17GB；现在序列长度补齐到 128 的倍数、批大小补齐到 2 的幂，形状最多 40 种，占用稳定在 3～4GB（分数与补齐前相差不到 0.002，排序一致，耗时不变）。用 `footprint -p $(pgrep -f rerank_server.py) | grep phys_footprint` 可以查看它的实际占用，正常在 2～4GB。
 - 接口与 HuggingFace text-embeddings-inference（TEI）的 `/rerank` 相同。部署到有 NVIDIA 显卡的 Linux 服务器时，可以直接用 TEI 镜像替代这个脚本，只需修改 `skb.rerank.base-url`。
 
 ### 扫描版 PDF 的文字识别（OCR）
