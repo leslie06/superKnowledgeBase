@@ -8,6 +8,7 @@
     python3 scripts/import_dir.py --kb-id 7 --dir ~/资料 --out report.csv  # 上传、等待处理完成、输出报告
     python3 scripts/import_dir.py --kb-id 7 --dir ~/资料 --delete-missing  # 同步：另外删除目录里已经不存在的文档
     python3 scripts/import_dir.py --kb-id 7 --dir ~/资料 --link            # 引用原文件，不复制（省一倍磁盘）
+    python3 scripts/import_dir.py --kb-id 7 --dir ~/资料 --link --existing-only  # 只把已导入的文档改为引用原文件，不导入新文件
 
 上传走 /api/knowledge-bases/{kbId}/documents，并带上文件的相对路径（以所选目录名开头，与页面上选择文件夹一致）。后端按 SHA-256 去重，所以重复运行是安全的：已导入的文件记为"已存在"，
 不会重复处理，这时脚本相当于重新生成一次报告。中途按 Ctrl-C 退出不影响后端继续处理，之后重新运行同一命令即可看到结果。
@@ -317,6 +318,8 @@ def main():
                         help="删除知识库中路径属于本目录、但目录里已经没有的文档（不加时只列出）")
     parser.add_argument("--link", action="store_true",
                         help="引用原文件，不复制到后端的存储目录（后端须在本机）；已复制导入的会改为引用并删除副本")
+    parser.add_argument("--existing-only", action="store_true",
+                        help="只处理知识库里已有（相对路径相同）的文件，不导入新文件；配合 --link 把已复制导入的文档改为引用原文件")
     parser.add_argument("--interval", type=float, default=5, help="轮询处理状态的间隔秒数，默认 %(default)s")
     parser.add_argument("--out", type=Path, help="把逐个文件的明细写入 CSV")
     args = parser.parse_args()
@@ -337,6 +340,11 @@ def main():
         return
 
     http_json("GET", f"{api}/knowledge-bases/{args.kb_id}")  # 知识库不存在时尽早报错
+    if args.existing_only:
+        known = {d.get("sourcePath") for d in fetch_documents(api, args.kb_id).values()}
+        before = len(todo)
+        todo = [i for i in todo if f"{root.name}/{Path(i.rel).as_posix()}" in known]
+        print(f"\n只处理知识库里已有的文件：{len(todo)} 个（跳过 {before - len(todo)} 个新文件）")
     print(f"\n{'引用原文件导入' if args.link else '上传'}到知识库 {args.kb_id}：")
     for n, item in enumerate(todo, 1):
         (link if args.link else upload)(api, args.kb_id, item, root.name)
