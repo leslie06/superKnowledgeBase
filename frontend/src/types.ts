@@ -50,6 +50,8 @@ export interface RelinkResult {
   updated: number
   missing: string[]
   changed: string[]
+  /** 之前因为找不到原文件处理失败、改完位置后自动重新处理的文档数 */
+  reprocessed: number
 }
 
 export interface ChunkView {

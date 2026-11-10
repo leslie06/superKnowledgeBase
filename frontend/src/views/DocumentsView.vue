@@ -165,7 +165,7 @@ async function relink() {
   relinking.value = true
   try {
     const r = await api.relinkDocuments(kbId.value, relinkFrom.value, relinkTo.value)
-    const parts = [`已修改 ${r.updated} 个文档的原文件位置`]
+    const parts = [`已修改 ${r.updated} 个文档的原文件位置` + (r.reprocessed ? `，其中 ${r.reprocessed} 个之前处理失败的已重新处理` : '')]
     if (r.missing.length) parts.push(`${r.missing.length} 个在新位置找不到`)
     if (r.changed.length) parts.push(`${r.changed.length} 个内容有变化未修改（重新运行导入脚本可按新版本更新）`)
     ;(r.missing.length || r.changed.length ? ElMessage.warning : ElMessage.success)({ message: parts.join('；'), duration: 6000 })

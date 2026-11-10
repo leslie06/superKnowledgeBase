@@ -45,9 +45,10 @@ public class DocumentService {
      * 修改文件夹位置的结果
      *
      * @param missing 新位置找不到的文件（旧路径）
-     * @param changed 新位置有文件但内容不同的（旧路径），没有修改，重新运行导入脚本可按新版本更新
+     * @param changed     新位置有文件但内容不同的（旧路径），没有修改，重新运行导入脚本可按新版本更新
+     * @param reprocessed 之前因为找不到原文件处理失败、改完位置后重新处理的文档数
      */
-    public record RelinkResult(int updated, List<String> missing, List<String> changed) {
+    public record RelinkResult(int updated, List<String> missing, List<String> changed, int reprocessed) {
     }
 
     private final DocumentRepository documents;
@@ -248,6 +249,7 @@ public class DocumentService {
             throw new IllegalArgumentException("没有引用「" + source + "」里原文件的文档");
         }
         int updated = 0;
+        int reprocessed = 0;
         List<String> missing = new ArrayList<>();
         List<String> changed = new ArrayList<>();
         for (Document doc : docs) {
@@ -260,12 +262,18 @@ public class DocumentService {
                 } else {
                     documents.updateLocalPath(doc.id(), moved.toString(), null);
                     updated++;
+                    // 找不到原文件时处理失败的，现在能读到了
+                    if (DocumentStatus.FAILED.name().equals(doc.status()) && !ingestionService.isProcessing(doc.id())) {
+                        documents.updateStatus(doc.id(), DocumentStatus.PENDING, null);
+                        ingestionService.submit(doc.id());
+                        reprocessed++;
+                    }
                 }
             } catch (IOException e) {
                 missing.add(doc.localPath());
             }
         }
-        return new RelinkResult(updated, missing, changed);
+        return new RelinkResult(updated, missing, changed, reprocessed);
     }
 
     /** 文件夹的绝对路径，去掉末尾的 / */
