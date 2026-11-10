@@ -195,19 +195,24 @@ public class DocumentService {
             var existing = documents.findBySha256(kbId, sha);
             if (existing.isPresent()) {
                 Document doc = existing.get();
-                if (localPath.equals(doc.localPath())) {
+                // 同一本书在目录里放了几份时，引用文档原来路径对应的那一份，不跟着扫描顺序来回换
+                Path target = preferredCopy(path, sourcePath, doc);
+                String targetPath = target.toString();
+                if (targetPath.equals(doc.localPath())
+                        || doc.localPath() != null && Files.isRegularFile(Path.of(doc.localPath()))) {
+                    // 引用的原文件还在，这一份只是内容相同的另一个副本
                     return duplicate(filename, doc);
                 }
                 if (ingestionService.isProcessing(doc.id())) {
                     return new UploadResult(filename, UploadStatus.REJECTED, doc.id(), "文档正在处理中，请处理完成后再运行");
                 }
-                documents.updateLocalPath(doc.id(), localPath, sourcePath);
+                documents.updateLocalPath(doc.id(), targetPath, target.equals(path) ? sourcePath : null);
                 if (doc.filePath() != null) {
                     fileStorage.delete(doc.filePath());
                     return new UploadResult(filename, UploadStatus.LINKED, doc.id(),
-                            "改为引用原文件，删除副本 " + size / 1024 / 1024 + " MB");
+                            "改为引用原文件 " + targetPath + "，删除副本 " + size / 1024 / 1024 + " MB");
                 }
-                return new UploadResult(filename, UploadStatus.MOVED, doc.id(), "原文件位置已更新：" + doc.localPath() + " → " + localPath);
+                return new UploadResult(filename, UploadStatus.MOVED, doc.id(), "原文件位置已更新：" + doc.localPath() + " → " + targetPath);
             }
             var previous = documents.findBySource(kbId, sourcePath, filename);
             if (previous.isPresent()) {
@@ -230,6 +235,26 @@ public class DocumentService {
             return new UploadResult(filename, UploadStatus.DUPLICATE, null, "内容相同的文件已存在");
         } catch (IOException e) {
             return new UploadResult(filename, UploadStatus.REJECTED, null, "读取文件失败：" + e.getMessage());
+        }
+    }
+
+    /**
+     * 内容相同的文件在目录里有多份时（"计算机/java/X.pdf"和"计算机/并发/X.pdf"），优先用文档原来的相对路径对应的那一份：
+     * 由这一份的绝对路径和相对路径推出所选目录的位置，再拼上文档原来的相对路径，存在且内容相同就用它，否则用这一份。
+     */
+    private static Path preferredCopy(Path path, String sourcePath, Document doc) {
+        if (sourcePath == null || doc.sourcePath() == null || sourcePath.equals(doc.sourcePath())) {
+            return path;
+        }
+        String absolute = path.toString();
+        if (!absolute.endsWith("/" + sourcePath)) {
+            return path;
+        }
+        Path original = Path.of(absolute.substring(0, absolute.length() - sourcePath.length()) + doc.sourcePath());
+        try {
+            return Files.isRegularFile(original) && FileStorage.sha256(original).equals(doc.sha256()) ? original : path;
+        } catch (IOException e) {
+            return path;
         }
     }
 
