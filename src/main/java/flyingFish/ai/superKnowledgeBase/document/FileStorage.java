@@ -20,6 +20,7 @@ import java.util.HexFormat;
 
 /**
  * 原始文件存储：{storageDir}/{kbId}/{sha256}.{ext}。按内容哈希命名，天然去重，也避免文件名中的特殊字符问题。
+ * 引用本机原文件导入的文档（{@link Document#localPath()}）不复制，直接读原文件。
  */
 @Component
 public class FileStorage {
@@ -51,6 +52,21 @@ public class FileStorage {
         } finally {
             Files.deleteIfExists(temp);
         }
+    }
+
+    /** 文档的原文件：引用本机原文件时是原文件，否则是复制保存的那一份 */
+    public Path locate(Document doc) {
+        return doc.localPath() != null ? Path.of(doc.localPath()) : resolve(doc.filePath());
+    }
+
+    /** 计算本机文件的 SHA-256（引用原文件导入、校验原文件是否变化时用） */
+    public static String sha256(Path file) throws IOException {
+        MessageDigest digest = sha256();
+        try (InputStream in = Files.newInputStream(file);
+             OutputStream out = new DigestOutputStream(OutputStream.nullOutputStream(), digest)) {
+            in.transferTo(out);
+        }
+        return HexFormat.of().formatHex(digest.digest());
     }
 
     public Path resolve(String relativePath) {

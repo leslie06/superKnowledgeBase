@@ -1105,3 +1105,14 @@ a:hover {
   font-size: 12px;
   font-variant-numeric: tabular-nums;
 }
+
+.missing-alert {
+  margin-bottom: 16px;
+}
+
+.relink-tip {
+  margin: 0 0 16px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.7;
+}

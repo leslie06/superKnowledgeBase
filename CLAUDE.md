@@ -19,7 +19,7 @@ python3 scripts/eval_retrieval.py --kb-id 5 --csv scripts/eval/laws.csv   # 检�
 python3 scripts/eval_retrieval.py --kb-id 5 --csv scripts/eval/laws.csv --rerank off   # 对比不精排的效果
 python3 scripts/eval_answer.py --kb-id 5 --csv scripts/eval/answers/laws.csv    # 答案级评测：真实问答 + DeepSeek 裁判（要点、编造、引用、拒答），基线在 scripts/eval/baseline/answers/
 swiftc -O scripts/ocr/vision_ocr.swift -o scripts/ocr/vision-ocr   # 编译扫描版 PDF 的文字识别工具（苹果 Vision，仅 macOS，产物已 gitignore）
-python3 scripts/import_dir.py --kb-id 7 --dir ~/资料 --out import.csv   # 目录批量导入（需后端运行），等处理完输出报告；--dry-run 只扫描，可重复运行
+python3 scripts/import_dir.py --kb-id 7 --dir ~/资料 --out import.csv   # 目录批量导入（需后端运行），等处理完输出报告；--dry-run 只扫描，可重复运行；--link 引用原文件不复制
 HF_HUB_OFFLINE=1 python3 scripts/rerank_server.py                # Rerank 服务 http://localhost:8081（bge-reranker-v2-m3，需 sentence-transformers；不在 docker 里，安装与启动见 README）
 
 cd frontend && npm install
@@ -48,7 +48,7 @@ npm run typecheck    # vue-tsc 类型检查
 
 ### 摄入管线（`ingestion/IngestionService`）
 
-上传（`DocumentService`）→ 按 SHA-256 在同一知识库内去重（`DUPLICATE`）→ 同一来源（文件夹导入按 `source_path`，单独上传按文件名）已有文档时视为新版本，`replaceFile` 在原文档上换文件、删旧文件和识别缓存后重新处理（`UPDATED`，文档 id 不变，处理完成前旧片段仍可检索）→ 文件存到 `skb.storage-dir/{kbId}/{sha256}.{ext}` → `IngestionService.submit` 异步处理。处理在固定大小的虚拟线程池中进行（`skb.ingestion.concurrency`，避免压垮本地 Ollama），文档状态依次为 `PENDING → PARSING → (OCR) → EMBEDDING → READY / FAILED`。应用关闭时中断的处理不标记失败，下次启动继续。旧 chunk 删除与新 chunk 写入在同一事务中完成，所以 reindex 是原子替换。应用启动时（`ApplicationReadyEvent`）会自动重新提交所有未完成状态的文档。
+上传（`DocumentService`）→ 按 SHA-256 在同一知识库内去重（`DUPLICATE`）→ 同一来源（文件夹导入按 `source_path`，单独上传按文件名）已有文档时视为新版本，`replaceFile` 在原文档上换文件、删旧文件和识别缓存后重新处理（`UPDATED`，文档 id 不变，处理完成前旧片段仍可检索）→ 文件存到 `skb.storage-dir/{kbId}/{sha256}.{ext}` → `IngestionService.submit` 异步处理。引用本机原文件导入（`import_dir.py --link` → `POST /documents/local`，只接受本机请求）时不复制：`document.local_path` 记原文件绝对路径、`file_path` 为空（V13），读文件一律用 `FileStorage.locate(doc)`，删除文档时绝不删原文件；已复制导入过的同内容文档改为引用并删副本（`LINKED`），原文件换了位置时更新路径（`MOVED`）；处理前检查原文件存在、SHA-256 变了按新版本处理（`checkLocalFile`）；原文件找不到时列表的 `fileMissing` 为真，文档管理「修改文件夹位置」（`POST /documents/relink`，新位置内容一致才改）。处理在固定大小的虚拟线程池中进行（`skb.ingestion.concurrency`，避免压垮本地 Ollama），文档状态依次为 `PENDING → PARSING → (OCR) → EMBEDDING → READY / FAILED`。应用关闭时中断的处理不标记失败，下次启动继续。旧 chunk 删除与新 chunk 写入在同一事务中完成，所以 reindex 是原子替换。应用启动时（`ApplicationReadyEvent`）会自动重新提交所有未完成状态的文档。
 
 - `DocumentParser` + `TikaBlockHandler`：Tika 输出 → `TextUnit`（文本 + 章节路径 + 位置）。Word 优先用标题样式，没有样式时用中文编号正则（"第X章"、"一、"、"2.1" 等）推断标题；PDF 记录页码，并先经 `PdfTextCleaner` 去掉页眉页脚和目录、接回被换行截断的句子；PPT 每张幻灯片首行作为标题；Excel 每行转成"列名: 值"。
 - `Chunker`：不跨章节、不跨幻灯片/工作表（PDF 跨页允许合并，位置记为"第1-2页"）。先把不可分的段落归组（法律条文及其款项、冒号结尾的引导句与其后的列举项、连续列举项），只在组之间按 `skb.chunk.*` 的目标/上限字数切分，组间不重叠；超长组在组内切分，后续片段重复最近的引导句，没有引导句时用句子级重叠。改切块规则后要对已有文档 reindex 才生效。

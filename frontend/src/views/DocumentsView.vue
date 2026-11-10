@@ -131,6 +131,52 @@ function directory(doc: KbDocument) {
 function extension(filename: string) {
   return filename.split('.').pop()?.toUpperCase() ?? ''
 }
+
+// ---------- 引用本机原文件：原文件移动后修改文件夹位置 ----------
+
+const missingDocs = computed(() => documents.value.filter((d) => d.fileMissing))
+const hasLocal = computed(() => documents.value.some((d) => d.localPath))
+const relinkOpen = ref(false)
+const relinkFrom = ref('')
+const relinkTo = ref('')
+const relinking = ref(false)
+
+/** 一组路径共同的上级文件夹，按 / 分段比较 */
+function commonFolder(paths: string[]) {
+  const parts = paths.map((p) => p.split('/').slice(0, -1))
+  if (!parts.length) return ''
+  const common: string[] = []
+  for (let i = 0; i < parts[0].length; i++) {
+    if (parts.every((p) => p[i] === parts[0][i])) common.push(parts[0][i])
+    else break
+  }
+  return common.join('/')
+}
+
+function openRelink() {
+  // 默认填上找不到的文件共同的上级文件夹，通常就是被移动的那个文件夹
+  const paths = (missingDocs.value.length ? missingDocs.value : documents.value).map((d) => d.localPath).filter(Boolean)
+  relinkFrom.value = commonFolder(paths as string[])
+  relinkTo.value = ''
+  relinkOpen.value = true
+}
+
+async function relink() {
+  relinking.value = true
+  try {
+    const r = await api.relinkDocuments(kbId.value, relinkFrom.value, relinkTo.value)
+    const parts = [`已修改 ${r.updated} 个文档的原文件位置`]
+    if (r.missing.length) parts.push(`${r.missing.length} 个在新位置找不到`)
+    if (r.changed.length) parts.push(`${r.changed.length} 个内容有变化未修改（重新运行导入脚本可按新版本更新）`)
+    ;(r.missing.length || r.changed.length ? ElMessage.warning : ElMessage.success)({ message: parts.join('；'), duration: 6000 })
+    relinkOpen.value = false
+    await refresh()
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  } finally {
+    relinking.value = false
+  }
+}
 </script>
 
 <template>
@@ -145,6 +191,13 @@ function extension(filename: string) {
       <div><b>{{ stats.chunks }}</b><span>知识片段</span></div>
     </section>
 
+    <el-alert v-if="missingDocs.length" type="warning" :closable="false" show-icon class="missing-alert">
+      <template #title>
+        有 {{ missingDocs.length }} 个文档引用的原文件找不到了（移动或删除了）。检索和问答不受影响，重新处理和查看原文件需要先更新位置。
+        <el-button link type="primary" @click="openRelink">修改文件夹位置</el-button>
+      </template>
+    </el-alert>
+
     <section class="panel">
       <div class="panel-header">
         <h3>文件列表</h3>
@@ -152,6 +205,7 @@ function extension(filename: string) {
         <el-select v-model="statusFilter" placeholder="全部状态" clearable class="status-filter">
           <el-option v-for="(s, key) in STATUS" :key="key" :label="s.label" :value="key" />
         </el-select>
+        <el-button v-if="hasLocal" @click="openRelink">修改文件夹位置</el-button>
         <el-button :icon="Refresh" @click="refresh">刷新</el-button>
       </div>
       <el-table v-loading="loading" :data="filtered" empty-text="还没有文件，先上传一些资料吧">
@@ -167,6 +221,8 @@ function extension(filename: string) {
                   </template>
                   <div class="doc-summary">{{ row.summary }}</div>
                 </el-popover>
+                <el-tag v-if="row.fileMissing" size="small" type="danger" effect="plain" :title="row.localPath">原文件缺失</el-tag>
+                <el-tag v-else-if="row.localPath" size="small" type="info" effect="plain" :title="row.localPath">引用原文件</el-tag>
                 <div v-if="directory(row)" class="file-dir" :title="directory(row)!">{{ directory(row) }}</div>
               </div>
             </div>
@@ -235,6 +291,27 @@ function extension(filename: string) {
         </li>
       </ol>
     </section>
+
+    <el-dialog v-model="relinkOpen" title="修改文件夹位置" width="560px">
+      <p class="relink-tip">
+        原文件所在的文件夹整体移动后，把文档记录的位置改过去。新位置的文件内容必须和原来一致才会修改，不用重新处理。
+        在 Finder 中选中文件夹，按 ⌥⌘C 可以复制完整路径。
+      </p>
+      <el-form label-width="72px">
+        <el-form-item label="旧位置">
+          <el-input v-model="relinkFrom" placeholder="/Users/me/资料/电子书" />
+        </el-form-item>
+        <el-form-item label="新位置">
+          <el-input v-model="relinkTo" placeholder="/Volumes/移动硬盘/电子书" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="relinkOpen = false">取消</el-button>
+        <el-button type="primary" :loading="relinking" :disabled="!relinkFrom.trim() || !relinkTo.trim()" @click="relink">
+          修改
+        </el-button>
+      </template>
+    </el-dialog>
 
     <el-drawer :model-value="!!chunkDoc" size="560px" @close="chunkDoc = null">
       <template #header>

@@ -1,6 +1,6 @@
 import type {
   AnswerVerification, ChatMessage, ChunkView, Citation, Conversation, EvalCase, Feedback, FeedbackReason, FollowUp,
-  InsightOverview, KbDocument, KnowledgeBase, RetrievedChunk, SearchScope, UploadResult,
+  InsightOverview, KbDocument, KnowledgeBase, RelinkResult, RetrievedChunk, SearchScope, UploadResult,
 } from './types'
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
@@ -40,6 +40,9 @@ export const api = {
     return request<UploadResult[]>(`/api/knowledge-bases/${kbId}/documents`, { method: 'POST', body: form })
   },
   deleteDocument: (id: number) => request<void>(`/api/documents/${id}`, { method: 'DELETE' }),
+  /** 引用的原文件所在文件夹整体移动后，把 from 下的文档改到 to 下的对应位置 */
+  relinkDocuments: (kbId: number, from: string, to: string) =>
+    request<RelinkResult>(`/api/knowledge-bases/${kbId}/documents/relink`, { method: 'POST', body: json({ from, to }) }),
   reindexDocument: (id: number) => request<void>(`/api/documents/${id}/reindex`, { method: 'POST' }),
   listChunks: (id: number) => request<ChunkView[]>(`/api/documents/${id}/chunks`),
   search: (kbId: number, query: string, topK = 10) =>

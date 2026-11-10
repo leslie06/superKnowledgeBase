@@ -4,11 +4,14 @@ import java.time.OffsetDateTime;
 
 /**
  * @param sourcePath 文件夹导入时文件的相对路径（含文件夹名和文件名），单独上传的文件为 null
+ * @param filePath   复制保存的原文件路径（相对于 skb.storage-dir），引用本机原文件时为 null
+ * @param localPath  引用本机原文件时原文件的绝对路径，复制保存时为 null
  * @param ocrPages   最近一次处理时需要文字识别的页数，0 表示不需要
  * @param ocrDone    已完成文字识别的页数，用于显示进度
  * @param summary    LLM 生成的文档摘要，还没有生成时为 null
  */
-public record Document(Long id, Long kbId, String filename, String sourcePath, String filePath, String sha256, String mimeType,
+public record Document(Long id, Long kbId, String filename, String sourcePath, String filePath, String localPath,
+                       String sha256, String mimeType,
                        long sizeBytes, String status, String errorMsg, int chunkCount, int ocrPages, int ocrDone,
                        String summary, OffsetDateTime createdAt, OffsetDateTime updatedAt) {
 }

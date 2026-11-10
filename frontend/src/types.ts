@@ -26,16 +26,30 @@ export interface KbDocument {
   ocrDone: number
   /** LLM 生成的文档摘要，作为特殊片段参与检索；还没有生成时为 null */
   summary: string | null
+  /** 引用本机原文件导入（import_dir.py --link）时原文件的绝对路径，复制保存的为 null */
+  localPath: string | null
+  /** 引用的原文件已经找不到（移动或删除了） */
+  fileMissing: boolean
   createdAt: string
   updatedAt: string
 }
 
 export interface UploadResult {
   filename: string
-  /** UPDATED：路径（单独上传时为文件名）相同但内容有变化，替换了旧版本 */
-  status: 'ACCEPTED' | 'UPDATED' | 'DUPLICATE' | 'REJECTED'
+  /**
+   * UPDATED：路径（单独上传时为文件名）相同但内容有变化，替换了旧版本；
+   * LINKED / MOVED：引用原文件导入时，改为引用原文件 / 原文件位置已更新
+   */
+  status: 'ACCEPTED' | 'UPDATED' | 'DUPLICATE' | 'LINKED' | 'MOVED' | 'REJECTED'
   documentId: number | null
   message: string
+}
+
+/** 修改文件夹位置的结果；missing、changed 是旧路径 */
+export interface RelinkResult {
+  updated: number
+  missing: string[]
+  changed: string[]
 }
 
 export interface ChunkView {

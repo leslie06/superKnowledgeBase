@@ -12,9 +12,13 @@ import org.slf4j.LoggerFactory;
 import org.springframework.ai.embedding.EmbeddingModel;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
@@ -142,14 +146,15 @@ public class IngestionService {
     }
 
     private void process(long documentId) {
-        Document doc = documents.findById(documentId).orElse(null);
-        if (doc == null) {
+        Document found = documents.findById(documentId).orElse(null);
+        if (found == null) {
             return;
         }
         long start = System.currentTimeMillis();
         try {
             documents.markParsing(documentId);
-            List<TextUnit> units = parser.parse(fileStorage.resolve(doc.filePath()), doc.filename(), doc.sha256(),
+            Document doc = checkLocalFile(found);
+            List<TextUnit> units = parser.parse(fileStorage.locate(doc), doc.filename(), doc.sha256(),
                     (done, total) -> documents.updateOcrProgress(documentId, done, total));
             List<ChunkDraft> drafts = chunker.chunk(units, DocType.fromFilename(doc.filename()));
             if (drafts.isEmpty()) {
@@ -177,10 +182,10 @@ public class IngestionService {
             chapterSummarizer.submit(documentId);
         } catch (Exception e) {
             if (stopping) {
-                log.info("应用关闭，文档下次启动后继续处理：{}", doc.filename());
+                log.info("应用关闭，文档下次启动后继续处理：{}", found.filename());
                 return;
             }
-            log.warn("文档处理失败：{}", doc.filename(), e);
+            log.warn("文档处理失败：{}", found.filename(), e);
             String message = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
             try {
                 documents.updateStatus(documentId, DocumentStatus.FAILED,
@@ -190,6 +195,31 @@ public class IngestionService {
                 log.debug("更新文档状态失败：{}", documentId, updateError);
             }
         }
+    }
+
+    /**
+     * 引用本机原文件的文档：原文件找不到时报错（旧片段保留，照样能检索）；内容变了（被替换成新版本）时更新指纹、清掉摘要，
+     * 按新版本处理，文字识别缓存也按新指纹查。复制保存的文档原样返回。
+     */
+    private Document checkLocalFile(Document doc) throws IOException {
+        if (doc.localPath() == null) {
+            return doc;
+        }
+        Path path = Path.of(doc.localPath());
+        if (!Files.isRegularFile(path)) {
+            throw new IllegalStateException("原文件不存在：" + path + "（移动过的话，可在文档管理「修改文件夹位置」或重新运行导入脚本）");
+        }
+        String sha = FileStorage.sha256(path);
+        if (sha.equals(doc.sha256())) {
+            return doc;
+        }
+        try {
+            documents.updateLocalVersion(doc.id(), sha, Files.size(path));
+        } catch (DuplicateKeyException e) {
+            throw new IllegalStateException("原文件内容已变化，且与知识库中另一个文档相同：" + path);
+        }
+        log.info("原文件内容已变化，按新版本处理：{}", path);
+        return documents.findById(doc.id()).orElseThrow();
     }
 
     /** 文件夹导入的文件用相对路径（目录名就是分类），否则用文件名 */

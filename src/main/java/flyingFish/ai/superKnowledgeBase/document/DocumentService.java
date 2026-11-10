@@ -15,6 +15,7 @@ import org.springframework.util.StringUtils;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -22,10 +23,31 @@ import java.util.List;
 @Service
 public class DocumentService {
 
-    /** ACCEPTED 新文档；UPDATED 同一来源（路径或文件名相同）内容有变化，替换了旧版本；DUPLICATE 内容相同的文件已存在 */
-    public enum UploadStatus {ACCEPTED, UPDATED, DUPLICATE, REJECTED}
+    /**
+     * ACCEPTED 新文档；UPDATED 同一来源（路径或文件名相同）内容有变化，替换了旧版本；DUPLICATE 内容相同的文件已存在；
+     * LINKED 已有文档由复制保存改为引用本机原文件（删除了副本）；MOVED 引用的原文件换了位置，已更新路径
+     */
+    public enum UploadStatus {ACCEPTED, UPDATED, DUPLICATE, LINKED, MOVED, REJECTED}
 
     public record UploadResult(String filename, UploadStatus status, Long documentId, String message) {
+    }
+
+    /**
+     * 引用本机原文件导入的一个文件
+     *
+     * @param path       原文件的绝对路径
+     * @param sourcePath 相对路径（以所选文件夹名开头），与上传时的 paths 相同
+     */
+    public record LocalFile(String path, String sourcePath) {
+    }
+
+    /**
+     * 修改文件夹位置的结果
+     *
+     * @param missing 新位置找不到的文件（旧路径）
+     * @param changed 新位置有文件但内容不同的（旧路径），没有修改，重新运行导入脚本可按新版本更新
+     */
+    public record RelinkResult(int updated, List<String> missing, List<String> changed) {
     }
 
     private final DocumentRepository documents;
@@ -98,6 +120,10 @@ public class DocumentService {
             FileStorage.StoredFile stored = fileStorage.store(kbId, file);
             var existing = documents.findBySha256(kbId, stored.sha256());
             if (existing.isPresent()) {
+                if (existing.get().localPath() != null) {
+                    // 已有文档引用的是本机原文件，刚复制的这份没人用
+                    fileStorage.delete(stored.relativePath());
+                }
                 return duplicate(filename, existing.get());
             }
             var previous = documents.findBySource(kbId, sourcePath, filename);
@@ -127,12 +153,136 @@ public class DocumentService {
         }
         documents.replaceFile(previous.id(), filename, stored.relativePath(), stored.sha256(),
                 mediaType(filename).toString(), stored.size());
-        if (!previous.filePath().equals(stored.relativePath())) {
+        // 旧版本引用的本机原文件不能删
+        if (previous.filePath() != null && !previous.filePath().equals(stored.relativePath())) {
             fileStorage.delete(previous.filePath());
         }
         ocrPages.deleteOrphans();
         ingestionService.submit(previous.id());
         return new UploadResult(filename, UploadStatus.UPDATED, previous.id(), "内容有变化，已替换旧版本并重新处理");
+    }
+
+    /**
+     * 引用本机原文件导入（scripts/import_dir.py --link）：不复制文件，只记录原文件的绝对路径。后端和文件在同一台电脑上才能用。
+     * 按 SHA-256 判断：库里已有内容相同的文档时，复制保存的改为引用原文件并删掉副本（LINKED），引用的原文件换了位置时更新路径
+     * （MOVED），都不用重新处理；同一来源内容变了按新版本替换；否则新增。
+     */
+    public List<UploadResult> linkLocal(long kbId, List<LocalFile> files) {
+        knowledgeBaseService.get(kbId);
+        return files.stream().map(f -> linkOne(kbId, f)).toList();
+    }
+
+    private UploadResult linkOne(long kbId, LocalFile file) {
+        Path path = Path.of(String.valueOf(file.path())).normalize();
+        String filename = String.valueOf(path.getFileName());
+        String sourcePath = sourcePath(file.sourcePath());
+        try {
+            DocType.fromFilename(filename);
+            if (!path.isAbsolute() || !Files.isRegularFile(path)) {
+                throw new IllegalArgumentException("文件不存在或不是绝对路径：" + path);
+            }
+            if (Files.size(path) == 0) {
+                throw new IllegalArgumentException("文件为空");
+            }
+        } catch (IllegalArgumentException | IOException e) {
+            return new UploadResult(filename, UploadStatus.REJECTED, null, e.getMessage());
+        }
+        try {
+            String sha = FileStorage.sha256(path);
+            long size = Files.size(path);
+            String localPath = path.toString();
+            var existing = documents.findBySha256(kbId, sha);
+            if (existing.isPresent()) {
+                Document doc = existing.get();
+                if (localPath.equals(doc.localPath())) {
+                    return duplicate(filename, doc);
+                }
+                if (ingestionService.isProcessing(doc.id())) {
+                    return new UploadResult(filename, UploadStatus.REJECTED, doc.id(), "文档正在处理中，请处理完成后再运行");
+                }
+                documents.updateLocalPath(doc.id(), localPath, sourcePath);
+                if (doc.filePath() != null) {
+                    fileStorage.delete(doc.filePath());
+                    return new UploadResult(filename, UploadStatus.LINKED, doc.id(),
+                            "改为引用原文件，删除副本 " + size / 1024 / 1024 + " MB");
+                }
+                return new UploadResult(filename, UploadStatus.MOVED, doc.id(), "原文件位置已更新：" + doc.localPath() + " → " + localPath);
+            }
+            var previous = documents.findBySource(kbId, sourcePath, filename);
+            if (previous.isPresent()) {
+                Document doc = previous.get();
+                if (ingestionService.isProcessing(doc.id())) {
+                    return new UploadResult(filename, UploadStatus.REJECTED, doc.id(), "旧版本正在处理中，请处理完成后再运行");
+                }
+                documents.replaceWithLocal(doc.id(), filename, localPath, sha, mediaType(filename).toString(), size);
+                if (doc.filePath() != null) {
+                    fileStorage.delete(doc.filePath());
+                }
+                ocrPages.deleteOrphans();
+                ingestionService.submit(doc.id());
+                return new UploadResult(filename, UploadStatus.UPDATED, doc.id(), "内容有变化，已替换旧版本并重新处理");
+            }
+            long id = documents.insert(kbId, filename, sourcePath, null, localPath, sha, mediaType(filename).toString(), size);
+            ingestionService.submit(id);
+            return new UploadResult(filename, UploadStatus.ACCEPTED, id, "已加入处理队列（引用原文件，不复制）");
+        } catch (DuplicateKeyException e) {
+            return new UploadResult(filename, UploadStatus.DUPLICATE, null, "内容相同的文件已存在");
+        } catch (IOException e) {
+            return new UploadResult(filename, UploadStatus.REJECTED, null, "读取文件失败：" + e.getMessage());
+        }
+    }
+
+    /**
+     * 修改文件夹位置：引用的原文件在 from 文件夹（含子文件夹）里的文档，路径改到 to 下的对应位置。
+     * 新位置的文件必须存在且内容（SHA-256）不变才修改；内容变了的不改，列出来，重新运行导入脚本会按新版本更新。
+     */
+    public RelinkResult relink(long kbId, String from, String to) {
+        knowledgeBaseService.get(kbId);
+        String source = folder(from);
+        String target = folder(to);
+        if (source.equals(target)) {
+            throw new IllegalArgumentException("新位置与旧位置相同");
+        }
+        List<Document> docs = documents.findLocalUnder(kbId, source);
+        if (docs.isEmpty()) {
+            throw new IllegalArgumentException("没有引用「" + source + "」里原文件的文档");
+        }
+        int updated = 0;
+        List<String> missing = new ArrayList<>();
+        List<String> changed = new ArrayList<>();
+        for (Document doc : docs) {
+            Path moved = Path.of(target + doc.localPath().substring(source.length()));
+            try {
+                if (!Files.isRegularFile(moved)) {
+                    missing.add(doc.localPath());
+                } else if (!FileStorage.sha256(moved).equals(doc.sha256())) {
+                    changed.add(doc.localPath());
+                } else {
+                    documents.updateLocalPath(doc.id(), moved.toString(), null);
+                    updated++;
+                }
+            } catch (IOException e) {
+                missing.add(doc.localPath());
+            }
+        }
+        return new RelinkResult(updated, missing, changed);
+    }
+
+    /** 文件夹的绝对路径，去掉末尾的 / */
+    private static String folder(String raw) {
+        if (!StringUtils.hasText(raw)) {
+            throw new IllegalArgumentException("请填写文件夹路径");
+        }
+        Path path = Path.of(raw.strip()).normalize();
+        if (!path.isAbsolute()) {
+            throw new IllegalArgumentException("请填写完整路径（以 / 开头）：" + raw);
+        }
+        return path.toString();
+    }
+
+    /** 引用本机原文件、但原文件已经找不到的文档 */
+    public boolean fileMissing(Document doc) {
+        return doc.localPath() != null && !Files.isRegularFile(Path.of(doc.localPath()));
     }
 
     private static UploadResult duplicate(String filename, Document existing) {
@@ -152,12 +302,19 @@ public class DocumentService {
     public void delete(long id) {
         Document doc = get(id);
         documents.delete(id);
-        fileStorage.delete(doc.filePath());
+        // 引用的本机原文件是用户的文件，不删
+        if (doc.filePath() != null) {
+            fileStorage.delete(doc.filePath());
+        }
         ocrPages.deleteOrphans();
     }
 
     public Path file(Document doc) {
-        return fileStorage.resolve(doc.filePath());
+        Path path = fileStorage.locate(doc);
+        if (!Files.isRegularFile(path)) {
+            throw new NotFoundException("原文件不存在：" + path + "（移动过的话，可在文档管理「修改文件夹位置」或重新运行导入脚本）");
+        }
+        return path;
     }
 
     public List<ChunkView> chunks(long id) {

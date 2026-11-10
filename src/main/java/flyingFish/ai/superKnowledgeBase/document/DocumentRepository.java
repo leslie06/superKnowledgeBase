@@ -45,12 +45,56 @@ public class DocumentRepository {
     /** 换成新版本的文件并重新排队处理；旧的片段保留到新版本处理完成时一并替换 */
     public void replaceFile(long id, String filename, String filePath, String sha256, String mimeType, long size) {
         jdbc.sql("""
-                        UPDATE document SET filename = ?, file_path = ?, sha256 = ?, mime_type = ?, size_bytes = ?,
-                                            summary = NULL, status = ?, error_msg = NULL, updated_at = now()
+                        UPDATE document SET filename = ?, file_path = ?, local_path = NULL, sha256 = ?, mime_type = ?,
+                                            size_bytes = ?, summary = NULL, status = ?, error_msg = NULL, updated_at = now()
                         WHERE id = ?
                         """)
                 .params(filename, filePath, sha256, mimeType, size, DocumentStatus.PENDING.name(), id)
                 .update();
+    }
+
+    /** 换成本机原文件的新版本（引用原文件导入）并重新排队处理 */
+    public void replaceWithLocal(long id, String filename, String localPath, String sha256, String mimeType, long size) {
+        jdbc.sql("""
+                        UPDATE document SET filename = ?, file_path = NULL, local_path = ?, sha256 = ?, mime_type = ?,
+                                            size_bytes = ?, summary = NULL, status = ?, error_msg = NULL, updated_at = now()
+                        WHERE id = ?
+                        """)
+                .params(filename, localPath, sha256, mimeType, size, DocumentStatus.PENDING.name(), id)
+                .update();
+    }
+
+    /**
+     * 改为引用本机原文件（或原文件换了位置）：内容不变，不用重新处理。
+     *
+     * @param sourcePath 新的相对路径，null 时保留原来的
+     */
+    public void updateLocalPath(long id, String localPath, String sourcePath) {
+        jdbc.sql("""
+                        UPDATE document SET local_path = ?, file_path = NULL, source_path = COALESCE(?, source_path),
+                                            updated_at = now()
+                        WHERE id = ?
+                        """)
+                .params(localPath, sourcePath, id)
+                .update();
+    }
+
+    /** 本机原文件的内容变了（被替换成新版本）：更新指纹，摘要要重新生成 */
+    public void updateLocalVersion(long id, String sha256, long size) {
+        jdbc.sql("UPDATE document SET sha256 = ?, size_bytes = ?, summary = NULL, updated_at = now() WHERE id = ?")
+                .params(sha256, size, id)
+                .update();
+    }
+
+    /** 引用的原文件在某个文件夹（含子文件夹）里的文档 */
+    public List<Document> findLocalUnder(long kbId, String folder) {
+        return jdbc.sql("""
+                        SELECT * FROM document
+                        WHERE kb_id = ? AND local_path IS NOT NULL AND (local_path = ? OR starts_with(local_path, ?))
+                        ORDER BY id
+                        """)
+                .params(kbId, folder, folder + "/")
+                .query(Document.class).list();
     }
 
     public void updateSummary(long id, String summary) {
@@ -64,11 +108,19 @@ public class DocumentRepository {
 
     public long insert(long kbId, String filename, String sourcePath, String filePath, String sha256, String mimeType,
                        long size) {
+        return insert(kbId, filename, sourcePath, filePath, null, sha256, mimeType, size);
+    }
+
+    /** @param filePath 复制保存的路径；引用本机原文件时为 null，localPath 为原文件的绝对路径 */
+    public long insert(long kbId, String filename, String sourcePath, String filePath, String localPath, String sha256,
+                       String mimeType, long size) {
         return jdbc.sql("""
-                        INSERT INTO document (kb_id, filename, source_path, file_path, sha256, mime_type, size_bytes, status)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id
+                        INSERT INTO document (kb_id, filename, source_path, file_path, local_path, sha256, mime_type,
+                                              size_bytes, status)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id
                         """)
-                .params(kbId, filename, sourcePath, filePath, sha256, mimeType, size, DocumentStatus.PENDING.name())
+                .params(kbId, filename, sourcePath, filePath, localPath, sha256, mimeType, size,
+                        DocumentStatus.PENDING.name())
                 .query(Long.class).single();
     }
 

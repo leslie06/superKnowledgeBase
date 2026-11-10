@@ -7,6 +7,7 @@
     python3 scripts/import_dir.py --kb-id 7 --dir ~/资料 --dry-run         # 只扫描，统计文件类型，不上传
     python3 scripts/import_dir.py --kb-id 7 --dir ~/资料 --out report.csv  # 上传、等待处理完成、输出报告
     python3 scripts/import_dir.py --kb-id 7 --dir ~/资料 --delete-missing  # 同步：另外删除目录里已经不存在的文档
+    python3 scripts/import_dir.py --kb-id 7 --dir ~/资料 --link            # 引用原文件，不复制（省一倍磁盘）
 
 上传走 /api/knowledge-bases/{kbId}/documents，并带上文件的相对路径（以所选目录名开头，与页面上选择文件夹一致）。后端按 SHA-256 去重，所以重复运行是安全的：已导入的文件记为"已存在"，
 不会重复处理，这时脚本相当于重新生成一次报告。中途按 Ctrl-C 退出不影响后端继续处理，之后重新运行同一命令即可看到结果。
@@ -15,6 +16,11 @@
 同步：路径相同但内容有变化的文件，后端会替换旧版本并重新处理（结果为"已更新"），所以修改过的文件重新运行即可更新。
 知识库里路径以本目录名开头、但目录里已经没有的文档会列出来；加 --delete-missing 时删除它们。
 本次上传中内容已存在的文档（文件只是移动或改名）不算已不存在。定时运行带 --delete-missing 的命令即可让知识库跟随目录自动同步。
+
+引用原文件（--link）：后端和文件在同一台电脑上时，不上传文件内容，只把原文件的绝对路径交给后端（/documents/local），
+后端直接读原文件，不在 skb.storage-dir 里复制一份。已经复制导入过的文档（内容相同）会改为引用原文件并删除副本（结果为"改为引用"），
+不用重新处理；原文件挪了位置、重新运行时会更新路径（结果为"位置已更新"）。原文件移动后检索和问答不受影响，
+但重新处理和查看原文件需要先更新路径：重新运行本命令，或在文档管理「修改文件夹位置」。也不受 200MB 上传上限的限制。
 
 报告内容：按文件类型统计成功 / 失败 / 片段数；失败原因归类；文字疑似过少的文件（扫描件、以图片为主的 PDF/PPT）；
 处理吞吐（文档/分钟、片段/分钟）。--out 写出逐个文件的明细 CSV。
@@ -48,7 +54,7 @@ class Item:
     rel: str
     kind: str
     size: int
-    result: str = ""        # 新增 / 已更新 / 已存在 / 已跳过 / 上传失败
+    result: str = ""        # 新增 / 已更新 / 已存在 / 改为引用 / 位置已更新 / 已跳过 / 上传失败
     message: str = ""
     doc_id: int | None = None
     status: str = ""
@@ -57,8 +63,8 @@ class Item:
     flag: str = ""
 
 
-def scan(root: Path) -> tuple[list[Item], list[Item]]:
-    """返回 (待上传, 跳过)。跳过隐藏文件、Office 临时锁文件（~$开头）、空文件、超限文件和不支持的类型。"""
+def scan(root: Path, link: bool = False) -> tuple[list[Item], list[Item]]:
+    """返回 (待上传, 跳过)。跳过隐藏文件、Office 临时锁文件（~$开头）、空文件、超限文件（引用原文件时不限）和不支持的类型。"""
     todo, skipped = [], []
     for path in sorted(root.rglob("*")):
         rel = path.relative_to(root)
@@ -72,7 +78,7 @@ def scan(root: Path) -> tuple[list[Item], list[Item]]:
             item.message = "不支持的类型"
         elif item.size == 0:
             item.message = "空文件"
-        elif item.size > MAX_FILE_BYTES:
+        elif item.size > MAX_FILE_BYTES and not link:
             item.message = "超过上传上限 200MB"
         if item.message:
             item.result = "已跳过"
@@ -93,6 +99,24 @@ def http_json(method: str, url: str, body: bytes | None = None, content_type="ap
         raise RuntimeError(f"HTTP {e.code}：{detail[:200]}") from None
 
 
+RESULTS = {"ACCEPTED": "新增", "UPDATED": "已更新", "DUPLICATE": "已存在", "LINKED": "改为引用", "MOVED": "位置已更新"}
+# 这些结果表示文档已在知识库里（内容相同），不算"已不在目录里"
+EXISTING_RESULTS = {"已存在", "改为引用", "位置已更新"}
+
+
+def link(api: str, kb_id: int, item: Item, root_name: str):
+    """引用原文件：只把绝对路径和相对路径交给后端，不上传内容"""
+    source_path = f"{root_name}/{Path(item.rel).as_posix()}"
+    body = json.dumps({"files": [{"path": str(item.path), "sourcePath": source_path}]}, ensure_ascii=False).encode("utf-8")
+    try:
+        result = http_json("POST", f"{api}/knowledge-bases/{kb_id}/documents/local", body)[0]
+    except (RuntimeError, OSError) as e:
+        item.result, item.message = "上传失败", str(e)
+        return
+    item.doc_id, item.message = result.get("documentId"), result.get("message") or ""
+    item.result = RESULTS.get(result["status"], "上传失败")
+
+
 def upload(api: str, kb_id: int, item: Item, root_name: str):
     boundary = uuid.uuid4().hex
     filename = item.path.name.replace('"', "'")
@@ -109,7 +133,7 @@ def upload(api: str, kb_id: int, item: Item, root_name: str):
         item.result, item.message = "上传失败", str(e)
         return
     item.doc_id, item.message = result.get("documentId"), result.get("message") or ""
-    item.result = {"ACCEPTED": "新增", "UPDATED": "已更新", "DUPLICATE": "已存在"}.get(result["status"], "上传失败")
+    item.result = RESULTS.get(result["status"], "上传失败")
 
 
 def fetch_documents(api: str, kb_id: int) -> dict[int, dict]:
@@ -182,7 +206,9 @@ def print_report(items: list[Item], elapsed: float, new_chunks: int):
     print()
     print("=" * 72)
     print(f"导入报告：{len(items)} 个文件对应 {len(imported)} 个文档；新增 {sum(i.result == '新增' for i in items)}，"
-          f"已更新 {sum(i.result == '已更新' for i in items)}，已存在 {sum(i.result == '已存在' for i in items)}，上传失败 {sum(i.result == '上传失败' for i in items)}")
+          f"已更新 {sum(i.result == '已更新' for i in items)}，已存在 {sum(i.result == '已存在' for i in items)}，"
+          f"改为引用 {sum(i.result == '改为引用' for i in items)}，位置已更新 {sum(i.result == '位置已更新' for i in items)}，"
+          f"上传失败 {sum(i.result == '上传失败' for i in items)}")
     print("=" * 72)
     print(f"  {'类型':<6} {'文件':>5} {'成功':>5} {'失败':>5} {'片段':>7} {'平均片段':>8}")
     by_kind = defaultdict(list)
@@ -289,6 +315,8 @@ def main():
     parser.add_argument("--retry-failed", action="store_true", help="对之前处理失败的已存在文件重新处理")
     parser.add_argument("--delete-missing", action="store_true",
                         help="删除知识库中路径属于本目录、但目录里已经没有的文档（不加时只列出）")
+    parser.add_argument("--link", action="store_true",
+                        help="引用原文件，不复制到后端的存储目录（后端须在本机）；已复制导入的会改为引用并删除副本")
     parser.add_argument("--interval", type=float, default=5, help="轮询处理状态的间隔秒数，默认 %(default)s")
     parser.add_argument("--out", type=Path, help="把逐个文件的明细写入 CSV")
     args = parser.parse_args()
@@ -296,7 +324,7 @@ def main():
     root = args.dir.expanduser().resolve()
     if not root.is_dir():
         parser.error(f"目录不存在：{root}")
-    todo, skipped = scan(root)
+    todo, skipped = scan(root, args.link)
     print_scan(todo, skipped)
     api = args.base_url.rstrip("/") + "/api"
     # 目录里现有的全部文件（含跳过的），路径格式与上传时一致
@@ -309,20 +337,20 @@ def main():
         return
 
     http_json("GET", f"{api}/knowledge-bases/{args.kb_id}")  # 知识库不存在时尽早报错
-    print(f"\n上传到知识库 {args.kb_id}：")
+    print(f"\n{'引用原文件导入' if args.link else '上传'}到知识库 {args.kb_id}：")
     for n, item in enumerate(todo, 1):
-        upload(api, args.kb_id, item, root.name)
+        (link if args.link else upload)(api, args.kb_id, item, root.name)
         print(f"\r  [{n}/{len(todo)}] {item.result}  {item.rel[:50]}" + " " * 20, end="", flush=True)
     print()
 
     if args.retry_failed:
         docs = fetch_documents(api, args.kb_id)
-        retry = [i for i in todo if i.result == "已存在" and docs.get(i.doc_id, {}).get("status") == "FAILED"]
+        retry = [i for i in todo if i.result in EXISTING_RESULTS and docs.get(i.doc_id, {}).get("status") == "FAILED"]
         for item in retry:
             http_json("POST", f"{api}/documents/{item.doc_id}/reindex")
         print(f"  重新处理之前失败的文件 {len(retry)} 个")
 
-    keep = {i.doc_id for i in todo if i.result == "已存在" and i.doc_id}
+    keep = {i.doc_id for i in todo if i.result in EXISTING_RESULTS and i.doc_id}
     sync_missing(api, args.kb_id, find_missing(fetch_documents(api, args.kb_id), root.name, present, keep),
                  args.delete_missing)
 
